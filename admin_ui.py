@@ -6,7 +6,7 @@ from dateutil.relativedelta import relativedelta
 from io import BytesIO
 import time
 
-CURRENT_VERSION = "1.0.2"
+CURRENT_VERSION = "1.0.3"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -114,11 +114,13 @@ with st.sidebar:
             try:
                 import requests
                 import re
+                import time
                 
                 # 指向你 GitHub 上的原始檔案 (Raw)
                 # url = "https://raw.githubusercontent.com/你的帳號/你的項目/main/admin_ui.py"
                 url = "https://raw.githubusercontent.com/xubingf17/invest-system/main/admin_ui.py"
-                response = requests.get(url, timeout=5)
+                # response = requests.get(url, timeout=5)
+                response = requests.get(f"{url}?t={int(time.time())}")
                 
                 if response.status_code == 200:
                     remote_code = response.text
