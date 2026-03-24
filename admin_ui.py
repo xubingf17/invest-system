@@ -6,7 +6,7 @@ from dateutil.relativedelta import relativedelta
 from io import BytesIO
 import time
 
-CURRENT_VERSION = "1.0.0"
+CURRENT_VERSION = "1.0.1"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -1116,3 +1116,7 @@ elif menu == "💰 業務佣金":
             st.warning(f"🌙 在 {start_f} 到 {end_f} 之間沒有任何新合約生效。")
     else:
         st.info("請在上方日期欄位選擇『開始日期』與『結束日期』。")
+
+st.markdown("---")
+st.caption("© 2026 Bing Xu. All Rights Reserved. | 投資管理系統 v{CURRENT_VERSION}")
+st.caption("本軟體僅供授權用戶使用，嚴禁任何形式之未經授權重製、散佈或商業用途。")
