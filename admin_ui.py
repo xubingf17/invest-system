@@ -6,7 +6,7 @@ from dateutil.relativedelta import relativedelta
 from io import BytesIO
 import time
 
-CURRENT_VERSION = "1.0.1"
+CURRENT_VERSION = "1.0.0"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
