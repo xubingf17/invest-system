@@ -6,7 +6,7 @@ from dateutil.relativedelta import relativedelta
 from io import BytesIO
 import time
 
-CURRENT_VERSION = "1.0.3"
+CURRENT_VERSION = "1.0.4"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -110,37 +110,52 @@ with st.sidebar:
     st.divider()
     st.info(f"今天日期：{date.today()}")
     if st.button("檢查並更新系統版本"):
-        with st.status("正在檢查版本...", expanded=True) as status:
+        with st.status("正在連線至 GitHub API...", expanded=True) as status:
             try:
                 import requests
                 import re
-                import time
                 
-                # 指向你 GitHub 上的原始檔案 (Raw)
-                # url = "https://raw.githubusercontent.com/你的帳號/你的項目/main/admin_ui.py"
-                url = "https://raw.githubusercontent.com/xubingf17/invest-system/main/admin_ui.py"
-                # response = requests.get(url, timeout=5)
-                response = requests.get(f"{url}?t={int(time.time())}")
+                # 1. 使用 GitHub API 獲取檔案內容
+                # 格式：https://api.github.com/repos/{帳號}/{專案}/contents/{路徑}
+                api_url = "https://api.github.com/repos/xubingf17/invest-system/contents/admin_ui.py"
+                
+                # 關鍵：加入這個 Header，API 會直接回傳檔案的純文字內容 (Raw string)
+                headers = {"Accept": "application/vnd.github.v3.raw"}
+                
+                response = requests.get(api_url, headers=headers, timeout=10)
                 
                 if response.status_code == 200:
                     remote_code = response.text
                     
-                    # 使用正規表達式抓取雲端檔案裡的 VERSION 字串
-                    version_match = re.search(r'CURRENT_VERSION\s*=\s*"([^"]+)"', remote_code)
+                    # 2. 提取雲端版本號 (支援單引號與雙引號)
+                    version_match = re.search(r'CURRENT_VERSION\s*=\s*[\'"]([^\'"]+)[\'"]', remote_code)
                     remote_version = version_match.group(1) if version_match else "0.0.0"
                     
+                    # Debug 資訊 (可視化比對)
+                    # st.write(f"📡 API 抓取版本: {remote_version}")
+                    # st.write(f"💻 本機目前版本: {CURRENT_VERSION}")
+                    
                     if remote_version > CURRENT_VERSION:
-                        status.update(label=f"發現新版本 {remote_version}，正在下載...", state="running")
+                        status.update(label=f"🚀 發現新版本 {remote_version}！準備升級...", state="running")
+                        
+                        # 3. 覆寫本地檔案
                         with open("admin_ui.py", "w", encoding="utf-8") as f:
                             f.write(remote_code)
-                        status.update(label=f"✅ 已升級至 {remote_version}！請重啟程式", state="complete", expanded=False)
+                        
+                        status.update(label=f"✅ 升級完成 (v{remote_version})！請重新啟動", state="complete", expanded=False)
                         st.balloons()
+                        # 提示用戶重啟或自動重整
+                        st.info("系統已更新，請關閉後重新開啟應用程式以套用變更。")
                     else:
-                        status.update(label=f"✅ 目前已是最新版本 (v{CURRENT_VERSION})", state="complete", expanded=False)
+                        status.update(label=f"✅ 您的系統已是最新狀態 (v{CURRENT_VERSION})", state="complete", expanded=False)
+                
+                elif response.status_code == 403:
+                    st.error("❌ 觸發 GitHub API 頻率限制，請稍後再試。")
                 else:
-                    st.error("❌ 無法連線至伺服器，請稍後再試。")
+                    st.error(f"❌ 無法連線至 API (HTTP {response.status_code})")
+                    
             except Exception as e:
-                st.error(f"❌ 更新出錯：{e}")
+                st.error(f"❌ 檢查更新時發生錯誤：{e}")
 
 # --- 1. 客戶資料瀏覽 ---
 if menu == "📊 客戶資料瀏覽":
