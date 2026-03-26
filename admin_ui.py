@@ -6,7 +6,7 @@ from dateutil.relativedelta import relativedelta
 from io import BytesIO
 import time
 
-CURRENT_VERSION = "1.0.5"
+CURRENT_VERSION = "1.0.6"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -428,20 +428,63 @@ elif menu == "📋 合約總覽":
 elif menu == "⚙️ 基礎資料設定":
     st.title("⚙️ 系統參數與管理")
 
-    # --- 1. 職級分潤管理 (編輯+刪除) ---
-    st.subheader("🎖️ 業務職級與分潤設定")
+    # --- 1. 業務員職級變更 (這是新增加的功能) ---
+    st.subheader("👤 業務員職級調整")
+    with st.expander("🛠️ 執行業務升遷", expanded=True):
+        # 抓取所有業務員與其目前的職級
+        agent_query = """
+            SELECT a.agent_id, a.name as 業務姓名, r.rank_name as 目前職級, r.rank_id
+            FROM agents a
+            JOIN ranks r ON a.rank_id = r.rank_id
+        """
+        all_agents_df = pd.read_sql(agent_query, conn)
+        
+        # 抓取所有可選職級
+        all_ranks_df = pd.read_sql("SELECT rank_id, rank_name FROM ranks", conn)
+
+        if not all_agents_df.empty:
+            col_sel_a, col_sel_r = st.columns(2)
+            with col_sel_a:
+                # 建立選擇選單
+                agent_options = all_agents_df.apply(lambda r: f"{r['業務姓名']} (目前: {r['目前職級']})", axis=1).tolist()
+                selected_agent_str = st.selectbox("選擇要調整的業務員", agent_options)
+                # 解析出選擇的 agent_id
+                target_agent_id = int(all_agents_df.iloc[agent_options.index(selected_agent_str)]['agent_id'])
+            
+            with col_sel_r:
+                rank_options = all_ranks_df['rank_name'].tolist()
+                target_rank_name = st.selectbox("調整為新職級", rank_options)
+                # 解析出選擇的 rank_id
+                target_rank_id = int(all_ranks_df[all_ranks_df['rank_name'] == target_rank_name]['rank_id'].values[0])
+
+            if st.button("確認變更職級", use_container_width=True, type="primary"):
+                try:
+                    conn.execute("UPDATE agents SET rank_id = ? WHERE agent_id = ?", (target_rank_id, target_agent_id))
+                    conn.commit()
+                    st.success(f"✅ 變更成功！已將該業務員職級更新為 {target_rank_name}")
+                    time.sleep(1)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"變更失敗：{e}")
+        else:
+            st.info("目前尚無業務員資料。")
+
+    st.divider()
+
+    # --- 2. 職級分潤管理 (編輯+刪除) ---
+    st.subheader("🎖️ 業務職級與分潤定義")
     rank_df = pd.read_sql("SELECT rank_id, rank_name as 職級, commission_rate as 分潤比例 FROM ranks", conn)
     
     col_r1, col_r2 = st.columns([1, 1.2])
     with col_r1:
-        st.write("📌 **目前職級清單**")
+        st.write("📌 **目前職級定義**")
         if not rank_df.empty:
             st.table(rank_df[['職級', '分潤比例']].style.format({"分潤比例": "{:.1%}"}))
         else:
             st.info("尚未建立職級。")
 
     with col_r2:
-        st.write("📝 **修改或刪除職級**")
+        st.write("📝 **修改職級名稱或比例**")
         if not rank_df.empty:
             target_rank = st.selectbox("選擇操作職級", rank_df['職級'].tolist(), key="rank_op_sel")
             curr_r = rank_df[rank_df['職級'] == target_rank].iloc[0]
@@ -454,9 +497,7 @@ elif menu == "⚙️ 基礎資料設定":
                                  (new_r_name, new_r_comm/100.0, int(curr_r['rank_id'])))
                     conn.commit(); st.success("更新成功"); time.sleep(0.5); st.rerun()
 
-            # 🔴 刪除職級邏輯
             if st.button(f"❌ 刪除職級：{target_rank}", type="secondary", use_container_width=True):
-                # 檢查是否有業務員還在這個職級
                 check_agent = pd.read_sql(f"SELECT COUNT(*) as count FROM agents WHERE rank_id = {curr_r['rank_id']}", conn)
                 if check_agent['count'][0] > 0:
                     st.error(f"無法刪除！目前仍有 {check_agent['count'][0]} 位業務員屬於此職級。請先將他們調職。")
@@ -466,7 +507,7 @@ elif menu == "⚙️ 基礎資料設定":
 
     st.divider()
 
-    # --- 2. 利率方案管理 (編輯+刪除) ---
+    # --- 3. 利率方案管理 (編輯+刪除) ---
     st.subheader("📈 利率方案設定")
     plan_df = pd.read_sql("SELECT plan_id, plan_name as 方案, annual_rate as 年利率, period_months as 週期 FROM rate_plans", conn)
     
@@ -485,21 +526,9 @@ elif menu == "⚙️ 基礎資料設定":
             p_info = plan_df[plan_df['方案'] == target_p].iloc[0]
             
             with st.expander("修改方案參數"):
-                # 幫每個輸入框加上專屬的 key
                 new_p_name = st.text_input("修正方案名稱", value=p_info['方案'], key="edit_plan_name_input")
-                
-                # 這裡就是報錯的地方，加上 key="edit_plan_rate_number"
-                new_p_rate = st.number_input(
-                    "修正年利率 (%)", 
-                    value=float(p_info['年利率']), 
-                    key="edit_plan_rate_number" 
-                )
-                
-                new_p_period = st.number_input(
-                    "修正週期 (月)", 
-                    value=int(p_info['週期']), 
-                    key="edit_plan_period_number"
-                )
+                new_p_rate = st.number_input("修正年利率 (%)", value=float(p_info['年利率']), key="edit_plan_rate_number")
+                new_p_period = st.number_input("修正週期 (月)", value=int(p_info['週期']), key="edit_plan_period_number")
                 
                 if st.button("💾 儲存方案修改", use_container_width=True, key="save_plan_btn"):
                     conn.execute("UPDATE rate_plans SET plan_name = ?, annual_rate = ?, period_months = ? WHERE plan_id = ?", 
@@ -509,7 +538,6 @@ elif menu == "⚙️ 基礎資料設定":
                     time.sleep(0.5)
                     st.rerun()
 
-            # 刪除按鈕也加上 key
             if st.button(f"❌ 刪除方案：{target_p}", type="secondary", use_container_width=True, key="del_plan_btn"):
                 check_contract = pd.read_sql(f"SELECT COUNT(*) as count FROM invest_contracts WHERE plan_id = {p_info['plan_id']}", conn)
                 if check_contract['count'][0] > 0:
@@ -520,21 +548,6 @@ elif menu == "⚙️ 基礎資料設定":
                     st.warning(f"已刪除方案：{target_p}")
                     time.sleep(0.5)
                     st.rerun()
-
-    st.divider()
-
-    # # --- 3. 利率方案管理 ---
-    # st.subheader("📈 利率方案設定")
-    # plan_df = pd.read_sql("SELECT plan_id, plan_name as 方案, annual_rate as 年利率, period_months as 週期 FROM rate_plans", conn)
-    # if not plan_df.empty:
-    #     st.table(plan_df[['方案', '年利率', '週期']])
-    #     with st.expander("📝 修改方案參數"):
-    #         target_p = st.selectbox("選擇方案", plan_df['方案'].tolist())
-    #         p_info = plan_df[plan_df['方案'] == target_p].iloc[0]
-    #         new_p_rate = st.number_input("修正年利率 (%)", value=float(p_info['年利率']))
-    #         if st.button("💾 儲存方案修改"):
-    #             conn.execute("UPDATE rate_plans SET annual_rate = ? WHERE plan_id = ?", (new_p_rate, int(p_info['plan_id'])))
-    #             conn.commit(); st.success("方案已更新"); time.sleep(1); st.rerun()
 
 elif menu == "👤 客戶總覽":
     st.title("👤 客戶資料管理")
