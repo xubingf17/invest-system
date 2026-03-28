@@ -8,7 +8,7 @@ import time
 # import graphviz
 
 
-CURRENT_VERSION = "1.0.8"
+CURRENT_VERSION = "1.0.9"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -691,13 +691,16 @@ elif menu == "➕ 新增資料":
         
         # --- 1. 下載範本 ---
         st.markdown("#### 📥 第一步：下載範本")
+        
         today = date.today()
         roc_year = today.year - 1911
         
+        # 建立全自動對照範本 (移除方案ID)
         template_df = pd.DataFrame({
             "客戶姓名": ["王小明", "李大華"],
             "歸屬業務姓名": ["張經理", "李襄理"],
-            "方案ID": [1, 2],
+            "年利率(%)": [6.0, 8.5],
+            "週期(月)": [12, 24],
             "金額(萬)": [100.0, 50.0],
             "生效年": [roc_year, roc_year],
             "生效月": [today.month, today.month],
@@ -706,7 +709,7 @@ elif menu == "➕ 新增資料":
         })
         
         csv_data = template_df.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下載分欄式範本 (CSV)", csv_data, "合約匯入範本.csv", "text/csv")
+        st.download_button("📥 下載全自動對照範本 (CSV)", csv_data, "合約匯入範本_自動對照版.csv", "text/csv")
 
         st.divider()
 
@@ -723,9 +726,11 @@ elif menu == "➕ 新增資料":
                 except: continue
             
             if df_upload is not None:
+                # 清理文字
                 df_upload['歸屬業務姓名'] = df_upload['歸屬業務姓名'].astype(str).str.strip()
                 df_upload['客戶姓名'] = df_upload['客戶姓名'].astype(str).str.strip()
 
+                # 業務員預檢
                 csv_agents = set(df_upload['歸屬業務姓名'].unique())
                 db_agents_df = pd.read_sql("SELECT name FROM agents", conn)
                 db_agents = set(db_agents_df['name'].unique())
@@ -735,7 +740,7 @@ elif menu == "➕ 新增資料":
                     st.error("⚠️ 找不到業務員：")
                     for agent in missing_agents: st.markdown(f"- ❌ `{agent}`")
                 else:
-                    st.success("✅ 業務員對照成功！")
+                    st.success("✅ 業務員預檢通過！")
                     st.dataframe(df_upload, use_container_width=True, hide_index=True)
                     
                     if st.button("🔥 確定執行智慧匯入", type="primary", use_container_width=True):
@@ -743,12 +748,25 @@ elif menu == "➕ 新增資料":
                             cursor = conn.cursor()
                             success_count = 0
                             new_cust_count = 0
+                            error_list = []
                             
                             for _, row in df_upload.iterrows():
                                 cust_name = row['客戶姓名']
                                 agent_name = row['歸屬業務姓名']
                                 
-                                # A. 客戶處理
+                                # A. 方案自動對照 (核心邏輯)
+                                target_rate = float(row['年利率(%)'])
+                                target_period = int(row['週期(月)'])
+                                
+                                plan_res = pd.read_sql(f"SELECT plan_id FROM rate_plans WHERE annual_rate = {target_rate} AND period_months = {target_period}", conn)
+                                
+                                if plan_res.empty:
+                                    error_list.append(f"客戶『{cust_name}』：找不到 利率 {target_rate}% / 週期 {target_period}月 的對應方案")
+                                    continue
+                                
+                                p_id = int(plan_res['plan_id'][0])
+
+                                # B. 客戶處理
                                 check_cust = pd.read_sql(f"SELECT customer_id FROM customers WHERE name = '{cust_name}'", conn)
                                 if check_cust.empty:
                                     ag_res = pd.read_sql(f"SELECT agent_id FROM agents WHERE name = '{agent_name}'", conn)
@@ -760,38 +778,36 @@ elif menu == "➕ 新增資料":
                                 else:
                                     cust_id = int(check_cust['customer_id'][0])
 
-                                # B. 日期處理
+                                # C. 日期處理
                                 try:
                                     y = int(row['生效年']) + 1911
                                     m = int(row['生效月'])
                                     d = int(row['生效日'])
                                     s_dt = date(y, m, d)
                                 except:
+                                    error_list.append(f"客戶『{cust_name}』：日期格式有誤")
                                     continue
 
-                                # C. 建立合約 (修正 Bindings: 7 個問號對應 7 個參數)
-                                p_id = int(row['方案ID'])
-                                plan_info = pd.read_sql(f"SELECT period_months FROM rate_plans WHERE plan_id={p_id}", conn)
-                                if not plan_info.empty:
-                                    months = int(plan_info['period_months'][0])
-                                    real_amt = float(row['金額(萬)']) * 10000
-                                    e_dt = s_dt + relativedelta(months=months)
-                                    
-                                    # 注意：這裡 (values) 的最後一個 0 是寫死的，所以參數列不需要再傳一次 0
-                                    cursor.execute("""
-                                        INSERT INTO invest_contracts (customer_id, plan_id, amount, start_date, end_date, status, note, is_renewed)
-                                        VALUES (?, ?, ?, ?, ?, ?, ?, 0)
-                                    """, (cust_id, p_id, real_amt, s_dt.isoformat(), e_dt.isoformat(), "Active", str(row.get('備註', ''))))
-                                    success_count += 1
+                                # D. 建立合約
+                                real_amt = float(row['金額(萬)']) * 10000
+                                e_dt = s_dt + relativedelta(months=target_period)
                                 
+                                cursor.execute("""
+                                    INSERT INTO invest_contracts (customer_id, plan_id, amount, start_date, end_date, status, note, is_renewed)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+                                """, (cust_id, p_id, real_amt, s_dt.isoformat(), e_dt.isoformat(), "Active", str(row.get('備註', ''))))
+                                success_count += 1
+                            
                             conn.commit()
+                            if error_list:
+                                for err in error_list: st.warning(err)
+                            
                             st.balloons()
-                            st.toast(f"✅ 匯入成功！", icon='🎉')
-                            time.sleep(1)
+                            st.success(f"🎉 匯入完成！成功：{success_count} 筆，新增客戶：{new_cust_count} 位")
+                            time.sleep(2)
                             st.rerun()
                         except Exception as e:
-                            st.error(f"❌ 匯入出錯：{e}")
-
+                            st.error(f"❌ 執行出錯：{e}")
     st.divider()
 
     # --- 第二部分：建立基礎對象 (已交換至下方) ---
