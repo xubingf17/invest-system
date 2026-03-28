@@ -5,8 +5,10 @@ from datetime import datetime, date
 from dateutil.relativedelta import relativedelta
 from io import BytesIO
 import time
+# import graphviz
 
-CURRENT_VERSION = "1.0.6"
+
+CURRENT_VERSION = "1.0.7"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -103,7 +105,7 @@ with st.sidebar:
     st.title("📂 系統總覽")
     menu = st.sidebar.radio(
         "請選擇功能模組：",
-        ["📋 合約總覽","📅 到期續約管理" , "💰 收益發放試算","💰 業務佣金", "👤 客戶總覽","➕ 新增資料", "⚙️ 基礎資料設定"],
+        ["📋 合約總覽","📅 到期續約管理" , "💰 收益發放試算","💰 業務佣金", "👤 客戶總覽", "🌳 團隊組織圖","➕ 新增資料", "⚙️ 基礎資料設定"],
         index=0,
         label_visibility="collapsed"
     )
@@ -428,40 +430,63 @@ elif menu == "📋 合約總覽":
 elif menu == "⚙️ 基礎資料設定":
     st.title("⚙️ 系統參數與管理")
 
-    # --- 1. 業務員職級變更 (這是新增加的功能) ---
-    st.subheader("👤 業務員職級調整")
-    with st.expander("🛠️ 執行業務升遷", expanded=True):
-        # 抓取所有業務員與其目前的職級
+    st.subheader("👤 業務員人事調整")
+    with st.expander("🛠️ 執行業務升遷或調動", expanded=True):
+        # 抓取所有業務員資訊，包含其主管姓名
         agent_query = """
-            SELECT a.agent_id, a.name as 業務姓名, r.rank_name as 目前職級, r.rank_id
+            SELECT a.agent_id, a.name as 業務姓名, r.rank_name as 目前職級, r.rank_id, 
+                   b.name as 目前主管, a.boss_id
             FROM agents a
             JOIN ranks r ON a.rank_id = r.rank_id
+            LEFT JOIN agents b ON a.boss_id = b.agent_id
         """
         all_agents_df = pd.read_sql(agent_query, conn)
         
-        # 抓取所有可選職級
+        # 抓取所有職級
         all_ranks_df = pd.read_sql("SELECT rank_id, rank_name FROM ranks", conn)
 
         if not all_agents_df.empty:
-            col_sel_a, col_sel_r = st.columns(2)
-            with col_sel_a:
-                # 建立選擇選單
-                agent_options = all_agents_df.apply(lambda r: f"{r['業務姓名']} (目前: {r['目前職級']})", axis=1).tolist()
-                selected_agent_str = st.selectbox("選擇要調整的業務員", agent_options)
-                # 解析出選擇的 agent_id
-                target_agent_id = int(all_agents_df.iloc[agent_options.index(selected_agent_str)]['agent_id'])
-            
-            with col_sel_r:
-                rank_options = all_ranks_df['rank_name'].tolist()
-                target_rank_name = st.selectbox("調整為新職級", rank_options)
-                # 解析出選擇的 rank_id
-                target_rank_id = int(all_ranks_df[all_ranks_df['rank_name'] == target_rank_name]['rank_id'].values[0])
+            # 1. 選擇業務員
+            agent_options = all_agents_df.apply(lambda r: f"{r['業務姓名']} (級別: {r['目前職級']} | 主管: {r['目前主管'] if r['目前主管'] else '無'})", axis=1).tolist()
+            selected_agent_str = st.selectbox("選擇要調整的業務員", agent_options)
+            target_idx = agent_options.index(selected_agent_str)
+            target_agent_id = int(all_agents_df.iloc[target_idx]['agent_id'])
+            target_agent_name = all_agents_df.iloc[target_idx]['業務姓名']
 
-            if st.button("確認變更職級", use_container_width=True, type="primary"):
+            col_edit_rank, col_edit_boss = st.columns(2)
+            
+            with col_edit_rank:
+                # 2. 選擇新職級
+                current_rank_name = all_agents_df.iloc[target_idx]['目前職級']
+                rank_list = all_ranks_df['rank_name'].tolist()
+                new_rank_name = st.selectbox("變更新職級", rank_list, index=rank_list.index(current_rank_name))
+                new_rank_id = int(all_ranks_df[all_ranks_df['rank_name'] == new_rank_name]['rank_id'].values[0])
+            
+            with col_edit_boss:
+                # 3. 選擇新主管 (過濾掉自己，避免邏輯循環)
+                potential_boss_df = all_agents_df[all_agents_df['agent_id'] != target_agent_id]
+                boss_list = ["None (無主管/最高階)"] + potential_boss_df['業務姓名'].tolist()
+                
+                # 預設選中目前的主管
+                current_boss = all_agents_df.iloc[target_idx]['目前主管']
+                default_boss_idx = boss_list.index(current_boss) if current_boss in boss_list else 0
+                
+                new_boss_name = st.selectbox("變更直屬主管", boss_list, index=default_boss_idx)
+                
+                if new_boss_name == "None (無主管/最高階)":
+                    new_boss_id = None
+                else:
+                    new_boss_id = int(potential_boss_df[potential_boss_df['業務姓名'] == new_boss_name]['agent_id'].values[0])
+
+            if st.button("💾 確認存檔人事變更", use_container_width=True, type="primary"):
                 try:
-                    conn.execute("UPDATE agents SET rank_id = ? WHERE agent_id = ?", (target_rank_id, target_agent_id))
+                    conn.execute("""
+                        UPDATE agents 
+                        SET rank_id = ?, boss_id = ? 
+                        WHERE agent_id = ?
+                    """, (new_rank_id, new_boss_id, target_agent_id))
                     conn.commit()
-                    st.success(f"✅ 變更成功！已將該業務員職級更新為 {target_rank_name}")
+                    st.success(f"✅ 變更成功！{target_agent_name} 的資料已更新。")
                     time.sleep(1)
                     st.rerun()
                 except Exception as e:
@@ -1146,6 +1171,69 @@ elif menu == "💰 業務佣金":
             st.warning(f"🌙 在 {start_f} 到 {end_f} 之間沒有任何新合約生效。")
     else:
         st.info("請在上方日期欄位選擇『開始日期』與『結束日期』。")
+
+# --- 🌳 團隊組織圖 模組 ---
+elif menu == "🌳 團隊組織圖":
+    st.title("🌳 團隊組織架構圖")
+    st.info("💡 提示：此圖表根據業務員設定之「直屬主管」自動生成。若要調整隸屬關係，請至「基礎資料設定」。")
+
+    # 1. 執行 SQL 抓取關係 (包含業務姓名、主管姓名、職級)
+    query = """
+        SELECT 
+            a.name as employee, 
+            b.name as boss, 
+            r.rank_name as rank
+        FROM agents a
+        LEFT JOIN agents b ON a.boss_id = b.agent_id
+        JOIN ranks r ON a.rank_id = r.rank_id
+    """
+    hierarchy_df = pd.read_sql(query, conn)
+
+    if not hierarchy_df.empty:
+        
+        # 2. 構建 Graphviz 語法字串 (使用高相容性語法)
+        # TB 代表 Top to Bottom (由上而下)
+        dot_code = """
+        digraph {
+            graph [rankdir=TB, nodesep=0.5, ranksep=0.8];
+            node [
+                shape=box, 
+                style="filled,rounded", 
+                color="#1f77b4", 
+                fillcolor="#1f77b4", 
+                fontcolor=white, 
+                fontname="Arial",
+                width=1.5,
+                height=0.6
+            ];
+            edge [color="#777777", penwidth=1.5];
+        """
+
+        for _, row in hierarchy_df.iterrows():
+            # 節點顯示：姓名 \n (職級)
+            node_label = f"{row['employee']}\\n({row['rank']})"
+            dot_code += f'    "{row["employee"]}" [label="{node_label}"];\n'
+            
+            # 如果有主管，建立連線 (主管 -> 部屬)
+            if row['boss']:
+                dot_code += f'    "{row["boss"]}" -> "{row["employee"]}";\n'
+
+        dot_code += "}"
+
+        # 3. 渲染圖表
+        try:
+            st.graphviz_chart(dot_code)
+        except Exception as e:
+            st.error(f"圖表渲染失敗，請確保已安裝 graphviz 套件。錯誤：{e}")
+        
+        # 4. 附上清單方便核對
+        with st.expander("📋 查看文字版隸屬清單"):
+            display_h = hierarchy_df.copy()
+            display_h.columns = ['業務姓名', '直屬主管', '職級']
+            st.table(display_h.fillna("-(最高階)-"))
+            
+    else:
+        st.warning("目前資料庫中尚無業務員資料，請先至「新增資料」建立。")
 
 st.markdown("---")
 st.caption(f"© 2026 Bing Xu. All Rights Reserved. | 投資管理系統 v{CURRENT_VERSION}")
