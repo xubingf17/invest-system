@@ -689,112 +689,108 @@ elif menu == "➕ 新增資料":
     else:
         st.write("### 🚀 批量匯入投資合約")
         
-        # --- 1. 顯示 ID 對照表 (維持置中與比例) ---
-        st.markdown("#### 📖 第一步：核對 ID 對照表")
-        st.markdown("""
-            <style>
-                [data-testid="stDataFrame"] td { text-align: center !important; }
-                [data-testid="stDataFrame"] th { text-align: center !important; }
-            </style>
-        """, unsafe_allow_html=True)
-
-        ref_col1, ref_col2 = st.columns(2)
-        with ref_col1:
-            st.write("👤 **客戶 ID 對照**")
-            cust_ref = pd.read_sql("SELECT customer_id as ID, name as 客戶姓名 FROM customers", conn)
-            st.dataframe(cust_ref, height=200, use_container_width=True, hide_index=True)
+        # --- 1. 下載範本 ---
+        st.markdown("#### 📥 第一步：下載範本")
+        today = date.today()
+        roc_year = today.year - 1911
         
-        with ref_col2:
-            st.write("📈 **方案 ID 對照**")
-            plan_ref = pd.read_sql("SELECT plan_id as ID, plan_name || ' (' || annual_rate || '%)' as 方案名稱 FROM rate_plans", conn)
-            st.dataframe(plan_ref, height=200, use_container_width=True, hide_index=True)
+        template_df = pd.DataFrame({
+            "客戶姓名": ["王小明", "李大華"],
+            "歸屬業務姓名": ["張經理", "李襄理"],
+            "方案ID": [1, 2],
+            "金額(萬)": [100.0, 50.0],
+            "生效年": [roc_year, roc_year],
+            "生效月": [today.month, today.month],
+            "生效日": [today.day, today.day],
+            "備註": ["新件", "續約"]
+        })
+        
+        csv_data = template_df.to_csv(index=False).encode('utf-8-sig')
+        st.download_button("📥 下載分欄式範本 (CSV)", csv_data, "合約匯入範本.csv", "text/csv")
 
         st.divider()
 
-        # --- 2. 下載「全中文標題」的範本 ---
-        op_col1, op_col2 = st.columns([1, 2])
-        with op_col1:
-            st.markdown("#### 📥 第二步：下載中文範本")
+        # --- 2. 上傳與預檢 ---
+        uploaded_file = st.file_uploader("選擇填寫好的 CSV 檔案", type="csv")
+        
+        if uploaded_file:
+            df_upload = None
+            for enc in ['utf-8-sig', 'utf-8', 'cp950']:
+                try:
+                    uploaded_file.seek(0)
+                    df_upload = pd.read_csv(uploaded_file, encoding=enc)
+                    break
+                except: continue
             
-            # 這裡的欄位名稱直接改為中文，方便業務員填寫
-            template_df = pd.DataFrame({
-                "客戶ID": [1],
-                "方案ID": [1],
-                "金額(萬)": [100.0],
-                "生效日期": ["2026-03-01"],
-                "備註": [" "]
-            })
-            
-            csv_data = template_df.to_csv(index=False).encode('utf-8-sig')
-            st.download_button(
-                label="📥 下載中文 CSV 範本",
-                data=csv_data,
-                file_name="投資合約匯入範本_中文版.csv",
-                mime="text/csv",
-                use_container_width=True
-            )
-            
-        with op_col2:
-            st.markdown("#### 📤 第三步：上傳並匯入")
-            uploaded_file = st.file_uploader("選擇填寫好的中文 CSV 檔案", type="csv")
-            
-            if uploaded_file:
-                df_upload = None
-                for enc in ['utf-8-sig', 'utf-8', 'cp950']:
-                    try:
-                        uploaded_file.seek(0)
-                        df_upload = pd.read_csv(uploaded_file, encoding=enc)
-                        break
-                    except: continue
+            if df_upload is not None:
+                df_upload['歸屬業務姓名'] = df_upload['歸屬業務姓名'].astype(str).str.strip()
+                df_upload['客戶姓名'] = df_upload['客戶姓名'].astype(str).str.strip()
+
+                csv_agents = set(df_upload['歸屬業務姓名'].unique())
+                db_agents_df = pd.read_sql("SELECT name FROM agents", conn)
+                db_agents = set(db_agents_df['name'].unique())
+                missing_agents = csv_agents - db_agents
                 
-                if df_upload is not None:
-                    # --- 關鍵：將中文標題轉回英文，以便程式處理 ---
-                    # 建立對照字典
-                    column_map = {
-                        "客戶ID": "customer_id",
-                        "方案ID": "plan_id",
-                        "金額(萬)": "amount_wan",
-                        "生效日期": "start_date",
-                        "備註": "note"
-                    }
+                if missing_agents:
+                    st.error("⚠️ 找不到業務員：")
+                    for agent in missing_agents: st.markdown(f"- ❌ `{agent}`")
+                else:
+                    st.success("✅ 業務員對照成功！")
+                    st.dataframe(df_upload, use_container_width=True, hide_index=True)
                     
-                    # 檢查上傳的欄位是否正確
-                    if all(col in df_upload.columns for col in column_map.keys()):
-                        st.write("👀 **預覽資料：**")
-                        st.dataframe(df_upload, use_container_width=True, hide_index=True)
-                        
-                        if st.button("🔥 確定執行批量匯入", type="primary", use_container_width=True):
-                            try:
-                                # 這裡將中文欄位更名回英文，方便後續迴圈讀取
-                                df_final = df_upload.rename(columns=column_map)
+                    if st.button("🔥 確定執行智慧匯入", type="primary", use_container_width=True):
+                        try:
+                            cursor = conn.cursor()
+                            success_count = 0
+                            new_cust_count = 0
+                            
+                            for _, row in df_upload.iterrows():
+                                cust_name = row['客戶姓名']
+                                agent_name = row['歸屬業務姓名']
                                 
-                                cursor = conn.cursor()
-                                success_count = 0
-                                for _, row in df_final.iterrows():
-                                    p_id = int(row['plan_id'])
-                                    plan_info = pd.read_sql(f"SELECT period_months FROM rate_plans WHERE plan_id={p_id}", conn)
-                                    if plan_info.empty: continue
-                                        
+                                # A. 客戶處理
+                                check_cust = pd.read_sql(f"SELECT customer_id FROM customers WHERE name = '{cust_name}'", conn)
+                                if check_cust.empty:
+                                    ag_res = pd.read_sql(f"SELECT agent_id FROM agents WHERE name = '{agent_name}'", conn)
+                                    ag_id = int(ag_res['agent_id'][0])
+                                    cursor.execute("INSERT INTO customers (name, agent_id) VALUES (?, ?)", (cust_name, ag_id))
+                                    conn.commit()
+                                    cust_id = cursor.lastrowid
+                                    new_cust_count += 1
+                                else:
+                                    cust_id = int(check_cust['customer_id'][0])
+
+                                # B. 日期處理
+                                try:
+                                    y = int(row['生效年']) + 1911
+                                    m = int(row['生效月'])
+                                    d = int(row['生效日'])
+                                    s_dt = date(y, m, d)
+                                except:
+                                    continue
+
+                                # C. 建立合約 (修正 Bindings: 7 個問號對應 7 個參數)
+                                p_id = int(row['方案ID'])
+                                plan_info = pd.read_sql(f"SELECT period_months FROM rate_plans WHERE plan_id={p_id}", conn)
+                                if not plan_info.empty:
                                     months = int(plan_info['period_months'][0])
-                                    real_amt = float(row['amount_wan']) * 10000
-                                    s_dt = datetime.strptime(str(row['start_date']), '%Y-%m-%d').date()
+                                    real_amt = float(row['金額(萬)']) * 10000
                                     e_dt = s_dt + relativedelta(months=months)
                                     
+                                    # 注意：這裡 (values) 的最後一個 0 是寫死的，所以參數列不需要再傳一次 0
                                     cursor.execute("""
-                                        INSERT INTO invest_contracts (customer_id, plan_id, amount, start_date, end_date, status, note)
-                                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                                    """, (int(row['customer_id']), p_id, real_amt, s_dt.isoformat(), e_dt.isoformat(), "Active", row.get('note', '')))
+                                        INSERT INTO invest_contracts (customer_id, plan_id, amount, start_date, end_date, status, note, is_renewed)
+                                        VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+                                    """, (cust_id, p_id, real_amt, s_dt.isoformat(), e_dt.isoformat(), "Active", str(row.get('備註', ''))))
                                     success_count += 1
                                 
-                                conn.commit()
-                                st.toast(f"✅ 成功匯入 {success_count} 筆資料！", icon='🎉')
-                                import time
-                                time.sleep(1)
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"❌ 匯入出錯：請檢查資料格式是否正確。錯誤原因：{e}")
-                    else:
-                        st.error("⚠️ CSV 欄位名稱不正確！請務必使用系統提供的『中文範本』且不要更動標題。")
+                            conn.commit()
+                            st.balloons()
+                            st.toast(f"✅ 匯入成功！", icon='🎉')
+                            time.sleep(1)
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"❌ 匯入出錯：{e}")
 
     st.divider()
 
