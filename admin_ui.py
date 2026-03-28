@@ -8,7 +8,7 @@ import time
 # import graphviz
 
 
-CURRENT_VERSION = "1.0.9"
+CURRENT_VERSION = "1.1.0"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -431,8 +431,8 @@ elif menu == "⚙️ 基礎資料設定":
     st.title("⚙️ 系統參數與管理")
 
     st.subheader("👤 業務員人事調整")
-    with st.expander("🛠️ 執行業務升遷或調動", expanded=True):
-        # 抓取所有業務員資訊，包含其主管姓名
+    with st.expander("🛠️ 執行業務姓名、升遷或主管調動", expanded=True):
+        # 抓取所有業務員資訊
         agent_query = """
             SELECT a.agent_id, a.name as 業務姓名, r.rank_name as 目前職級, r.rank_id, 
                    b.name as 目前主管, a.boss_id
@@ -441,56 +441,58 @@ elif menu == "⚙️ 基礎資料設定":
             LEFT JOIN agents b ON a.boss_id = b.agent_id
         """
         all_agents_df = pd.read_sql(agent_query, conn)
-        
-        # 抓取所有職級
         all_ranks_df = pd.read_sql("SELECT rank_id, rank_name FROM ranks", conn)
 
         if not all_agents_df.empty:
-            # 1. 選擇業務員
-            agent_options = all_agents_df.apply(lambda r: f"{r['業務姓名']} (級別: {r['目前職級']} | 主管: {r['目前主管'] if r['目前主管'] else '無'})", axis=1).tolist()
-            selected_agent_str = st.selectbox("選擇要調整的業務員", agent_options)
-            target_idx = agent_options.index(selected_agent_str)
-            target_agent_id = int(all_agents_df.iloc[target_idx]['agent_id'])
-            target_agent_name = all_agents_df.iloc[target_idx]['業務姓名']
+            # A. 選擇要修改的對象
+            agent_list = all_agents_df.apply(lambda r: f"{r['業務姓名']} (級別: {r['目前職級']} | 主管: {r['目前主管'] if r['目前主管'] else '無'})", axis=1).tolist()
+            selected_agent_str = st.selectbox("1. 選擇要調整的業務員", agent_list)
+            t_idx = agent_list.index(selected_agent_str)
+            t_id = int(all_agents_df.iloc[t_idx]['agent_id'])
+            old_name = all_agents_df.iloc[t_idx]['業務姓名']
 
-            col_edit_rank, col_edit_boss = st.columns(2)
+            st.divider()
             
-            with col_edit_rank:
-                # 2. 選擇新職級
-                current_rank_name = all_agents_df.iloc[target_idx]['目前職級']
-                rank_list = all_ranks_df['rank_name'].tolist()
-                new_rank_name = st.selectbox("變更新職級", rank_list, index=rank_list.index(current_rank_name))
-                new_rank_id = int(all_ranks_df[all_ranks_df['rank_name'] == new_rank_name]['rank_id'].values[0])
+            # B. 編輯各項資料
+            col_name, col_rank, col_boss = st.columns(3)
             
-            with col_edit_boss:
-                # 3. 選擇新主管 (過濾掉自己，避免邏輯循環)
-                potential_boss_df = all_agents_df[all_agents_df['agent_id'] != target_agent_id]
-                boss_list = ["None (無主管/最高階)"] + potential_boss_df['業務姓名'].tolist()
-                
-                # 預設選中目前的主管
-                current_boss = all_agents_df.iloc[target_idx]['目前主管']
-                default_boss_idx = boss_list.index(current_boss) if current_boss in boss_list else 0
-                
-                new_boss_name = st.selectbox("變更直屬主管", boss_list, index=default_boss_idx)
-                
-                if new_boss_name == "None (無主管/最高階)":
-                    new_boss_id = None
+            with col_name:
+                # 新增：修改姓名欄位
+                new_name = st.text_input("📝 修改業務姓名", value=old_name)
+            
+            with col_rank:
+                curr_rank = all_agents_df.iloc[t_idx]['目前職級']
+                rank_opts = all_ranks_df['rank_name'].tolist()
+                new_rank = st.selectbox("🎖️ 變更新職級", rank_opts, index=rank_opts.index(curr_rank))
+                new_rank_id = int(all_ranks_df[all_ranks_df['rank_name'] == new_rank]['rank_id'].values[0])
+            
+            with col_boss:
+                potential_boss = all_agents_df[all_agents_df['agent_id'] != t_id]
+                boss_opts = ["None (無主管)"] + potential_boss['業務姓名'].tolist()
+                curr_boss = all_agents_df.iloc[t_idx]['目前主管']
+                def_idx = boss_opts.index(curr_boss) if curr_boss in boss_opts else 0
+                new_boss_name = st.selectbox("🌳 變更直屬主管", boss_opts, index=def_idx)
+                new_boss_id = None if new_boss_name == "None (無主管)" else int(potential_boss[potential_boss['業務姓名'] == new_boss_name]['agent_id'].values[0])
+
+            if st.button("💾 儲存所有變更", use_container_width=True, type="primary"):
+                if not new_name.strip():
+                    st.error("姓名不能為空！")
                 else:
-                    new_boss_id = int(potential_boss_df[potential_boss_df['業務姓名'] == new_boss_name]['agent_id'].values[0])
-
-            if st.button("💾 確認存檔人事變更", use_container_width=True, type="primary"):
-                try:
-                    conn.execute("""
-                        UPDATE agents 
-                        SET rank_id = ?, boss_id = ? 
-                        WHERE agent_id = ?
-                    """, (new_rank_id, new_boss_id, target_agent_id))
-                    conn.commit()
-                    st.success(f"✅ 變更成功！{target_agent_name} 的資料已更新。")
-                    time.sleep(1)
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"變更失敗：{e}")
+                    try:
+                        cursor = conn.cursor()
+                        # 執行更新：同時更新姓名、職級、主管 ID
+                        cursor.execute("""
+                            UPDATE agents 
+                            SET name = ?, rank_id = ?, boss_id = ? 
+                            WHERE agent_id = ?
+                        """, (new_name.strip(), new_rank_id, new_boss_id, t_id))
+                        
+                        conn.commit()
+                        st.success(f"✅ 更新成功！已將資料同步至系統。")
+                        time.sleep(1)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"變更失敗：{e}")
         else:
             st.info("目前尚無業務員資料。")
 
