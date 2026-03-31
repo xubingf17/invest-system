@@ -8,7 +8,7 @@ import time
 # import graphviz
 
 
-CURRENT_VERSION = "1.1.1"
+CURRENT_VERSION = "1.1.2"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -556,24 +556,28 @@ elif menu == "⚙️ 基礎資料設定":
     with st.expander("💣 重設系統資料 (慎用)"):
         st.warning("此操作將永久刪除『所有』投資合約紀錄，但會保留您的客戶、業務員與方案設定。")
         
-        # 二次確認機制
         confirm_text = st.text_input("請在下方輸入『CONFIRM』以確認刪除所有合約：")
         
         if st.button("🔥 確定清空所有合約資料", type="primary", use_container_width=True):
             if confirm_text == "CONFIRM":
                 try:
                     cursor = conn.cursor()
-                    # 執行刪除所有合約
-                    cursor.execute("DELETE FROM invest_contracts")
-                    # 重設 ID 計數器（讓下一筆從 ID 1 開始）
-                    cursor.execute("DELETE FROM sqlite_sequence WHERE name='invest_contracts'")
-                    conn.commit()
                     
-                    st.success("✅ 所有合約資料已清空！")
+                    # 1. 刪除所有合約資料
+                    cursor.execute("DELETE FROM invest_contracts")
+                    
+                    # 2. 智慧重設計數器：先檢查 sqlite_sequence 是否存在
+                    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='sqlite_sequence'")
+                    if cursor.fetchone():
+                        # 如果表存在，才執行歸零
+                        cursor.execute("DELETE FROM sqlite_sequence WHERE name='invest_contracts'")
+                    
+                    conn.commit()
+                    st.success("✅ 所有合約資料已清空，計數器已重置！")
                     time.sleep(1)
                     st.rerun()
                 except Exception as e:
-                    st.error(f"刪除失敗：{e}")
+                    st.error(f"❌ 刪除失敗：{e}")
             else:
                 st.error("請正確輸入『CONFIRM』字樣。")
 
