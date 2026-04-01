@@ -8,7 +8,7 @@ import time
 # import graphviz
 
 
-CURRENT_VERSION = "1.1.3"
+CURRENT_VERSION = "1.1.4"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -354,7 +354,7 @@ elif menu == "📋 合約總覽":
         df_raw['狀態'] = df_raw['結束日'].apply(get_status_label)
 
     # --- 3. 篩選面板 (放置開關) ---
-    with st.expander("🔍 進階篩選面板 (50/50 比例)", expanded=True):
+    with st.expander("🔍 進階篩選面板", expanded=True):
         col_f1, col_f2 = st.columns(2)
         with col_f1:
             # 1. 準備統計資料 (邏輯前置，不影響 UI 順序)
@@ -743,7 +743,7 @@ elif menu == "➕ 新增資料":
                 contract_type_val = st.radio("📄 合約性質", ["新約", "續約"], index=1, horizontal=True, help="這將影響後續業績統計與佣金計算")
             
             # 備註欄位
-            note_val = st.text_area("🗒️ 合約備註 (選填)", placeholder="例如：由舊合約轉入、特別優惠等...", height=100)
+            note_val = st.text_area("🗒️ 合約備註 (選填)", placeholder="", height=100)
             
             # 提交按鈕
             submit_btn = st.form_submit_button("✅ 確認送出單筆合約", use_container_width=True, type="primary")
@@ -792,11 +792,9 @@ elif menu == "➕ 新增資料":
         
         # --- 1. 下載範本 ---
         st.markdown("#### 📥 第一步：下載範本")
-        
         today = date.today()
         roc_year = today.year - 1911
         
-        # 建立範本 (包含合約性質)
         template_df = pd.DataFrame({
             "客戶姓名": ["王小明", "李大華"],
             "歸屬業務姓名": ["張經理", "李襄理"],
@@ -811,14 +809,23 @@ elif menu == "➕ 新增資料":
         })
         
         csv_data = template_df.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下載全自動對照範本 (CSV)", csv_data, "合約匯入範本_v1.4.csv", "text/csv")
+        st.download_button("📥 下載批量匯入範本 (CSV)", csv_data, "合約匯入範本_v1.5.csv", "text/csv")
 
         st.divider()
 
         # --- 2. 上傳與預檢 ---
         uploaded_file = st.file_uploader("選擇填寫好的 CSV 檔案", type="csv")
         
+        # ⚡️ 初始化 session_state 用來存儲錯誤
+        if 'batch_errors' not in st.session_state:
+            st.session_state.batch_errors = []
+
         if uploaded_file:
+            # 💡 當有新檔案上傳時，自動清空之前的錯誤紀錄
+            if "last_file_name" not in st.session_state or st.session_state.last_file_name != uploaded_file.name:
+                st.session_state.batch_errors = []
+                st.session_state.last_file_name = uploaded_file.name
+
             df_upload = None
             for enc in ['utf-8-sig', 'utf-8', 'cp950']:
                 try:
@@ -828,90 +835,110 @@ elif menu == "➕ 新增資料":
                 except: continue
             
             if df_upload is not None:
-                # 清理文字
                 df_upload['歸屬業務姓名'] = df_upload['歸屬業務姓名'].astype(str).str.strip()
                 df_upload['客戶姓名'] = df_upload['客戶姓名'].astype(str).str.strip()
 
-                # 業務員預檢
-                db_agents_df = pd.read_sql("SELECT name FROM agents", conn)
-                db_agents = set(db_agents_df['name'].unique())
-                missing_agents = [a for a in df_upload['歸屬業務姓名'].unique() if a not in db_agents]
+                # A. 業務員預檢
+                db_agents_df = pd.read_sql("SELECT agent_id, name FROM agents", conn)
+                db_agents_dict = dict(zip(db_agents_df['name'], db_agents_df['agent_id']))
+                csv_agents = set(df_upload['歸屬業務姓名'].unique())
+                missing_agents = [a for a in csv_agents if a not in db_agents_dict]
                 
                 if missing_agents:
                     st.error(f"⚠️ 找不到業務員：{', '.join(missing_agents)}")
-                else:
-                    st.success("✅ 業務員預檢通過！")
-                    st.dataframe(df_upload, use_container_width=True, hide_index=True)
+                    st.stop() 
+                
+                st.success("✅ 業務員預檢通過！")
+                st.dataframe(df_upload, use_container_width=True, hide_index=True)
+                
+                # --- 執行按鈕 ---
+                if st.button("🔥 確定執行智慧匯入", type="primary", use_container_width=True):
+                    current_errors = [] 
+                    cursor = conn.cursor()
+                    success_count = 0
                     
-                    if st.button("🔥 確定執行智慧匯入", type="primary", use_container_width=True):
+                    for index, row in df_upload.iterrows():
+                        row_idx = index + 2 
+                        cust_name = str(row['客戶姓名']).strip()
+                        agent_name = str(row['歸屬業務姓名']).strip()
+                        
+                        # 1. 取得業務 ID (已預檢必存在)
+                        target_agent_id = db_agents_dict[agent_name]
+
+                        # 2. 處理合約性質
+                        c_type = str(row.get('合約性質', '續約')).strip()
+                        if not c_type or c_type == 'nan': c_type = "續約"
+                        if c_type not in ["新約", "續約"]: c_type = "續約"
+
+                        # 3. 方案自動對照
                         try:
-                            cursor = conn.cursor()
-                            success_count = 0
-                            error_list = []
-                            
-                            for _, row in df_upload.iterrows():
-                                cust_name = str(row['客戶姓名']).strip()
-                                agent_name = str(row['歸屬業務姓名']).strip()
-                                
-                                # A. 處理合約性質 (預設為續約)
-                                c_type = str(row.get('合約性質', '續約')).strip()
-                                if not c_type or c_type == 'nan': c_type = "續約"
-                                if c_type not in ["新約", "續約"]: c_type = "續約"
+                            target_rate = float(row['年利率(%)'])
+                            target_period = int(row['週期(月)'])
+                            plan_res = pd.read_sql("SELECT plan_id FROM rate_plans WHERE annual_rate = ? AND period_months = ?", conn, params=(target_rate, target_period))
+                            if plan_res.empty:
+                                current_errors.append(f"❌ 行號 {row_idx}：找不到利率 {target_rate}% / 週期 {target_period}月 的方案")
+                                continue
+                            p_id = int(plan_res['plan_id'][0])
+                        except Exception:
+                            current_errors.append(f"❌ 行號 {row_idx}：利率或週期格式錯誤")
+                            continue
 
-                                # B. 方案自動對照 (參數化查詢防止 nan 報錯)
-                                try:
-                                    target_rate = float(row['年利率(%)'])
-                                    target_period = int(row['週期(月)'])
-                                    plan_res = pd.read_sql("SELECT plan_id FROM rate_plans WHERE annual_rate = ? AND period_months = ?", conn, params=(target_rate, target_period))
-                                    
-                                    if plan_res.empty:
-                                        error_list.append(f"客戶『{cust_name}』：找不到對應方案 ({target_rate}% / {target_period}月)")
-                                        continue
-                                    p_id = int(plan_res['plan_id'][0])
-                                except:
-                                    error_list.append(f"客戶『{cust_name}』：利率或週期格式錯誤")
-                                    continue
+                        # 4. 日期與金額檢查
+                        try:
+                            y, m, d = int(row['生效年'])+1911, int(row['生效月']), int(row['生效日'])
+                            s_dt = date(y, m, d)
+                            e_dt = s_dt + relativedelta(months=target_period)
+                            real_amt = float(row['金額(萬)']) * 10000
+                        except Exception:
+                            current_errors.append(f"❌ 行號 {row_idx}：日期日期或金額格式錯誤")
+                            continue
 
-                                # C. 客戶處理
-                                check_cust = pd.read_sql(f"SELECT customer_id FROM customers WHERE name = '{cust_name}'", conn)
-                                if check_cust.empty:
-                                    ag_res = pd.read_sql(f"SELECT agent_id FROM agents WHERE name = '{agent_name}'", conn)
-                                    ag_id = int(ag_res['agent_id'][0])
-                                    cursor.execute("INSERT INTO customers (name, agent_id) VALUES (?, ?)", (cust_name, ag_id))
-                                    conn.commit()
-                                    cust_id = cursor.lastrowid
-                                else:
-                                    cust_id = int(check_cust['customer_id'][0])
-
-                                # D. 日期與金額處理
-                                try:
-                                    y, m, d = int(row['生效年'])+1911, int(row['生效月']), int(row['生效日'])
-                                    s_dt = date(y, m, d)
-                                    e_dt = s_dt + relativedelta(months=target_period)
-                                    real_amt = float(row['金額(萬)']) * 10000
-                                except:
-                                    error_list.append(f"客戶『{cust_name}』：日期或金額格式有誤")
-                                    continue
-
-                                # E. 建立合約
-                                cursor.execute("""
-                                    INSERT INTO invest_contracts (
-                                        customer_id, plan_id, amount, start_date, end_date, 
-                                        status, note, contract_type, is_renewed
-                                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
-                                """, (cust_id, p_id, real_amt, s_dt.isoformat(), e_dt.isoformat(), "Active", str(row.get('備註', '')), c_type))
-                                success_count += 1
-                            
+                        # 5. ⚡️ 客戶處理 (防撞名邏輯：姓名 + 業務ID)
+                        # 檢查該業務名下是否已有同名客戶
+                        check_cust = pd.read_sql(
+                            "SELECT customer_id FROM customers WHERE name = ? AND agent_id = ?", 
+                            conn, params=(cust_name, target_agent_id)
+                        )
+                        
+                        if check_cust.empty:
+                            # 建立該業務員名下的新客戶
+                            cursor.execute("INSERT INTO customers (name, agent_id) VALUES (?, ?)", (cust_name, target_agent_id))
                             conn.commit()
-                            if error_list:
-                                for err in error_list: st.warning(err)
-                            
-                            st.balloons()
-                            st.success(f"🎉 批量匯入完成！成功：{success_count} 筆")
-                            time.sleep(2)
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"❌ 執行出錯：{e}")
+                            cust_id = cursor.lastrowid
+                        else:
+                            cust_id = int(check_cust['customer_id'][0])
+
+                        # 6. 寫入合約
+                        cursor.execute("""
+                            INSERT INTO invest_contracts (customer_id, plan_id, amount, start_date, end_date, status, note, contract_type, is_renewed)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+                        """, (cust_id, p_id, real_amt, s_dt.isoformat(), e_dt.isoformat(), "Active", str(row.get('備註', '')), c_type))
+                        success_count += 1
+                    
+                    conn.commit()
+                    
+                    # 💡 將錯誤存入 session_state 供 Rerun 後顯示
+                    st.session_state.batch_errors = current_errors
+                    
+                    if not current_errors:
+                        st.balloons()
+                        st.success(f"🎉 批量匯入成功！共完成 {success_count} 筆。")
+                        time.sleep(1)
+                        st.rerun()
+                    else:
+                        st.warning(f"⚠️ 匯入完成，但發現 {len(current_errors)} 處錯誤 (已跳過該行)。")
+
+        # --- 3. 顯示錯誤清單 ---
+        if st.session_state.batch_errors:
+            st.divider()
+            st.error("🚨 匯入異常報告 (請修正 CSV 後重新上傳)：")
+            # 使用 container 讓錯誤訊息排版整齊
+            with st.container():
+                for err in st.session_state.batch_errors:
+                    st.write(err)
+            if st.button("🗑️ 清除錯誤訊息"):
+                st.session_state.batch_errors = []
+                st.rerun()
 
     st.divider()
 
@@ -969,7 +996,7 @@ elif menu == "➕ 新增資料":
             agent_query = pd.read_sql("SELECT agent_id, name FROM agents", conn)
             sel_agent = st.selectbox("歸屬業務", agent_query['name'] if not agent_query.empty else ["請先新增業務員"])
             bank = st.text_input("銀行資訊")
-            c_note = st.text_area("備註 (例如：客戶偏好、特殊要求等)") 
+            c_note = st.text_area("備註") 
             
             if st.form_submit_button("確認建立客戶"):
                 if not agent_query.empty and c_name:
@@ -1077,17 +1104,46 @@ elif menu == "📅 到期續約管理":
                     for idx in to_r:
                         row = pending_df.loc[idx]
                         oid = row['contract_id']
+                        
+                        # 撈出舊合約的所有原始資訊
                         info = pd.read_sql(f"SELECT * FROM invest_contracts WHERE contract_id={oid}", conn).iloc[0]
                         pid = int(info['plan_id'])
-                        m = int(pd.read_sql(f"SELECT period_months FROM rate_plans WHERE plan_id={pid}", conn)['period_months'][0])
-                        ns = row['下週三生效']; ne = ns + relativedelta(months=m)
                         
-                        cursor.execute("INSERT INTO invest_contracts (customer_id, plan_id, amount, start_date, end_date, status, is_renewed, note) VALUES (?,?,?,?,?,?,0,?)",
-                                       (int(info['customer_id']), pid, float(info['amount']), ns.isoformat(), ne.isoformat(), "Active", info['note']))
+                        # 抓取該方案的週期月數
+                        plan_data = pd.read_sql(f"SELECT period_months FROM rate_plans WHERE plan_id={pid}", conn)
+                        if plan_data.empty:
+                            st.error(f"找不到方案 ID {pid}，續約失敗。")
+                            continue
+                        m = int(plan_data['period_months'][0])
+                        
+                        # 計算新合約的日期：下週三生效，加上週期月數
+                        ns = row['下週三生效']
+                        ne = ns + relativedelta(months=m)
+                        
+                        # ⚡️ 關鍵修正：插入新合約時，明確標註 contract_type 為 '續約'
+                        cursor.execute("""
+                            INSERT INTO invest_contracts (
+                                customer_id, plan_id, amount, start_date, end_date, 
+                                status, is_renewed, note, contract_type
+                            ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
+                        """, (
+                            int(info['customer_id']), 
+                            pid, 
+                            float(info['amount']), 
+                            ns.isoformat(), 
+                            ne.isoformat(), 
+                            "Active", 
+                            f"由 ID:{oid} 續約轉入", # 在備註自動標記來源
+                            "續約" # 這裡強制給予 '續約' 標籤
+                        ))
+                        
+                        # 將舊合約標記為「已處理續約」
                         cursor.execute("UPDATE invest_contracts SET is_renewed = 1 WHERE contract_id = ?", (oid,))
+                    
                     conn.commit()
-                    st.toast("續約成功！", icon="✅")
-                    time.sleep(0.5)
+                    st.balloons()
+                    st.success("🎉 選中合約已成功續約！")
+                    time.sleep(1)
                     st.rerun()
         else:
             st.success("🎉 此篩選條件下無待處理合約")
