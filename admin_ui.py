@@ -8,7 +8,7 @@ import time
 # import graphviz
 
 
-CURRENT_VERSION = "1.1.5"
+CURRENT_VERSION = "1.1.6"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -1118,7 +1118,7 @@ elif menu == "📅 到期續約管理":
                 
                 # 使用 data_editor 編輯
                 ed_p = st.data_editor(
-                    pending_df[['確認續約', '客戶姓名', '業務姓名', '金額(萬)', '方案名稱', '利率', '原結束日', '下個生效日']], 
+                    pending_df[['確認續約', '客戶姓名', '業務姓名', '金額(萬)', '方案名稱', '利率', '原結束日', '下週三生效']], 
                     hide_index=True, 
                     use_container_width=True, 
                     key="p_editor",
