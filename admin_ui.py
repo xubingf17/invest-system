@@ -8,7 +8,7 @@ import time
 # import graphviz
 
 
-CURRENT_VERSION = "1.1.4"
+CURRENT_VERSION = "1.1.5"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -1033,201 +1033,196 @@ elif menu == "➕ 新增資料":
                     st.error("請輸入方案名稱")
 
 elif menu == "📅 到期續約管理":
-    st.title("📅 到期續約管理")
+    st.title("📅 到期續約管理 與 業績統計")
     
-    # 1. 取得日期範圍 (本月第一天到最後一天)
-    today = date.today()
-    this_m_s = today.replace(day=1)
-    this_m_e = (this_m_s + relativedelta(months=1)) - relativedelta(days=1)
+    # --- 1. 時間區間選擇器 ---
+    with st.expander("📅 篩選合約到期日期區間", expanded=True):
+        col_date1, col_date2 = st.columns([2, 1])
+        with col_date1:
+            today = date.today()
+            default_end = (today + relativedelta(months=1)).replace(day=1) - relativedelta(days=1)
+            renew_range = st.date_input(
+                "選擇到期日區間",
+                value=(today, default_end),
+                help="系統將找出『結束日』落在這段時間內的合約"
+            )
+    
+    if isinstance(renew_range, tuple) and len(renew_range) == 2:
+        r_start, r_end = renew_range
 
-    # 2. 從資料庫抓取最新資料
-    query = """
-    SELECT 
-        ic.contract_id, 
-        c.name as 客戶姓名, 
-        a.name as 業務姓名,
-        ic.amount / 10000.0 as '金額(萬)', 
-        rp.plan_name as 方案名稱, 
-        rp.plan_id,
-        ic.end_date as 原結束日,
-        ic.is_renewed,
-        ic.note
-    FROM invest_contracts ic
-    JOIN customers c ON ic.customer_id = c.customer_id
-    JOIN agents a ON c.agent_id = a.agent_id
-    JOIN rate_plans rp ON ic.plan_id = rp.plan_id
-    WHERE ic.end_date >= ? AND ic.end_date <= ?
-    """
-    all_df = pd.read_sql(query, conn, params=(this_m_s.isoformat(), this_m_e.isoformat()))
+        query = """
+        SELECT 
+            ic.contract_id, 
+            c.name as 客戶姓名, 
+            a.name as 業務姓名,
+            ic.amount / 10000.0 as '金額(萬)', 
+            rp.plan_name as 方案名稱, 
+            rp.annual_rate as '利率',
+            rp.plan_id,
+            ic.end_date as 原結束日,
+            ic.is_renewed,
+            ic.note
+        FROM invest_contracts ic
+        JOIN customers c ON ic.customer_id = c.customer_id
+        JOIN agents a ON c.agent_id = a.agent_id
+        JOIN rate_plans rp ON ic.plan_id = rp.plan_id
+        WHERE ic.end_date >= ? AND ic.end_date <= ?
+        """
+        all_df = pd.read_sql(query, conn, params=(r_start.isoformat(), r_end.isoformat()))
 
-    if not all_df.empty:
-        # --- ⚡️ 新增：頂部篩選器 (讓你更好找已處理的筆數) ---
-        with st.expander("🔍 續約清單篩選", expanded=True):
+        if not all_df.empty:
             f_col1, f_col2 = st.columns(2)
             with f_col1:
                 agent_opts = ["全部"] + sorted(all_df['業務姓名'].unique().tolist())
-                sel_agent = st.selectbox("篩選業務", agent_opts, key="renew_agent_filter")
+                sel_agent = st.selectbox("🔍 篩選業務員", agent_opts, key="renew_agent_filter")
             with f_col2:
                 cust_opts = ["全部"] + sorted(all_df['客戶姓名'].unique().tolist())
-                sel_cust = st.selectbox("篩選客戶", cust_opts, key="renew_cust_filter")
+                sel_cust = st.selectbox("🔍 篩選客戶", cust_opts, key="renew_cust_filter")
 
-        # 執行過濾
-        filtered_df = all_df.copy()
-        if sel_agent != "全部":
-            filtered_df = filtered_df[filtered_df['業務姓名'] == sel_agent]
-        if sel_cust != "全部":
-            filtered_df = filtered_df[filtered_df['客戶姓名'] == sel_cust]
+            filtered_df = all_df.copy()
+            if sel_agent != "全部":
+                filtered_df = filtered_df[filtered_df['業務姓名'] == sel_agent]
+            if sel_cust != "全部":
+                filtered_df = filtered_df[filtered_df['客戶姓名'] == sel_cust]
 
-        # --- 區塊一：待處理續約 ---
-        st.subheader("⚠️ 待處理續約 (尚未標記)")
-        pending_df = filtered_df[filtered_df['is_renewed'] == 0].copy()
-        
-        if not pending_df.empty:
-            def get_wed(d_str):
-                d = pd.to_datetime(d_str).date()
-                days = 2 - d.weekday()
-                if days <= 0: days += 7
-                return d + relativedelta(days=days)
+            # --- 區塊一：待處理續約 ---
+            st.subheader(f"⚠️ 待處理續約名單 ({r_start} ~ {r_end})")
+            pending_df = filtered_df[filtered_df['is_renewed'] == 0].copy()
             
-            pending_df['下週三生效'] = pending_df['原結束日'].apply(get_wed)
-            pending_df['確認續約'] = False
-            
-            ed_p = st.data_editor(
-                pending_df[['確認續約', '客戶姓名', '業務姓名', '金額(萬)', '方案名稱', '原結束日', '下週三生效']], 
-                hide_index=True, use_container_width=True, key="p_editor"
-            )
-            
-            if st.button("🚀 執行批次續約", type="primary", use_container_width=True):
-                to_r = ed_p[ed_p['確認續約'] == True].index
-                if not to_r.empty:
-                    cursor = conn.cursor()
-                    for idx in to_r:
-                        row = pending_df.loc[idx]
-                        oid = row['contract_id']
-                        
-                        # 撈出舊合約的所有原始資訊
-                        info = pd.read_sql(f"SELECT * FROM invest_contracts WHERE contract_id={oid}", conn).iloc[0]
-                        pid = int(info['plan_id'])
-                        
-                        # 抓取該方案的週期月數
-                        plan_data = pd.read_sql(f"SELECT period_months FROM rate_plans WHERE plan_id={pid}", conn)
-                        if plan_data.empty:
-                            st.error(f"找不到方案 ID {pid}，續約失敗。")
-                            continue
-                        m = int(plan_data['period_months'][0])
-                        
-                        # 計算新合約的日期：下週三生效，加上週期月數
-                        ns = row['下週三生效']
-                        ne = ns + relativedelta(months=m)
-                        
-                        # ⚡️ 關鍵修正：插入新合約時，明確標註 contract_type 為 '續約'
-                        cursor.execute("""
-                            INSERT INTO invest_contracts (
-                                customer_id, plan_id, amount, start_date, end_date, 
-                                status, is_renewed, note, contract_type
-                            ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
-                        """, (
-                            int(info['customer_id']), 
-                            pid, 
-                            float(info['amount']), 
-                            ns.isoformat(), 
-                            ne.isoformat(), 
-                            "Active", 
-                            f"由 ID:{oid} 續約轉入", # 在備註自動標記來源
-                            "續約" # 這裡強制給予 '續約' 標籤
-                        ))
-                        
-                        # 將舊合約標記為「已處理續約」
-                        cursor.execute("UPDATE invest_contracts SET is_renewed = 1 WHERE contract_id = ?", (oid,))
-                    
-                    conn.commit()
-                    st.balloons()
-                    st.success("🎉 選中合約已成功續約！")
-                    time.sleep(1)
-                    st.rerun()
-        else:
-            st.success("🎉 此篩選條件下無待處理合約")
+            if not pending_df.empty:
+                # 計算下週三生效日
+                def get_wed(d_str):
+                    d = pd.to_datetime(d_str).date()
+                    days = 2 - d.weekday()
+                    if days <= 0: days += 7
+                    return d + relativedelta(days=days)
+                
+                pending_df['下週三生效'] = pending_df['原結束日'].apply(get_wed)
 
-        st.divider()
-
-        # --- 區塊二：已處理清單 ---
-        st.subheader("✅ 已處理續約 (本月結案)")
-        # 這裡從過濾後的 filtered_df 抓取 is_renewed = 1 的
-        done_df = filtered_df[filtered_df['is_renewed'] == 1].copy()
-        if not done_df.empty:
-            st.dataframe(
-                done_df[['客戶姓名', '業務姓名', '金額(萬)', '方案名稱', '原結束日']],
-                use_container_width=True, hide_index=True
-            )
-        else:
-            st.caption("目前無已處理資料 (請檢查篩選條件)")
-
-        st.divider()
-        
-        # with st.expander("🛠️ 數據庫原始狀態監控 (Debug Only)", expanded=False):
-        #     st.write("這張表顯示資料庫內『所有』合約的續約標記，方便確認更新是否成功：")
-        #     debug_df = pd.read_sql("""
-        #         SELECT 
-        #             ic.contract_id as ID, 
-        #             c.name as 客戶, 
-        #             ic.end_date as 結束日,
-        #             ic.is_renewed as 續約狀態
-        #         FROM invest_contracts ic
-        #         JOIN customers c ON ic.customer_id = c.customer_id
-        #         ORDER BY ic.contract_id DESC
-        #     """, conn)
-            
-        #     # 使用彩色標註，方便一眼看穿
-        #     def highlight_renewed(val):
-        #         color = 'background-color: #2ecc71' if val == 1 else 'background-color: #e74c3c' if val == 0 else 'background-color: #f1c40f'
-        #         return f'color: white; {color}'
-            
-        #     st.dataframe(debug_df.style.applymap(highlight_renewed, subset=['續約狀態']), use_container_width=True)
-        #     st.caption("🟢 1 = 已續約 | 🔴 0 = 未續約 | 🟡 None/NULL = 異常空值")
-
-        # --- 區塊三：手動標記狀態 ---
-        st.subheader("🛠️ 手動標記狀態")
-        
-        # 這裡改用 all_df 確保不受上方篩選器的「業務/客戶」限制，方便全域搜尋
-        # 且強制過濾出 is_renewed 為 0 (或 NULL) 的資料
-        raw_pending = all_df[all_df['is_renewed'].fillna(0).astype(int) == 0]
-        
-        if not raw_pending.empty:
-            # 在選單字串中直接加入 ID，這是最保險的作法，避免同名同金額抓錯筆
-            t_options = raw_pending.apply(
-                lambda r: f"ID:{int(r['contract_id'])} | {r['客戶姓名']} ({r['金額(萬)']}萬, 結束:{r['原結束日']})", 
-                axis=1
-            ).tolist()
-            
-            sel_t = st.selectbox(
-                "若已手動新增續約，請在此標記舊合約為『已續約』：", 
-                ["請選擇..."] + t_options, 
-                key="fix_select_manual"
-            )
-            
-            if st.button("🔧 執行標記並存檔", use_container_width=True):
-                if sel_t != "請選擇...":
-                    try:
-                        # 1. 從選單字串中直接解析出 ID (最準確)
-                        # 字串格式為 "ID:123 | ..." -> 取出 123
-                        target_id = int(sel_t.split('|')[0].replace('ID:', '').strip())
-                        
-                        # 2. 執行更新
+                # 💡 核心修正：全選功能邏輯
+                # 建立一個全選勾選框
+                select_all = st.checkbox("全選所有待處理合約", value=False, key="select_all_renew")
+                
+                # 根據全選框狀態初始化表格中的「確認續約」欄位
+                pending_df['確認續約'] = select_all
+                
+                # 使用 data_editor 編輯
+                ed_p = st.data_editor(
+                    pending_df[['確認續約', '客戶姓名', '業務姓名', '金額(萬)', '方案名稱', '利率', '原結束日', '下週三生效']], 
+                    hide_index=True, 
+                    use_container_width=True, 
+                    key="p_editor",
+                    column_config={
+                        "利率": st.column_config.NumberColumn("利率 (%)", format="%.1f%%"),
+                        "確認續約": st.column_config.CheckboxColumn("確認續約", default=select_all)
+                    }
+                )
+                
+                if st.button("🚀 執行選中項目的批次續約", type="primary", use_container_width=True):
+                    # 抓取編輯器中被勾選的行 (包含手動勾選或全選的)
+                    to_r_indices = ed_p[ed_p['確認續約'] == True].index
+                    if not to_r_indices.empty:
                         cursor = conn.cursor()
-                        cursor.execute("UPDATE invest_contracts SET is_renewed = 1 WHERE contract_id = ?", (target_id,))
+                        for idx in to_r_indices:
+                            row = pending_df.loc[idx]
+                            oid = row['contract_id']
+                            info = pd.read_sql(f"SELECT * FROM invest_contracts WHERE contract_id={oid}", conn).iloc[0]
+                            pid = int(info['plan_id'])
+                            plan_data = pd.read_sql(f"SELECT period_months FROM rate_plans WHERE plan_id={pid}", conn)
+                            m = int(plan_data['period_months'][0])
+                            ns = row['下週三生效']
+                            ne = ns + relativedelta(months=m)
+                            
+                            cursor.execute("""
+                                INSERT INTO invest_contracts (customer_id, plan_id, amount, start_date, end_date, 
+                                status, is_renewed, note, contract_type) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
+                            """, (int(info['customer_id']), pid, float(info['amount']), ns.isoformat(), ne.isoformat(), "Active", f"由 ID:{oid} 續約轉入", "續約"))
+                            cursor.execute("UPDATE invest_contracts SET is_renewed = 1 WHERE contract_id = ?", (oid,))
                         
-                        # 3. 強制提交事務 (Commit)
                         conn.commit()
-                        
-                        # 4. 成功提示並重整
-                        st.toast(f"✅ 合約 ID:{target_id} 狀態已成功變更！", icon="🎉")
-                        time.sleep(0.5)
-                        st.rerun()
-                        
-                    except Exception as e:
-                        st.error(f"❌ 標記失敗，錯誤訊息：{e}")
+                        st.balloons(); st.success("🎉 續約成功！"); time.sleep(1); st.rerun()
+                    else:
+                        st.warning("請先勾選要續約的合約。")
+            else:
+                st.success("🎉 此區間內無待處理合約")
+
+            st.divider()
+            st.subheader("✅ 已處理完成清單")
+            done_df = filtered_df[filtered_df['is_renewed'] == 1].copy()
+            if not done_df.empty:
+                st.dataframe(done_df[['客戶姓名', '業務姓名', '金額(萬)', '方案名稱', '利率', '原結束日']], use_container_width=True, hide_index=True)
+            
+            with st.expander("🔧 手動標記功能"):
+                raw_pending = all_df[all_df['is_renewed'].fillna(0).astype(int) == 0]
+                if not raw_pending.empty:
+                    t_options = raw_pending.apply(lambda r: f"ID:{int(r['contract_id'])} | {r['客戶姓名']} ({r['金額(萬)']}萬)", axis=1).tolist()
+                    sel_t = st.selectbox("選擇要標記為已續約的合約：", ["請選擇..."] + t_options)
+                    if st.button("執行手動標記"):
+                        tid = int(sel_t.split('|')[0].replace('ID:', '').strip())
+                        conn.execute("UPDATE invest_contracts SET is_renewed = 1 WHERE contract_id = ?", (tid,))
+                        conn.commit(); st.rerun()
         else:
-            st.info("目前無待處理的到期合約。")
+            st.info(f"📅 在 {r_start} 到 {r_end} 之間沒有到期的合約。")
+
+    # # =========================================================
+    # # 📊 新增：業務方案業績統計表 (同一個介面下方)
+    # # =========================================================
+    # st.markdown("---")
+    # st.header("📊 業務方案業績分佈統計")
+    
+    # # 這裡統計「進行中」的所有合約金額
+    # analysis_query = """
+    # SELECT 
+    #     a.name as 業務姓名,
+    #     rp.plan_name || ' (' || rp.annual_rate || '%)' as 方案名稱,
+    #     ic.amount / 10000.0 as 金額
+    # FROM invest_contracts ic
+    # JOIN customers c ON ic.customer_id = c.customer_id
+    # JOIN agents a ON c.agent_id = a.agent_id
+    # JOIN rate_plans rp ON ic.plan_id = rp.plan_id
+    # WHERE ic.end_date >= DATE('now')
+    # """
+    # df_ana = pd.read_sql(analysis_query, conn)
+
+    # if not df_ana.empty:
+    #     # 製作樞紐分析表
+    #     pivot_df = df_ana.pivot_table(
+    #         index='業務姓名', 
+    #         columns='方案名稱', 
+    #         values='金額', 
+    #         aggfunc='sum',
+    #         fill_value=0
+    #     )
+        
+    #     # 計算加總
+    #     pivot_df['個人總計'] = pivot_df.sum(axis=1)
+        
+    #     # 顯示統計表
+    #     st.write("##### 單位：新台幣 (萬元)")
+    #     st.dataframe(
+    #         pivot_df.style.background_gradient(cmap='YlGnBu', axis=None).format("{:.0f}"),
+    #         use_container_width=True
+    #     )
+
+    #     # 列印與下載功能
+    #     col_p1, col_p2 = st.columns(2)
+    #     with col_p1:
+    #         # 1. 下載為 CSV
+    #         csv = pivot_df.to_csv().encode('utf-8-sig')
+    #         st.download_button(
+    #             label="📥 下載業績統計表 (CSV)",
+    #             data=csv,
+    #             file_name=f"業務業績統計_{date.today()}.csv",
+    #             mime="text/csv",
+    #             use_container_width=True
+    #         )
+    #     with col_p2:
+    #         # 2. 列印提示按鈕 (瀏覽器預設功能)
+    #         st.button("🖨️ 列印此頁面", on_click=None, help="請按組合鍵 Cmd+P (Mac) 或 Ctrl+P (Win) 進行列印", use_container_width=True)
+    #         st.caption("💡 提示：點擊按鈕後，請直接使用瀏覽器的列印功能 (Ctrl+P)。")
+
+    # else:
+    #     st.warning("目前尚無進行中的合約資料，無法生成業績統計。")
 
 elif menu == "💰 業務佣金":
     st.title("💰 業務佣金對帳 (個人新件)")
