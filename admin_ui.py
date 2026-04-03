@@ -8,7 +8,7 @@ import time
 # import graphviz
 
 
-CURRENT_VERSION = "1.1.6"
+CURRENT_VERSION = "1.1.7"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -710,9 +710,8 @@ elif menu == "➕ 新增資料":
         with st.form("single_contract"):
             st.info("💡 請填寫下方欄位以建立單筆合約 (金額單位：萬)")
             
-            # 1. 抓取基礎資料 (客戶、方案)
-            cust_df = pd.read_sql("SELECT customer_id, name FROM customers ORDER BY name", conn)
-            # 方案顯示：名稱 + 利率 (年利率 -> 利率)
+            # 1. 抓取基礎資料 (業務、客戶、方案)
+            agent_df = pd.read_sql("SELECT agent_id, name FROM agents ORDER BY name", conn)
             plan_df = pd.read_sql("""
                 SELECT 
                     plan_id, 
@@ -721,53 +720,70 @@ elif menu == "➕ 新增資料":
                 FROM rate_plans
             """, conn)
             
-            # 第一橫列：客戶與金額
+            # 第一橫列：選擇業務與客戶 (連動邏輯)
             col_a1, col_a2 = st.columns(2)
             with col_a1:
-                sel_cust = st.selectbox("👤 選擇客戶", cust_df['name'] if not cust_df.empty else ["⚠️ 請先新增客戶"])
-            with col_a2:
-                amt_wan = st.number_input("💰 投資金額 (萬)", min_value=0.0, value=100.0, step=10.0)
+                # 這裡新增了「選擇業務員」
+                sel_agent_name = st.selectbox(
+                    "💼 承辦業務員", 
+                    agent_df['name'] if not agent_df.empty else ["⚠️ 請先新增業務員"]
+                )
             
-            # 第二橫列：方案與生效日
+            with col_a2:
+                if not agent_df.empty and sel_agent_name != "⚠️ 請先新增業務員":
+                    # 根據選中的業務員 ID，過濾出該業務名下的客戶
+                    target_agent_id = int(agent_df[agent_df['name'] == sel_agent_name]['agent_id'].values[0])
+                    cust_query = f"SELECT customer_id, name FROM customers WHERE agent_id = {target_agent_id} ORDER BY name"
+                    cust_df = pd.read_sql(cust_query, conn)
+                    
+                    sel_cust = st.selectbox(
+                        "👤 選擇客戶", 
+                        cust_df['name'] if not cust_df.empty else ["⚠️ 該業務名下尚無客戶"]
+                    )
+                else:
+                    sel_cust = st.selectbox("👤 選擇客戶", ["請先選擇業務員"])
+
+            # 第二橫列：金額與方案
             col_b1, col_b2 = st.columns(2)
             with col_b1:
-                sel_plan_display = st.selectbox("📈 選擇方案 (利率)", plan_df['展示名稱'] if not plan_df.empty else ["⚠️ 請先設定方案"])
+                amt_wan = st.number_input("💰 投資金額 (萬)", min_value=0.0, value=100.0, step=10.0)
             with col_b2:
-                start_dt = st.date_input("📅 生效日期", date.today())
+                sel_plan_display = st.selectbox("📈 選擇方案 (利率)", plan_df['展示名稱'] if not plan_df.empty else ["⚠️ 請先設定方案"])
             
-            # 第三橫列：合約性質 (新約/續約)
+            # 第三橫列：生效日與性質
             st.write("---")
             col_c1, col_c2 = st.columns(2)
             with col_c1:
-                # ⚡️ 預設值設為「續約」 (index=1)
-                contract_type_val = st.radio("📄 合約性質", ["新約", "續約"], index=1, horizontal=True, help="這將影響後續業績統計與佣金計算")
+                start_dt = st.date_input("📅 生效日期", date.today())
+            with col_c2:
+                contract_type_val = st.radio("📄 合約性質", ["新約", "續約"], index=1, horizontal=True)
             
             # 備註欄位
-            note_val = st.text_area("🗒️ 合約備註 (選填)", placeholder="", height=100)
+            note_val = st.text_area("🗒️ 合約備註 (選填)", placeholder="例如：由舊合約轉入...", height=100)
             
             # 提交按鈕
             submit_btn = st.form_submit_button("✅ 確認送出單筆合約", use_container_width=True, type="primary")
 
             if submit_btn:
-                if cust_df.empty or plan_df.empty:
-                    st.error("❌ 缺少客戶或方案基礎資料，無法建立合約。")
-                elif not sel_cust or sel_cust == "⚠️ 請先新增客戶":
-                    st.error("❌ 請選擇正確的客戶。")
+                if agent_df.empty or cust_df.empty or plan_df.empty:
+                    st.error("❌ 基礎資料不足，請確認業務員名下已有該客戶。")
+                elif sel_cust == "⚠️ 該業務名下尚無客戶":
+                    st.error("❌ 請先至「新增客戶」將此客戶歸屬給該業務員。")
                 else:
                     try:
-                        # A. 取得正確的 ID
+                        # 取得客戶 ID
                         c_id = int(cust_df[cust_df['name'] == sel_cust]['customer_id'].values[0])
                         
-                        # B. 解析方案資訊
+                        # 解析方案資訊
                         p_row = plan_df[plan_df['展示名稱'] == sel_plan_display]
                         p_id = int(p_row['plan_id'].values[0])
                         months = int(p_row['period_months'].values[0])
                         
-                        # C. 計算金額與結束日
+                        # 計算結束日
                         real_amount = amt_wan * 10000
                         end_dt = start_dt + relativedelta(months=months)
                         
-                        # D. 寫入資料庫
+                        # 寫入資料庫
                         cursor = conn.cursor()
                         cursor.execute("""
                             INSERT INTO invest_contracts (
@@ -781,12 +797,11 @@ elif menu == "➕ 新增資料":
                         
                         conn.commit()
                         st.balloons()
-                        st.success(f"🎉 已成功建立【{sel_cust}】的 {amt_wan} 萬合約 ({contract_type_val})")
+                        st.success(f"🎉 已成功建立【{sel_cust}】的 {amt_wan} 萬合約 (業務：{sel_agent_name})")
                         time.sleep(1)
                         st.rerun()
                     except Exception as e:
-                        st.error(f"❌ 儲存失敗，錯誤訊息：{e}")
-
+                        st.error(f"❌ 儲存失敗：{e}")
     else:
         st.write("### 🚀 批量匯入投資合約")
         
