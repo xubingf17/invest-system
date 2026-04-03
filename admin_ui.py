@@ -1091,11 +1091,21 @@ elif menu == "📅 到期續約管理":
             
             if not pending_df.empty:
                 # 計算下週三生效日
+                # def get_wed(d_str):
+                #     d = pd.to_datetime(d_str).date()
+                #     days = 2 - d.weekday()
+                #     if days <= 0: days += 7
+                #     return d + relativedelta(days=days)
                 def get_wed(d_str):
                     d = pd.to_datetime(d_str).date()
-                    days = 2 - d.weekday()
-                    if days <= 0: days += 7
-                    return d + relativedelta(days=days)
+                    # d.weekday(): 0=一, 1=二, 2=三...
+                    # 計算距離「週三(2)」還有幾天
+                    days_until_wed = (2 - d.weekday() + 7) % 7
+                    
+                    # 💡 邏輯：
+                    # 如果 d 是週三，days_until_wed 會是 0，結果就是 d 當天。
+                    # 如果 d 是週四，days_until_wed 會是 6，結果就是下週三。
+                    return d + relativedelta(days=days_until_wed)
                 
                 pending_df['下週三生效'] = pending_df['原結束日'].apply(get_wed)
 
@@ -1108,7 +1118,7 @@ elif menu == "📅 到期續約管理":
                 
                 # 使用 data_editor 編輯
                 ed_p = st.data_editor(
-                    pending_df[['確認續約', '客戶姓名', '業務姓名', '金額(萬)', '方案名稱', '利率', '原結束日', '下週三生效']], 
+                    pending_df[['確認續約', '客戶姓名', '業務姓名', '金額(萬)', '方案名稱', '利率', '原結束日', '下個生效日']], 
                     hide_index=True, 
                     use_container_width=True, 
                     key="p_editor",
