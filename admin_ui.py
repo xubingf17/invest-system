@@ -8,7 +8,7 @@ import time
 # import graphviz
 
 
-CURRENT_VERSION = "1.2.0"
+CURRENT_VERSION = "1.2.1"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -123,7 +123,7 @@ with st.sidebar:
     st.title("📂 系統總覽")
     menu = st.sidebar.radio(
         "請選擇功能模組：",
-        ["📋 合約總覽","📅 到期續約管理" , "💰 收益發放試算","💰 業務佣金", "👤 客戶總覽", "🌳 團隊組織圖","➕ 新增資料", "⚙️ 基礎資料設定"],
+        ["📋 合約總覽","📅 到期續約管理" , "💰 收益發放試算","💰 業務佣金", "👤 客戶資料管理", "🌳 團隊組織圖","➕ 新增資料", "⚙️ 基礎資料設定"],
         index=0,
         label_visibility="collapsed"
     )
@@ -281,7 +281,7 @@ elif menu == "💰 收益發放試算":
             m1, m2, m3 = st.columns(3)
             m1.metric("待發放筆數", f"{len(df_filtered)} 筆")
             m2.metric("總計應發金額", display_total)
-            m3.metric("折合台幣約", f"NT$ {int(total_pay_wan * 10000):,}")
+            # m3.metric("折合台幣約", f"NT$ {int(total_pay_wan * 10000):,}")
 
             st.dataframe(
                 df_filtered[['客戶姓名', '業務員', '所屬主管', '金額(萬)', '方案(利率)', '本月預計發放(萬)', '生效日']],
@@ -759,29 +759,104 @@ elif menu == "⚙️ 基礎資料設定":
             else:
                 st.error("請正確輸入『CONFIRM』字樣。")
 
-elif menu == "👤 客戶總覽":
+elif menu == "👤 客戶資料管理":
     st.title("👤 客戶資料管理")
-    
-    # 這裡關聯業務員 (agents)
-    query = """
+
+    # --- 1. 撈取基礎資料 (使用 LEFT JOIN 確保資料完整) ---
+    cust_query = """
     SELECT 
         c.customer_id as ID, 
         c.name as 客戶姓名, 
-        a.name as 歸屬業務, 
-        c.bank_info as 銀行資訊,
-        c.note as 備註
+        IFNULL(a.name, '⚠️ 未分配') as 業務姓名
     FROM customers c
     LEFT JOIN agents a ON c.agent_id = a.agent_id
+    ORDER BY c.customer_id DESC
     """
-    df_cust = pd.read_sql(query, conn)
-    
-    if not df_cust.empty:
-        # 使用 st.data_editor 甚至可以直接在介面上改備註（如果之後需要的話）
-        st.dataframe(df_cust, use_container_width=True, hide_index=True)
-        
-        st.write(f"目前共有 {len(df_cust)} 位客戶")
+    df_all_cust = pd.read_sql(cust_query, conn)
+
+    if df_all_cust.empty:
+        st.info("目前資料庫中尚無客戶資料。")
     else:
-        st.info("目前尚無客戶資料，請至「新增資料」建立。")
+        # --- 2. 頂部篩選面板 (影響下方的表格顯示) ---
+        st.subheader("🔍 篩選客戶名單")
+        agent_opts = ["全部"] + sorted(df_all_cust['業務姓名'].unique().tolist())
+        sel_agent = st.selectbox("請選擇業務員進行過濾：", agent_opts, key="filter_agent_top")
+
+        # 執行過濾邏輯
+        df_display = df_all_cust.copy()
+        if sel_agent != "全部":
+            df_display = df_display[df_display['業務姓名'] == sel_agent]
+
+        # --- 3. 顯示客戶清單 (優化欄位寬度) ---
+        st.write(f"📅 目前顯示：**{sel_agent}** 的客戶 (共 {len(df_display)} 筆)")
+        st.dataframe(
+            df_display, 
+            use_container_width=False,
+            hide_index=True,
+            height=600,
+            column_config={
+                "ID": st.column_config.NumberColumn("ID", width=60, format="%d"),
+                "客戶姓名": st.column_config.TextColumn("客戶姓名", width="large"),
+                "業務姓名": st.column_config.TextColumn("所屬業務", width="large")
+            }
+        )
+
+        # --- 4. 刪除客戶功能 (業務員連動版) ---
+        st.divider()
+        st.subheader("🗑️ 刪除客戶資料")
+        st.caption("流程：先選業務員 ➔ 再選該業務下的客戶 ➔ 系統檢查後刪除")
+
+        col_del1, col_del2 = st.columns(2)
+        
+        with col_del1:
+            # 這裡列出所有在資料庫中有客戶的業務員
+            del_agent_list = sorted(df_all_cust['業務姓名'].unique().tolist())
+            sel_del_agent = st.selectbox(
+                "1. 選擇該客戶的所屬業務", 
+                ["請選擇業務..."] + del_agent_list,
+                key="del_agent_step_1"
+            )
+        
+        with col_del2:
+            target_id = None
+            target_name_only = ""
+            if sel_del_agent != "請選擇業務...":
+                # 只撈出該業務名下的客戶
+                sub_list = df_all_cust[df_all_cust['業務姓名'] == sel_del_agent]
+                
+                if not sub_list.empty:
+                    cust_opts = [f"{r['客戶姓名']} (ID: {r['ID']})" for _, r in sub_list.iterrows()]
+                    selected_cust = st.selectbox("2. 選擇欲刪除的客戶", ["請選擇客戶..."] + cust_opts)
+                    
+                    if "請選擇" not in selected_cust:
+                        target_id = int(selected_cust.split("(ID: ")[1].split(")")[0])
+                        target_name_only = selected_cust.split(" (ID:")[0]
+                else:
+                    st.warning("⚠️ 該業務目前名下無客戶。")
+            else:
+                st.selectbox("2. 選擇欲刪除的客戶", ["請先完成第一步"], disabled=True)
+
+        # 執行刪除
+        if target_id:
+            st.error(f"即將刪除：**{target_name_only}** (業務：{sel_del_agent})")
+            if st.button("🔥 確認永久刪除此客戶", use_container_width=True):
+                try:
+                    # 安全檢查：若有合約則不給刪
+                    check_cnt = pd.read_sql(
+                        "SELECT COUNT(*) as n FROM invest_contracts WHERE customer_id = ?", 
+                        conn, params=(target_id,)
+                    ).iloc[0]['n']
+
+                    if check_cnt > 0:
+                        st.error(f"❌ 無法刪除：此客戶名下尚有 {check_cnt} 筆合約紀錄，請先移除合約。")
+                    else:
+                        conn.execute("DELETE FROM customers WHERE customer_id = ?", (target_id,))
+                        conn.commit()
+                        st.success(f"✅ 已成功移除客戶：{target_name_only}")
+                        time.sleep(1.5)
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"❌ 刪除失敗：{e}")
 
 # --- 4. 資料總覽 ---
 elif menu == "📋 資料總覽":
@@ -1459,7 +1534,7 @@ elif menu == "💰 業務佣金":
                 with c2:
                     total_all = summary_df['總計佣金(萬)'].sum()
                     st.metric("當前篩選發放總額", f"{total_all:.2f} 萬")
-                    st.metric("折合台幣約", f"NT$ {int(total_all * 10000):,}")
+                    # st.metric("折合台幣約", f"NT$ {int(total_all * 10000):,}")
 
                 # 6. 下載報表
                 csv = summary_df.to_csv(index=False).encode('utf-8-sig')
