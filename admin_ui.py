@@ -8,7 +8,7 @@ import time
 # import graphviz
 
 
-CURRENT_VERSION = "1.1.9"
+CURRENT_VERSION = "1.2.0"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -269,7 +269,7 @@ elif menu == "💰 收益發放試算":
 
         if not df_filtered.empty:
             # --- 4. 計算發放金額 ---
-            df_filtered['本月預計發放(萬)'] = (df_filtered['金額(萬)'] * (df_filtered['利率'] / 100.0) / 12.0)
+            df_filtered['本月預計發放(萬)'] = (df_filtered['金額(萬)'] * (df_filtered['利率'] / 100.0))
             
             total_pay_wan = df_filtered['本月預計發放(萬)'].sum()
             display_total = f"NT$ {total_pay_wan / 10000:.2f} 億" if total_pay_wan >= 10000 else f"NT$ {total_pay_wan:,.2f} 萬"
@@ -293,7 +293,7 @@ elif menu == "💰 收益發放試算":
             st.subheader("📊 業務員與合約分佈統計")
 
             try:
-                # 💡 修正 XY：index 是縱軸(方案)，columns 是直軸(業務)
+                # 1. 建立基礎交叉表：Index=業務員, Columns=方案(利率)
                 pivot_df = df_filtered.pivot_table(
                     index='業務員', 
                     columns='方案(利率)', 
@@ -302,29 +302,47 @@ elif menu == "💰 收益發放試算":
                     fill_value=0
                 )
                 
-                # 計算合計
-                pivot_df['方案合計'] = pivot_df.sum(axis=1)
+                # 2. 取得利率對照表 (從篩選後的資料抓取 方案 -> 利率 數值)
+                # 確保 map 的 key 與 pivot_df 的 columns 一致
+                rate_map = df_filtered.drop_duplicates('方案(利率)').set_index('方案(利率)')['利率']
+
+                # 3. 計算「收益」欄位
+                # 邏輯：遍歷每一橫列(業務員)，將各方案本金乘以其對應利率後加總，再除以 12
+                def calculate_member_income(row):
+                    income_sum = 0
+                    for plan_name in pivot_df.columns:
+                        principal = row[plan_name]
+                        plan_rate = rate_map.get(plan_name, 0)
+                        income_sum += (principal * (plan_rate / 100.0))
+                    return income_sum
+
+                pivot_df['收益'] = pivot_df.apply(calculate_member_income, axis=1)
+
+                # 4. 計算「方案合計」列 (最下方橫列)
+                # 注意：收益欄位不參與方案本金的加總，所以我們只加總本金部分
                 total_row = pivot_df.sum(axis=0)
-                total_row.name = '業務合計'
+                total_row.name = '方案合計(本金)'
                 
                 # 合併總結行
                 pivot_final = pd.concat([pivot_df, total_row.to_frame().T])
 
-                # 顯示表格，並格式化數字
+                # 5. 顯示表格
+                # 使用 precision=2 確保收益的小數點（萬）能看清楚
                 st.dataframe(
-                    pivot_final.style.format("{:,.0f}"), 
+                    pivot_final.style.format(precision=2, thousands=","), 
                     use_container_width=True, 
                     height=1000
                 )
+                
+                st.info("💡 計算說明：『收益』欄位 = Σ(各方案本金 × 該方案利率 )。")
+
             except Exception as e:
-                st.info("暫無足夠資料生成統計表")
+                st.info(f"暫無足夠資料生成統計表，錯誤訊息：{e}")
 
             # 下載報表
             csv = df_filtered.to_csv(index=False).encode('utf-8-sig')
             st.download_button("📥 下載發放清單 (CSV)", csv, f"payout_{date.today()}.csv", "text/csv", use_container_width=True)
 
-        else:
-            st.warning("🔔 篩選條件下無符合合約。")
     else:
         st.warning(f"🔔 區間內 ({start_day}號 ~ {end_day}號) 無符合之發條合約。")
 
@@ -463,33 +481,76 @@ elif menu == "📋 合約總覽":
 
         with op_col1:
             st.markdown("##### 📝 修正合約資料")
+            # 取得當前顯示中的 ID 清單
             edit_id = st.selectbox("1. 選擇要修正的 ID", ["請選擇..."] + df_display['ID'].tolist(), key="edit_box")
+            
             if edit_id != "請選擇...":
-                row = df_display[df_display['ID'] == edit_id].iloc[0]
-                st.info(f"📍 正在編輯：{row['客戶姓名']} (ID:{edit_id})")
+                # 撈出該筆合約的詳細原始資料（包含隱藏的 plan_id 等資訊）
+                # 注意：我們需要從資料庫重新撈取該合約的週期月數
+                detail_query = """
+                    SELECT ic.*, rp.period_months, a.name as agent_name 
+                    FROM invest_contracts ic
+                    JOIN rate_plans rp ON ic.plan_id = rp.plan_id
+                    JOIN customers c ON ic.customer_id = c.customer_id
+                    JOIN agents a ON c.agent_id = a.agent_id
+                    WHERE ic.contract_id = ?
+                """
+                detail_df = pd.read_sql(detail_query, conn, params=(edit_id,))
                 
-                # 修正業務歸屬
-                agent_list = all_agents_df['name'].tolist()
-                new_agent_name = st.selectbox("2. 變更承辦業務員", agent_list, index=agent_list.index(row['業務員']))
-                new_agent_id = int(all_agents_df[all_agents_df['name'] == new_agent_name]['agent_id'].values[0])
-                
-                new_amt = st.number_input("3. 修正金額(萬)", value=float(row['金額(萬)']), step=1.0)
-                new_type = st.radio("4. 修正性質", ["新約", "續約"], index=0 if row['類型'] == "新約" else 1, horizontal=True)
-                new_note = st.text_input("5. 修正備註", value=str(row['備註']) if row['備註'] and row['備註'] != 'None' else "")
-                
-                if st.button("💾 儲存所有修正內容", use_container_width=True, type="primary"):
-                    try:
-                        conn.execute("UPDATE invest_contracts SET amount=?, note=?, contract_type=? WHERE contract_id=?", 
-                                     (new_amt * 10000, new_note, new_type, edit_id))
-                        # 同步更新客戶歸屬
-                        conn.execute("""
-                            UPDATE customers SET agent_id = ? 
-                            WHERE customer_id = (SELECT customer_id FROM invest_contracts WHERE contract_id = ?)
-                        """, (new_agent_id, edit_id))
-                        conn.commit()
-                        st.success("✅ 修正成功！"); time.sleep(1); st.rerun()
-                    except Exception as e:
-                        st.error(f"❌ 更新失敗：{e}")
+                if not detail_df.empty:
+                    info = detail_df.iloc[0]
+                    st.info(f"📍 正在編輯：ID {edit_id} | 週期：{info['period_months']} 個月")
+
+                    # A. 修正業務歸屬
+                    agent_list = all_agents_df['name'].tolist()
+                    new_agent_name = st.selectbox("2. 變更承辦業務員", agent_list, index=agent_list.index(info['agent_name']))
+                    new_agent_id = int(all_agents_df[all_agents_df['name'] == new_agent_name]['agent_id'].values[0])
+
+                    # B. 修正開始日 (自動計算結束日)
+                    orig_start = pd.to_datetime(info['start_date']).date()
+                    new_start_dt = st.date_input("3. 修正開始日", value=orig_start)
+                    
+                    # 💡 自動計算新的結束日
+                    new_end_dt = new_start_dt + relativedelta(months=int(info['period_months']))
+                    st.caption(f"💡 系統已自動根據週期換算結束日為：**{new_end_dt}**")
+
+                    # C. 其他欄位修正
+                    col_amt_edit, col_type_edit = st.columns(2)
+                    with col_amt_edit:
+                        new_amt = st.number_input("4. 修正金額(萬)", value=float(info['amount']/10000), step=1.0)
+                    with col_type_edit:
+                        new_type = st.radio("5. 修正性質", ["新約", "續約"], index=0 if info['contract_type'] == "新約" else 1, horizontal=True)
+                    
+                    new_note = st.text_input("6. 修正備註", value=str(info['note']) if info['note'] and info['note'] != 'None' else "")
+                    
+                    if st.button("💾 儲存所有修正內容", use_container_width=True, type="primary"):
+                        try:
+                            # 更新合約
+                            conn.execute("""
+                                UPDATE invest_contracts 
+                                SET amount=?, start_date=?, end_date=?, note=?, contract_type=? 
+                                WHERE contract_id=?
+                            """, (
+                                new_amt * 10000, 
+                                new_start_dt.isoformat(), 
+                                new_end_dt.isoformat(), 
+                                new_note, 
+                                new_type, 
+                                edit_id
+                            ))
+                            
+                            # 同步更新客戶歸屬
+                            conn.execute("""
+                                UPDATE customers SET agent_id = ? 
+                                WHERE customer_id = (SELECT customer_id FROM invest_contracts WHERE contract_id = ?)
+                            """, (new_agent_id, edit_id))
+                            
+                            conn.commit()
+                            st.success(f"✅ 合約 ID:{edit_id} 已成功修正為 {new_start_dt} ~ {new_end_dt}")
+                            time.sleep(1)
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"❌ 更新失敗：{e}")
 
         with op_col2:
             st.markdown("##### ❌ 刪除合約紀錄")
@@ -1205,37 +1266,75 @@ elif menu == "📅 到期續約管理":
                     hide_index=True, use_container_width=True, key=dynamic_key,
                     height=800
                 )
-                
+
                 if st.button("🚀 執行批次續約並歸檔", type="primary", use_container_width=True):
-                    to_process = ed_p[ed_p['確認續約'] == True].index
-                    if not to_process.empty:
-                        cursor = conn.cursor()
-                        for idx in to_process:
-                            row = pending_df.loc[idx]
-                            oid = row['contract_id']
+                    # 💡 1. 取得編輯器中被勾選的行
+                    # 我們直接將 ed_p 跟 pending_df 的 contract_id 合併，確保抓到的是正確的 ID
+                    selected_rows = ed_p[ed_p['確認續約'] == True]
+                    
+                    if not selected_rows.empty:
+                        try:
+                            cursor = conn.cursor()
+                            msg_placeholder = st.empty()
                             
-                            # 抓取原合約資訊
-                            info = pd.read_sql(f"SELECT * FROM invest_contracts WHERE contract_id={oid}", conn).iloc[0]
-                            plan_meta = pd.read_sql(f"SELECT period_months FROM rate_plans WHERE plan_id={int(info['plan_id'])}", conn).iloc[0]
+                            # 💡 2. 這裡改用 selected_rows 的資料，因為 ed_p 可能不包含 contract_id
+                            # 我們要從原本的 pending_df 找回對應的 ID
+                            # 為了保險，我們直接從 pending_df 篩選出跟 ed_p 勾選內容一致的資料
+                            # 最穩的方法是：直接利用 pending_df 的索引來對應 ed_p
                             
-                            ns = row['下週三生效']
-                            ne = ns + relativedelta(months=int(plan_meta['period_months']))
+                            processed_count = 0
+                            for idx in selected_rows.index:
+                                # 從原始 pending_df 抓取真正的資料庫 ID
+                                real_row = pending_df.loc[idx]
+                                oid = int(real_row['contract_id'])
+                                
+                                # 3. 抓取原約資訊 (與你原本邏輯相同)
+                                cursor.execute("SELECT customer_id, plan_id, amount FROM invest_contracts WHERE contract_id = ?", (oid,))
+                                info = cursor.fetchone()
+                                
+                                if info:
+                                    c_id, p_id, amt = info
+                                    cursor.execute("SELECT period_months FROM rate_plans WHERE plan_id = ?", (p_id,))
+                                    p_months = int(cursor.fetchone()[0])
+                                    
+                                    # 計算日期
+                                    ns = real_row['下週三生效']
+                                    ne = ns + relativedelta(months=p_months)
+                                    
+                                    # 4. 執行資料庫變更
+                                    # A. 建立新約
+                                    cursor.execute("""
+                                        INSERT INTO invest_contracts (
+                                            customer_id, plan_id, amount, start_date, end_date, 
+                                            status, is_renewed, note, contract_type
+                                        ) VALUES (?, ?, ?, ?, ?, 'Active', 0, ?, '續約')
+                                    """, (c_id, p_id, amt, ns.isoformat(), ne.isoformat(), f"由 ID:{oid} 續約轉入"))
+                                    
+                                    # B. 更新舊約 (關鍵：強制轉型 oid 確保 SQL 匹配)
+                                    cursor.execute("""
+                                        UPDATE invest_contracts 
+                                        SET is_renewed = 1, status = 'Closed' 
+                                        WHERE contract_id = ?
+                                    """, (oid,))
+                                    
+                                    processed_count += 1
                             
-                            # 1. 建立新約 (is_renewed=0)
-                            cursor.execute("""
-                                INSERT INTO invest_contracts (customer_id, plan_id, amount, start_date, end_date, 
-                                status, is_renewed, note, contract_type) VALUES (?, ?, ?, ?, ?, ?, 0, ?, '續約')
-                            """, (int(info['customer_id']), int(info['plan_id']), float(info['amount']), 
-                                  ns.isoformat(), ne.isoformat(), "Active", f"由 ID:{oid} 續約轉入"))
+                            # 💡 5. 執行存檔
+                            conn.commit()
                             
-                            # 2. 標記舊約已結案 (is_renewed=1)
-                            cursor.execute("UPDATE invest_contracts SET is_renewed = 1 WHERE contract_id = ?", (oid,))
-                        
-                        conn.commit()
-                        st.session_state.renew_sync_key += 1 # 變更 Key
-                        st.success("✅ 續約成功！資料已搬移至『已完成清單』。")
-                        time.sleep(1)
-                        st.rerun()
+                            # 💡 6. 更新 Session State 強制 UI 刷新
+                            st.session_state.renew_sync_key += 1
+                            
+                            msg_placeholder.success(f"✅ 成功處理 {processed_count} 筆續約！資料已存入。5 秒後自動刷新...")
+                            time.sleep(5)
+                            msg_placeholder.empty()
+                            st.rerun()
+
+                        except Exception as e:
+                            conn.rollback()
+                            st.error(f"❌ 續約失敗：{e}")
+                    else:
+                        st.warning("⚠️ 請先勾選要續約的項目。")
             else:
                 st.success("🎉 選定條件下所有合約皆已處理完成。")
 
