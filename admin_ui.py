@@ -8,7 +8,7 @@ import time
 # import graphviz
 
 
-CURRENT_VERSION = "1.2.1"
+CURRENT_VERSION = "1.2.2"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -485,10 +485,9 @@ elif menu == "📋 合約總覽":
             edit_id = st.selectbox("1. 選擇要修正的 ID", ["請選擇..."] + df_display['ID'].tolist(), key="edit_box")
             
             if edit_id != "請選擇...":
-                # 撈出該筆合約的詳細原始資料（包含隱藏的 plan_id 等資訊）
-                # 注意：我們需要從資料庫重新撈取該合約的週期月數
+                # 撈出該筆合約的詳細原始資料
                 detail_query = """
-                    SELECT ic.*, rp.period_months, a.name as agent_name 
+                    SELECT ic.*, rp.period_months, a.name as agent_name, c.name as customer_name
                     FROM invest_contracts ic
                     JOIN rate_plans rp ON ic.plan_id = rp.plan_id
                     JOIN customers c ON ic.customer_id = c.customer_id
@@ -499,7 +498,8 @@ elif menu == "📋 合約總覽":
                 
                 if not detail_df.empty:
                     info = detail_df.iloc[0]
-                    st.info(f"📍 正在編輯：ID {edit_id} | 週期：{info['period_months']} 個月")
+                    # 💡 修正這裡：改用 info['customer_name'] 顯示姓名
+                    st.info(f"📍 編輯ID： {edit_id} | 客戶：{info['customer_name']} | ⏳ 週期：{info['period_months']} 個月")
 
                     # A. 修正業務歸屬
                     agent_list = all_agents_df['name'].tolist()
@@ -525,7 +525,7 @@ elif menu == "📋 合約總覽":
                     
                     if st.button("💾 儲存所有修正內容", use_container_width=True, type="primary"):
                         try:
-                            # 更新合約
+                            # 1. 更新合約資料
                             conn.execute("""
                                 UPDATE invest_contracts 
                                 SET amount=?, start_date=?, end_date=?, note=?, contract_type=? 
@@ -539,14 +539,15 @@ elif menu == "📋 合約總覽":
                                 edit_id
                             ))
                             
-                            # 同步更新客戶歸屬
+                            # 2. 同步更新該合約所屬客戶的業務員歸屬
+                            # 使用 info['customer_id'] 確保精確更新該名客戶
                             conn.execute("""
                                 UPDATE customers SET agent_id = ? 
-                                WHERE customer_id = (SELECT customer_id FROM invest_contracts WHERE contract_id = ?)
-                            """, (new_agent_id, edit_id))
+                                WHERE customer_id = ?
+                            """, (new_agent_id, int(info['customer_id'])))
                             
                             conn.commit()
-                            st.success(f"✅ 合約 ID:{edit_id} 已成功修正為 {new_start_dt} ~ {new_end_dt}")
+                            st.success(f"✅ {info['customer_name']} 的合約 (ID:{edit_id}) 已修正完成！")
                             time.sleep(1)
                             st.rerun()
                         except Exception as e:
