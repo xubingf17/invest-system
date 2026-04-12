@@ -8,7 +8,7 @@ import time
 # import graphviz
 
 
-CURRENT_VERSION = "1.2.3"
+CURRENT_VERSION = "1.2.4"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -1428,117 +1428,146 @@ elif menu == "💰 業務佣金":
     if isinstance(date_range, tuple) and len(date_range) == 2:
         start_f, end_f = date_range
 
-        # 2. SQL 查詢：抓取全體業務與對應合約 (使用 LEFT JOIN 確保沒單的業務也抓得到基礎資訊)
+        # 2. SQL 查詢：串接兩層主管資訊 (b=主管, bb=上級)
         query = """
         SELECT 
             c.name as 客戶姓名,
             a.name as 業務姓名,
             r.rank_name as 職級,
-            r.commission_rate as 分潤比例,
-            ic.amount / 10000.0 as '金額(萬)',
+            r.commission_rate as 個人比例,
+            ic.amount / 10000.0 as '金額',
             rp.plan_name,
             rp.annual_rate as '利率',
-            ic.start_date as 生效日
+            ic.start_date as 生效日,
+            b.name as 直屬主管,
+            rb.rank_name as 主管職級,
+            rb.commission_rate as 主管比例,
+            bb.name as 上級主管,
+            rbb.rank_name as 上級職級,
+            rbb.commission_rate as 上級比例
         FROM invest_contracts ic
         JOIN customers c ON ic.customer_id = c.customer_id
         JOIN agents a ON c.agent_id = a.agent_id
         JOIN ranks r ON a.rank_id = r.rank_id
         JOIN rate_plans rp ON ic.plan_id = rp.plan_id
+        LEFT JOIN agents b ON a.boss_id = b.agent_id
+        LEFT JOIN ranks rb ON b.rank_id = rb.rank_id
+        LEFT JOIN agents bb ON b.boss_id = bb.agent_id
+        LEFT JOIN ranks rbb ON bb.rank_id = rbb.rank_id
         WHERE ic.start_date >= ? AND ic.start_date <= ?
         """
         df_raw = pd.read_sql(query, conn, params=(start_f.isoformat(), end_f.isoformat()))
 
-        # 預先抓取「所有」業務員名單用於下拉選單 (確保排序)
-        all_agents_list = sorted(pd.read_sql("SELECT name FROM agents", conn)['name'].tolist())
-
         if not df_raw.empty:
-            # ⚡️ 預處理：方案(利率) 標籤與排序
-            df_raw['方案(利率)'] = df_raw['plan_name'] + " (" + df_raw['利率'].astype(str) + "%)"
-            df_raw = df_raw.sort_values(by=['業務姓名', '客戶姓名']).reset_index(drop=True)
+            # 💡 修正點：方案名稱後帶上利率 %
+            df_raw['方案名稱(%)'] = df_raw['plan_name'] + " (" + df_raw['利率'].astype(str) + "%)"
 
-            # --- 3. 進階連動篩選面板 ---
-            with st.expander("🔍 佣金細節篩選 (業務/客戶/利率)", expanded=True):
-                f_col1, f_col2 = st.columns(2)
-                with f_col1:
-                    # 業務員多選 (按筆劃排序)
-                    sel_agents = st.multiselect("💼 篩選業務員", all_agents_list, key="comm_agent_filter")
-                    
-                    # 方案多選 (按筆劃排序)
-                    plan_opts = sorted(df_raw['方案(利率)'].unique().tolist())
-                    sel_plans = st.multiselect("📈 篩選方案(利率)", plan_opts, key="comm_plan_filter")
-
-                with f_col2:
-                    # 客戶連動篩選 (按筆劃排序)
-                    if sel_agents:
-                        cust_opts = sorted(df_raw[df_raw['業務姓名'].isin(sel_agents)]['客戶姓名'].unique().tolist())
-                    else:
-                        cust_opts = sorted(df_raw['客戶姓名'].unique().tolist())
-                    sel_custs = st.multiselect("👤 篩選客戶", cust_opts, key="comm_cust_filter")
-
-            # 執行過濾
-            df_filtered = df_raw.copy()
-            if sel_agents:
-                df_filtered = df_filtered[df_filtered['業務姓名'].isin(sel_agents)]
-            if sel_custs:
-                df_filtered = df_filtered[df_filtered['客戶姓名'].isin(sel_custs)]
-            if sel_plans:
-                df_filtered = df_filtered[df_filtered['方案(利率)'].isin(sel_plans)]
-
-            if not df_filtered.empty:
-                # 4. 計算佣金
-                df_filtered['應領佣金(萬)'] = (df_filtered['金額(萬)'] * df_filtered['分潤比例']).round(4)
+            # --- 3. 核心計算邏輯：差% 與 同階補償 ---
+            def calculate_hierarchy_comm(row):
+                amt = row['金額']
+                p_self = row['個人比例']
+                p_b = row['主管比例'] if pd.notna(row['主管比例']) else 0
+                p_bb = row['上級比例'] if pd.notna(row['上級比例']) else 0
                 
-                # 介面美化
-                st.write("### 📄 佣金發放明細")
-                display_df = df_filtered.copy()
-                display_df['分潤比例'] = display_df['分潤比例'].apply(lambda x: f"{x*100:.1f}%")
+                self_comm = amt * p_self
+                boss_overriding = 0.0
+                grand_boss_overriding = 0.0
+
+                # A. 直屬主管 (b) 邏輯
+                if pd.notna(row['直屬主管']):
+                    if p_b > p_self:
+                        boss_overriding = amt * (p_b - p_self)
+                    elif p_b == p_self and row['主管職級'] != '主任':
+                        boss_overriding = amt * 0.002 # 0.2%
                 
+                # B. 上級主管 (bb) 邏輯
+                if pd.notna(row['上級主管']):
+                    if p_bb > p_b:
+                        grand_boss_overriding = amt * (p_bb - max(p_b, p_self))
+                        if p_b == p_self and row['主管職級'] != '主任':
+                            grand_boss_overriding -= amt * 0.002
+                    elif p_bb == p_self and row['上級職級'] != '主任':
+                        grand_boss_overriding = amt * 0.001 # 0.1%
+
+                return pd.Series([self_comm, boss_overriding, grand_boss_overriding])
+
+            df_raw[['個人件佣金', '主管加給', '上級加給']] = df_raw.apply(calculate_hierarchy_comm, axis=1)
+
+            # --- 4. 建立領款發放清單 (實作高專歸併) ---
+            payout_records = []
+            for _, r in df_raw.iterrows():
+                # 💡 修正點：高專業績直接歸併給主管名下
+                if r['職級'] == '高專':
+                    payee = r['直屬主管'] if pd.notna(r['直屬主管']) else f"{r['業務姓名']}(高專無主管)"
+                else:
+                    payee = r['業務姓名']
+                
+                # 1. 業務本人份 (若高專則 payee 已換成主管)
+                payout_records.append({'姓名': payee, '方案': r['方案名稱(%)'], '金額': r['個人件佣金']})
+                
+                # 2. 直屬主管加給
+                if r['主管加給'] > 0:
+                    payout_records.append({'姓名': r['直屬主管'], '方案': r['方案名稱(%)'], '金額': r['主管加給']})
+                
+                # 3. 上級主管加給
+                if r['上級加給'] > 0:
+                    payout_records.append({'姓名': r['上級主管'], '方案': r['方案名稱(%)'], '金額': r['上級加給']})
+
+            df_payout = pd.DataFrame(payout_records)
+
+            # --- 5. 顯示矩陣報表 (X軸: 方案名稱%, Y軸: 姓名) ---
+            st.write("### 🧩 佣金計算（含差%）")
+            if not df_payout.empty:
+                # 樞紐分析：X軸為帶利率的方案名稱
+                pivot_df = df_payout.pivot_table(
+                    index='姓名', 
+                    columns='方案', 
+                    values='金額', 
+                    aggfunc='sum', 
+                    fill_value=0
+                )
+                pivot_df['個人總計'] = pivot_df.sum(axis=1)
+                pivot_df = pivot_df.sort_values(by='個人總計', ascending=False)
+
                 st.dataframe(
-                    display_df[['客戶姓名', '業務姓名', '職級', '金額(萬)', '方案(利率)', '分潤比例', '應領佣金(萬)', '生效日']],
+                    pivot_df.style.format("{:.2f} 萬"),
                     use_container_width=True,
-                    hide_index=True,
-                    height=500,
-                    column_config={
-                        "金額(萬)": st.column_config.NumberColumn("金額(萬)", format="%.2f 萬"),
-                        "應領佣金(萬)": st.column_config.NumberColumn("應領佣金(萬)", format="%.4f 萬"),
-                        "生效日": st.column_config.DateColumn("生效日")
-                    }
+                    height=600
                 )
 
-                st.divider()
-
-                # 5. 匯總：業務員領款總表
-                st.write("### 📊 業務員領款總表")
-                summary_df = df_filtered.groupby('業務姓名')['應領佣金(萬)'].sum().reset_index()
-                summary_df.columns = ['業務姓名', '總計佣金(萬)']
-                # 確保總表也按業務姓名筆劃排序
-                summary_df = summary_df.sort_values(by='業務姓名')
+                csv_matrix = pivot_df.to_csv(index=True).encode('utf-8-sig')
                 
-                c1, c2 = st.columns([1, 1])
-                with c1:
-                    st.table(summary_df.style.format({"總計佣金(萬)": "{:.2f} 萬"}).set_properties(**{'text-align': 'center'}))
-                
-                with c2:
-                    total_all = summary_df['總計佣金(萬)'].sum()
-                    st.metric("當前篩選發放總額", f"{total_all:.2f} 萬")
-                    # st.metric("折合台幣約", f"NT$ {int(total_all * 10000):,}")
-
-                # 6. 下載報表
-                csv = summary_df.to_csv(index=False).encode('utf-8-sig')
                 st.download_button(
-                    "📥 下載佣金結算單 (CSV)", 
-                    csv, 
-                    f"commission_report_{date.today()}.csv", 
-                    "text/csv",
-                    use_container_width=True
+                    label="📥 下載此佣金計算 (CSV)",
+                    data=csv_matrix,
+                    file_name=f"commission_matrix_{start_f}_to_{end_f}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                    help="下載目前畫面上看到的業務與方案交叉匯總表"
                 )
-            else:
-                st.warning("⚠️ 篩選條件下無符合的佣金資料。")
+            
+            st.divider()
+
+            # --- 6. 佣金明細 (完整對帳資訊) ---
+            st.write("### 📄 原始佣金拆解明細")
+            st.dataframe(
+                df_raw[['客戶姓名', '業務姓名', '職級', '金額', '方案名稱(%)', '個人件佣金', '生效日']],
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "個人件佣金": st.column_config.NumberColumn("個人佣金", format="%.2f"),
+                    # "主管加給": st.column_config.NumberColumn("主管差%/補償", format="%.4f"),
+                    # "上級加給": st.column_config.NumberColumn("上級差%/補償", format="%.4f")
+                },
+                height=600
+            )
+
+            # 7. 下載
+            csv = pivot_df.to_csv(index=True).encode('utf-8-sig')
+            st.download_button("📥 下載佣金結算總表", csv, f"commission_matrix_{date.today()}.csv", "text/csv")
 
         else:
-            st.warning(f"🌙 在 {start_f} 到 {end_f} 之間沒有任何新合約生效，故無佣金產生。")
-    else:
-        st.info("請在上方日期欄位選擇『開始日期』與『結束日期』。")
+            st.warning("🌙 此區間內無生效合約。")
 
 # --- 🌳 團隊組織圖 模組 ---
 elif menu == "🌳 團隊組織圖":
