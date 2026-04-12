@@ -8,7 +8,7 @@ import time
 # import graphviz
 
 
-CURRENT_VERSION = "1.2.2"
+CURRENT_VERSION = "1.2.3"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -352,7 +352,6 @@ elif menu == "📋 合約總覽":
     # --- 1. 基礎資料與環境設定 ---
     all_agents_df = pd.read_sql("SELECT agent_id, name FROM agents ORDER BY name", conn)
     
-    # 預先抓取所有原始資料
     query = """
         SELECT 
             ic.contract_id as ID, 
@@ -374,12 +373,10 @@ elif menu == "📋 合約總覽":
     df_raw = pd.read_sql(query, conn)
 
     if not df_raw.empty:
-        # 格式化方案名稱為 "方案 (利率%)"
         df_raw['方案(利率)'] = df_raw['方案名稱'] + " (" + df_raw['利率'].astype(str) + "%)"
         df_raw['開始日'] = pd.to_datetime(df_raw['開始日']).dt.date
         df_raw['結束日'] = pd.to_datetime(df_raw['結束日']).dt.date
         
-        # 狀態標籤處理
         this_m = date.today().replace(day=1)
         def get_status_label(d):
             if d.replace(day=1) < this_m: return "🔴 已過期"
@@ -387,186 +384,175 @@ elif menu == "📋 合約總覽":
             else: return "🟢 進行中"
         df_raw['狀態'] = df_raw['結束日'].apply(get_status_label)
 
-    # --- 2. 進階篩選面板 (連動邏輯) ---
+    # --- 2. 進階篩選面板 ---
     with st.expander("🔍 進階篩選面板", expanded=True):
         col_f1, col_f2 = st.columns(2)
         
+        # 💡 先讀取 Checkbox 的狀態（透過 session_state 以防順序移動導致抓不到值）
+        show_expired = st.session_state.get("show_exp_key", False)
+
         with col_f1:
-            # A. 業務員篩選
-            is_show_expired = st.session_state.get("show_exp_key", False)
+            # A. 業務員篩選 (會計算目前筆數)
             df_for_stats = df_raw.copy() if not df_raw.empty else pd.DataFrame()
-            if not is_show_expired and not df_for_stats.empty:
+            if not show_expired and not df_for_stats.empty:
                 df_for_stats = df_for_stats[df_for_stats['狀態'] != "🔴 已過期"]
             
             current_counts = df_for_stats.groupby('業務員').size().to_dict() if not df_for_stats.empty else {}
             agent_labels = {name: f"{name} ({current_counts.get(name, 0)})" for name in all_agents_df['name']}
+            sel_agents = st.multiselect("💼 篩選業務員", options=all_agents_df['name'].tolist(), format_func=lambda x: agent_labels.get(x, x))
             
-            sel_agents = st.multiselect("💼 篩選業務員 (可多選)", options=all_agents_df['name'].tolist(), 
-                                        format_func=lambda x: agent_labels.get(x, x), key="ms_agents")
-
-            # B. ⚡️ 客戶連動篩選 (只顯示選中業務員的客戶)
-            if sel_agents:
-                # 找出選中業務員名下的客戶
-                linked_cust_list = sorted(df_raw[df_raw['業務員'].isin(sel_agents)]['客戶姓名'].unique().tolist())
-                sel_customers = st.multiselect("👤 篩選客戶姓名 (連動中)", options=linked_cust_list, placeholder="該業務名下所有客戶")
-            else:
-                # 若沒選業務，顯示全體客戶
-                all_cust_list = sorted(df_raw['客戶姓名'].unique().tolist()) if not df_raw.empty else []
-                sel_customers = st.multiselect("👤 篩選客戶姓名", options=all_cust_list, placeholder="全部客戶")
-
-            # C. 方案(含利率)多選
-            all_plan_rate_list = sorted(df_raw['方案(利率)'].unique().tolist()) if not df_raw.empty else []
-            sel_plans_rates = st.multiselect("📈 篩選方案 (利率)", options=all_plan_rate_list, placeholder="全部方案與利率")
+            # B. 客戶篩選 (連動)
+            linked_cust_list = sorted(df_raw[df_raw['業務員'].isin(sel_agents)]['客戶姓名'].unique().tolist()) if sel_agents else sorted(df_raw['客戶姓名'].unique().tolist()) if not df_raw.empty else []
+            sel_customers = st.multiselect("👤 篩選客戶姓名", options=linked_cust_list)
 
         with col_f2:
+            # C. 方案篩選
+            all_plan_rate_list = sorted(df_raw['方案(利率)'].unique().tolist()) if not df_raw.empty else []
+            sel_plans_rates = st.multiselect("📈 篩選方案 (利率)", options=all_plan_rate_list)
+            
             # D. 日期範圍
-            st.write("📅 篩選合約生效日區間")
             if not df_raw.empty:
-                date_range = st.date_input("合約開始日期範圍", value=(df_raw['開始日'].min(), df_raw['開始日'].max()))
-            
-            c_sub1, c_sub2 = st.columns(2)
-            with c_sub1:
-                status_options = ["全部", "🟢 進行中", "🟡 本月到期"]
-                if is_show_expired: status_options.append("🔴 已過期")
-                filter_status = st.selectbox("⏳ 狀態", status_options)
-            with c_sub2:
-                filter_type = st.selectbox("📄 性質", ["全部", "新約", "續約"])
-            
+                date_range = st.date_input("📅 篩選生效日範圍", value=(df_raw['開始日'].min(), df_raw['開始日'].max()))
+            else:
+                date_range = (date.today(), date.today())
+
+        # 💡 將狀態篩選與過期開關移至最下方
+        st.write("---")
+        c_sub1, c_sub2, c_sub3 = st.columns(3)
+        with c_sub1:
+            status_opts = ["全部", "🟢 進行中", "🟡 本月到期"]
+            if show_expired: status_opts.append("🔴 已過期")
+            filter_status = st.selectbox("⏳ 合約狀態", status_opts)
+        with c_sub2:
+            filter_type = st.selectbox("📄 合約性質", ["全部", "新約", "續約"])
+        with c_sub3:
+            st.write("") # 對齊用
+            # 💡 這裡是你要移動的 Checkbox
             show_expired = st.checkbox("顯示已過期合約", value=False, key="show_exp_key")
 
     # --- 3. 執行過濾與顯示 ---
     if not df_raw.empty:
         df_display = df_raw.copy()
-        
-        if not show_expired:
-            df_display = df_display[df_display['狀態'] != "🔴 已過期"]
-        
-        # 多維度過濾
-        if sel_agents:
-            df_display = df_display[df_display['業務員'].isin(sel_agents)]
-        if sel_customers:
-            df_display = df_display[df_display['客戶姓名'].isin(sel_customers)]
-        if sel_plans_rates:
-            df_display = df_display[df_display['方案(利率)'].isin(sel_plans_rates)]
-        
+        if not show_expired: df_display = df_display[df_display['狀態'] != "🔴 已過期"]
+        if sel_agents: df_display = df_display[df_display['業務員'].isin(sel_agents)]
+        if sel_customers: df_display = df_display[df_display['客戶姓名'].isin(sel_customers)]
+        if sel_plans_rates: df_display = df_display[df_display['方案(利率)'].isin(sel_plans_rates)]
         if isinstance(date_range, tuple) and len(date_range) == 2:
             df_display = df_display[(df_display['開始日'] >= date_range[0]) & (df_display['開始日'] <= date_range[1])]
-        
-        if filter_type != "全部":
-            df_display = df_display[df_display['類型'] == filter_type]
-        if filter_status != "全部":
-            df_display = df_display[df_display['狀態'] == filter_status]
+        if filter_type != "全部": df_display = df_display[df_display['類型'] == filter_type]
+        if filter_status != "全部": df_display = df_display[df_display['狀態'] == filter_status]
 
-        # 業績總計
+        # 業績總結
         total_wan = df_display['金額(萬)'].sum()
         display_total = f"{total_wan/10000:.2f} 億" if total_wan >= 10000 else f"{total_wan:,.0f} 萬"
-        
         st.divider()
         m1, m2 = st.columns(2)
         m1.metric("符合條件筆數", f"{len(df_display)} 筆")
         m2.metric("篩選總金額 (NT$)", display_total)
-        
-        # 顯示表格 (隱藏不必要的輔助欄位)
-        st.dataframe(
+
+        # 顯示表格並捕捉選取事件
+        event = st.dataframe(
             df_display.drop(columns=['agent_id', '方案(利率)', '方案名稱']), 
             use_container_width=True, 
             hide_index=True,
-            column_config={"利率": st.column_config.NumberColumn("利率", format="%.1f%%")}
+            column_config={
+                "ID": st.column_config.NumberColumn("ID", width=60, format="%d"),
+                "利率": st.column_config.NumberColumn("利率", format="%.1f%%")
+            },
+            on_select="rerun",
+            selection_mode="single-row",
+            key="overview_table_final"
         )
+
+        auto_selected_id = "請選擇..."
+        try:
+            selected_rows = event.selection.get("rows", [])
+            if selected_rows:
+                auto_selected_id = df_display.iloc[selected_rows[0]]['ID']
+        except:
+            pass
 
         # --- 4. 🛠️ 快速維護區 ---
         st.divider()
         st.subheader("🛠️ 合約快速維護區")
         op_col1, op_col2 = st.columns(2)
 
+        id_list = df_display['ID'].tolist()
+        current_idx = id_list.index(auto_selected_id) + 1 if auto_selected_id in id_list else 0
+
         with op_col1:
             st.markdown("##### 📝 修正合約資料")
-            # 取得當前顯示中的 ID 清單
-            edit_id = st.selectbox("1. 選擇要修正的 ID", ["請選擇..."] + df_display['ID'].tolist(), key="edit_box")
+            edit_id = st.selectbox("1. 選擇要修正的 ID", ["請選擇..."] + id_list, index=current_idx, key=f"edit_ui_{auto_selected_id}")
             
             if edit_id != "請選擇...":
-                # 撈出該筆合約的詳細原始資料
                 detail_query = """
-                    SELECT ic.*, rp.period_months, a.name as agent_name, c.name as customer_name
+                    SELECT ic.*, rp.plan_name, rp.annual_rate, rp.period_months, 
+                           a.name as agent_name, c.name as customer_name
                     FROM invest_contracts ic
                     JOIN rate_plans rp ON ic.plan_id = rp.plan_id
                     JOIN customers c ON ic.customer_id = c.customer_id
                     JOIN agents a ON c.agent_id = a.agent_id
                     WHERE ic.contract_id = ?
                 """
-                detail_df = pd.read_sql(detail_query, conn, params=(edit_id,))
-                
-                if not detail_df.empty:
-                    info = detail_df.iloc[0]
-                    # 💡 修正這裡：改用 info['customer_name'] 顯示姓名
-                    st.info(f"📍 編輯ID： {edit_id} | 客戶：{info['customer_name']} | ⏳ 週期：{info['period_months']} 個月")
+                det_df = pd.read_sql(detail_query, conn, params=(edit_id,))
+                if not det_df.empty:
+                    info = det_df.iloc[0]
+                    st.info(f"📍 編輯：ID {edit_id} | 👤 客戶：{info['customer_name']}")
 
-                    # A. 修正業務歸屬
-                    agent_list = all_agents_df['name'].tolist()
-                    new_agent_name = st.selectbox("2. 變更承辦業務員", agent_list, index=agent_list.index(info['agent_name']))
-                    new_agent_id = int(all_agents_df[all_agents_df['name'] == new_agent_name]['agent_id'].values[0])
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        new_c_name = st.text_input("修正姓名", value=info['customer_name'])
+                    with c2:
+                        a_names = all_agents_df['name'].tolist()
+                        new_a_name = st.selectbox("變更業務", a_names, index=a_names.index(info['agent_name']))
+                        new_a_id = int(all_agents_df[all_agents_df['name'] == new_a_name]['agent_id'].values[0])
 
-                    # B. 修正開始日 (自動計算結束日)
-                    orig_start = pd.to_datetime(info['start_date']).date()
-                    new_start_dt = st.date_input("3. 修正開始日", value=orig_start)
+                    plans_df = pd.read_sql("SELECT plan_id, plan_name, annual_rate, period_months FROM rate_plans", conn)
+                    plans_df['display'] = plans_df['plan_name'] + " (" + plans_df['annual_rate'].astype(str) + "%)"
+                    p_opts = plans_df['display'].tolist()
+                    curr_p = f"{info['plan_name']} ({info['annual_rate']}%)"
+                    new_p_label = st.selectbox("變更方案", p_opts, index=p_opts.index(curr_p) if curr_p in p_opts else 0)
                     
-                    # 💡 自動計算新的結束日
-                    new_end_dt = new_start_dt + relativedelta(months=int(info['period_months']))
-                    st.caption(f"💡 系統已自動根據週期換算結束日為：**{new_end_dt}**")
+                    p_info = plans_df[plans_df['display'] == new_p_label].iloc[0]
+                    new_p_id, new_p_m = int(p_info['plan_id']), int(p_info['period_months'])
 
-                    # C. 其他欄位修正
-                    col_amt_edit, col_type_edit = st.columns(2)
-                    with col_amt_edit:
-                        new_amt = st.number_input("4. 修正金額(萬)", value=float(info['amount']/10000), step=1.0)
-                    with col_type_edit:
-                        new_type = st.radio("5. 修正性質", ["新約", "續約"], index=0 if info['contract_type'] == "新約" else 1, horizontal=True)
+                    new_s_dt = st.date_input("開始日", value=pd.to_datetime(info['start_date']).date())
+                    new_e_dt = new_s_dt + relativedelta(months=new_p_m)
+                    st.caption(f"📅 自動計算結束日：**{new_e_dt}**")
+
+                    amt_c, type_c = st.columns(2)
+                    with amt_c:
+                        new_amt = st.number_input("金額(萬)", value=float(info['amount']/10000))
+                    with type_c:
+                        new_type = st.radio("性質", ["新約", "續約"], index=0 if info['contract_type'] == "新約" else 1, horizontal=True)
                     
-                    new_note = st.text_input("6. 修正備註", value=str(info['note']) if info['note'] and info['note'] != 'None' else "")
+                    new_n = st.text_input("備註", value=str(info['note']) if info['note'] else "")
                     
-                    if st.button("💾 儲存所有修正內容", use_container_width=True, type="primary"):
-                        try:
-                            # 1. 更新合約資料
-                            conn.execute("""
-                                UPDATE invest_contracts 
-                                SET amount=?, start_date=?, end_date=?, note=?, contract_type=? 
-                                WHERE contract_id=?
-                            """, (
-                                new_amt * 10000, 
-                                new_start_dt.isoformat(), 
-                                new_end_dt.isoformat(), 
-                                new_note, 
-                                new_type, 
-                                edit_id
-                            ))
-                            
-                            # 2. 同步更新該合約所屬客戶的業務員歸屬
-                            # 使用 info['customer_id'] 確保精確更新該名客戶
-                            conn.execute("""
-                                UPDATE customers SET agent_id = ? 
-                                WHERE customer_id = ?
-                            """, (new_agent_id, int(info['customer_id'])))
-                            
-                            conn.commit()
-                            st.success(f"✅ {info['customer_name']} 的合約 (ID:{edit_id}) 已修正完成！")
-                            time.sleep(1)
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"❌ 更新失敗：{e}")
+                    if st.button("💾 儲存修正", use_container_width=True, type="primary"):
+                        conn.execute("UPDATE invest_contracts SET plan_id=?, amount=?, start_date=?, end_date=?, note=?, contract_type=? WHERE contract_id=?", 
+                                     (new_p_id, new_amt*10000, new_s_dt.isoformat(), new_e_dt.isoformat(), new_n, new_type, edit_id))
+                        conn.execute("UPDATE customers SET name=?, agent_id=? WHERE customer_id=?", 
+                                     (new_c_name, new_a_id, int(info['customer_id'])))
+                        conn.commit(); st.success("修正成功！"); time.sleep(1); st.rerun()
 
         with op_col2:
             st.markdown("##### ❌ 刪除合約紀錄")
-            del_id = st.selectbox("1. 選擇要刪除的 ID", ["請選擇..."] + df_display['ID'].tolist(), key="del_box")
+            del_id = st.selectbox("1. 選擇要刪除的 ID", ["請選擇..."] + id_list, index=current_idx, key=f"del_ui_{auto_selected_id}")
+            
             if del_id != "請選擇...":
                 row = df_display[df_display['ID'] == del_id].iloc[0]
                 st.error(f"⚠️ 警告：即將刪除合約 ID {del_id}")
-                if st.checkbox(f"確認永久刪除 {row['客戶姓名']} 的此筆資料"):
-                    if st.button(f"🔥 確定刪除"):
+                st.write(f"客戶：{row['客戶姓名']} | 金額：{row['金額(萬)']} 萬")
+                st.write("---")
+                is_confirmed = st.checkbox(f"我已確認要永久刪除此筆資料", key=f"confirm_del_{del_id}")
+                
+                if is_confirmed:
+                    if st.button(f"🔥 確定刪除 ID:{del_id}", type="primary", use_container_width=True):
                         conn.execute("DELETE FROM invest_contracts WHERE contract_id=?", (del_id,))
                         conn.commit()
-                        st.toast(f"🗑️ 已移除資料"); time.sleep(1); st.rerun()
+                        st.success(f"🗑️ 已移除資料"); time.sleep(1); st.rerun()
     else:
         st.info("⚠️ 目前資料庫中無任何合約。")
-
         
 elif menu == "⚙️ 基礎資料設定":
     st.title("⚙️ 系統參數與管理")
