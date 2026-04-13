@@ -8,7 +8,7 @@ import time
 # import graphviz
 
 
-CURRENT_VERSION = "1.2.4"
+CURRENT_VERSION = "1.2.5"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -1414,37 +1414,61 @@ elif menu == "📅 到期續約管理":
 
 elif menu == "💰 業務佣金":
     st.title("💰 業務佣金對帳 ")
-    st.info("必須要先把續約完成才可以在佣金裡面查詢到！！")
-    
+    st.info("💡 規則提醒：獎勵期數計算為『放款日次月』算第 1 次。")
+
+    # --- 0. 動態獎勵條件管理區 (這部分你的代碼很完整，保留) ---
+    with st.expander("🎁 額外活動獎勵管理", expanded=True):
+        if 'extra_rules' not in st.session_state:
+            st.session_state.extra_rules = []
+            
+        all_plans_info = pd.read_sql("SELECT plan_name, annual_rate, period_months FROM rate_plans", conn)
+        all_plans_info['display'] = all_plans_info['plan_name'] + " (" + all_plans_info['annual_rate'].astype(str) + "%)"
+        
+        r_col1, r_col2, r_col3 = st.columns([2, 1, 1])
+        with r_col1:
+            sel_rule_plan = st.selectbox("選擇利率方案", all_plans_info['display'].tolist())
+        with r_col2:
+            sel_rule_time = st.number_input("第二次佣金時間", min_value=1, value=6, step=1)
+        with r_col3:
+            sel_rule_bonus = st.number_input("加給 % 數", min_value=0.0, value=2.0, format="%.2f")
+            
+        if st.button("➕ 新增獎勵規則", use_container_width=True):
+            max_p = all_plans_info[all_plans_info['display'] == sel_rule_plan]['period_months'].values[0]
+            if sel_rule_time >= max_p:
+                st.error(f"❌ 獎勵期數 ({sel_rule_time}) 不得大於等於合約總期數 ({max_p})")
+            else:
+                new_rule = {"id": time.time(), "plan": sel_rule_plan, "time": sel_rule_time, "bonus_rate": sel_rule_bonus / 100}
+                st.session_state.extra_rules.append(new_rule)
+                st.rerun() 
+        
+        if st.session_state.extra_rules:
+            for idx, rule in enumerate(st.session_state.extra_rules):
+                rc1, rc2 = st.columns([4, 1])
+                with rc1: st.write(f"📍 {rule['plan']} - 第 {rule['time']} 次：加給 {rule['bonus_rate']*100:.2f}%")
+                with rc2:
+                    if st.button(f"❌ 刪除", key=f"del_{rule['id']}"):
+                        st.session_state.extra_rules.pop(idx)
+                        st.rerun()
+            if st.button("🗑️ 全部清空規則"):
+                st.session_state.extra_rules = []
+                st.rerun()
+
     # 1. 選擇日期範圍
     col_date1, col_date2 = st.columns([2, 1])
     with col_date1:
-        date_range = st.date_input(
-            "請選擇對帳日期區間",
-            value=(date.today().replace(day=1), date.today()),
-            help="起始日與結束日皆會包含在計算內"
-        )
+        date_range = st.date_input("請選擇對帳日期區間", value=(date.today().replace(day=1), date.today()))
     
     if isinstance(date_range, tuple) and len(date_range) == 2:
         start_f, end_f = date_range
 
-        # 2. SQL 查詢：串接兩層主管資訊 (b=主管, bb=上級)
+        # 2. SQL 查詢：抓取「結束日前」生效的所有單
         query = """
         SELECT 
-            c.name as 客戶姓名,
-            a.name as 業務姓名,
-            r.rank_name as 職級,
-            r.commission_rate as 個人比例,
-            ic.amount / 10000.0 as '金額',
-            rp.plan_name,
-            rp.annual_rate as '利率',
-            ic.start_date as 生效日,
-            b.name as 直屬主管,
-            rb.rank_name as 主管職級,
-            rb.commission_rate as 主管比例,
-            bb.name as 上級主管,
-            rbb.rank_name as 上級職級,
-            rbb.commission_rate as 上級比例
+            c.name as 客戶姓名, a.name as 業務姓名, r.rank_name as 職級, r.commission_rate as 個人比例,
+            ic.amount / 10000.0 as '金額', rp.plan_name, rp.annual_rate as '利率', 
+            ic.start_date as 生效日, rp.period_months as 總期數,
+            b.name as 直屬主管, rb.rank_name as 主管職級, rb.commission_rate as 主管比例,
+            bb.name as 上級主管, rbb.rank_name as 上級職級, rbb.commission_rate as 上級比例
         FROM invest_contracts ic
         JOIN customers c ON ic.customer_id = c.customer_id
         JOIN agents a ON c.agent_id = a.agent_id
@@ -1454,120 +1478,136 @@ elif menu == "💰 業務佣金":
         LEFT JOIN ranks rb ON b.rank_id = rb.rank_id
         LEFT JOIN agents bb ON b.boss_id = bb.agent_id
         LEFT JOIN ranks rbb ON bb.rank_id = rbb.rank_id
-        WHERE ic.start_date >= ? AND ic.start_date <= ?
+        WHERE ic.start_date <= ?
         """
-        df_raw = pd.read_sql(query, conn, params=(start_f.isoformat(), end_f.isoformat()))
+        df_all = pd.read_sql(query, conn, params=(end_f.isoformat(),))
 
-        if not df_raw.empty:
-            # 💡 修正點：方案名稱後帶上利率 %
-            df_raw['方案名稱(%)'] = df_raw['plan_name'] + " (" + df_raw['利率'].astype(str) + "%)"
+        if not df_all.empty:
+            df_all['方案名稱(%)'] = df_all['plan_name'] + " (" + df_all['利率'].astype(str) + "%)"
 
-            # --- 3. 核心計算邏輯：差% 與 同階補償 ---
-            def calculate_hierarchy_comm(row):
+            # --- 3. 核心計算邏輯：將規則判斷與過濾機制整合 ---
+            def calculate_comm_logic(row):
+                # --- 1. 時間與期數計算 ---
+                start_dt = pd.to_datetime(row['生效日']).date()
+                # 期數計算基準：結束日期 (end_f) 減去 生效日期
+                # 若 2025-10 生效, 2026-04 對帳, diff_months = 6 (符合你的次月=1邏輯)
+                diff_months = (end_f.year - start_dt.year) * 12 + (end_f.month - start_dt.month)
+                
+                # 判定這筆單是否為「本區間新成交」
+                is_new_deal = (row['生效日'] >= start_f.isoformat() and row['生效日'] <= end_f.isoformat())
+                
+                # 防呆：如果合約尚未開始或已經領超過總期數，本月不計入
+                if diff_months < 0 or diff_months >= row['總期數']:
+                    return pd.Series([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+
                 amt = row['金額']
                 p_self = row['個人比例']
                 p_b = row['主管比例'] if pd.notna(row['主管比例']) else 0
                 p_bb = row['上級比例'] if pd.notna(row['上級比例']) else 0
                 
-                self_comm = amt * p_self
-                boss_overriding = 0.0
-                grand_boss_overriding = 0.0
-
-                # A. 直屬主管 (b) 邏輯
-                if pd.notna(row['直屬主管']):
-                    if p_b > p_self:
-                        boss_overriding = amt * (p_b - p_self)
-                    elif p_b == p_self and row['主管職級'] != '主任':
-                        boss_overriding = amt * 0.002 # 0.2%
+                # --- 2. 額外獎勵規則判定 ---
+                extra_bonus = 0.0
+                has_bonus_triggered = False
                 
-                # B. 上級主管 (bb) 邏輯
-                if pd.notna(row['上級主管']):
-                    if p_bb > p_b:
-                        grand_boss_overriding = amt * (p_bb - max(p_b, p_self))
-                        if p_b == p_self and row['主管職級'] != '主任':
-                            grand_boss_overriding -= amt * 0.002
-                    elif p_bb == p_self and row['上級職級'] != '主任':
-                        grand_boss_overriding = amt * 0.001 # 0.1%
+                # 遍歷用戶手動新增的規則
+                for rule in st.session_state.get('extra_rules', []):
+                    # 匹配條件：方案名稱相同 且 期數相同
+                    if row['方案名稱(%)'] == rule['plan'] and diff_months == rule['time']:
+                        extra_bonus = amt * rule['bonus_rate']
+                        has_bonus_triggered = True
 
-                return pd.Series([self_comm, boss_overriding, grand_boss_overriding])
-
-            df_raw[['個人件佣金', '主管加給', '上級加給']] = df_raw.apply(calculate_hierarchy_comm, axis=1)
-
-            # --- 4. 建立領款發放清單 (實作高專歸併) ---
-            payout_records = []
-            for _, r in df_raw.iterrows():
-                # 💡 修正點：高專業績直接歸併給主管名下
-                if r['職級'] == '高專':
-                    payee = r['直屬主管'] if pd.notna(r['直屬主管']) else f"{r['業務姓名']}(高專無主管)"
-                else:
-                    payee = r['業務姓名']
+                # --- 3. 佣金拆解 ---
+                # 基礎分潤：只有新成交月才領 (若你的制度是每月領，則拿掉 is_new_deal 判斷)
+                self_base = amt * p_self if is_new_deal else 0.0
                 
-                # 1. 業務本人份 (若高專則 payee 已換成主管)
-                payout_records.append({'姓名': payee, '方案': r['方案名稱(%)'], '金額': r['個人件佣金']})
+                # 個人實領小計 = 基礎分潤 + 獎勵
+                current_self_total = self_base + extra_bonus
                 
-                # 2. 直屬主管加給
-                if r['主管加給'] > 0:
-                    payout_records.append({'姓名': r['直屬主管'], '方案': r['方案名稱(%)'], '金額': r['主管加給']})
-                
-                # 3. 上級主管加給
-                if r['上級加給'] > 0:
-                    payout_records.append({'姓名': r['上級主管'], '方案': r['方案名稱(%)'], '金額': r['上級加給']})
+                # 組織獎金 (通常只有新成交月發放)
+                boss_over = 0.0
+                grand_over = 0.0
+                if is_new_deal:
+                    # A. 直屬主管 (b) 邏輯
+                    if pd.notna(row['直屬主管']):
+                        if p_b > p_self:
+                            boss_over = amt * (p_b - p_self)
+                        elif p_b == p_self and row['主管職級'] != '主任':
+                            boss_over = amt * 0.002 # 0.2% 同階補償
+                    
+                    # B. 上級主管 (bb) 邏輯
+                    if pd.notna(row['上級主管']):
+                        if p_bb > p_b:
+                            grand_over = amt * (p_bb - max(p_b, p_self))
+                            # 負擔邏輯：若直屬主管領了同階補償，則由領差額的上級扣除
+                            if p_b == p_self and row['主管職級'] != '主任':
+                                grand_over -= amt * 0.002
+                        elif p_bb == p_self and row['上級職級'] != '主任':
+                            grand_over = amt * 0.001 # 0.1% 同階補償
 
-            df_payout = pd.DataFrame(payout_records)
+                # --- 4. 矩陣業績顯示邏輯 ---
+                # 💡 關鍵：如果是新單 OR 有觸發獎勵的舊單，我們都要讓成交額顯示出來
+                # 這樣在矩陣 X 軸上才看得到這筆業績
+                display_performance = amt if (is_new_deal or has_bonus_triggered) else 0.0
 
-            # --- 5. 顯示矩陣報表 (X軸: 方案名稱%, Y軸: 姓名) ---
-            st.write("### 🧩 佣金計算（含差%）")
-            if not df_payout.empty:
-                # 樞紐分析：X軸為帶利率的方案名稱
-                pivot_df = df_payout.pivot_table(
-                    index='姓名', 
-                    columns='方案', 
-                    values='金額', 
-                    aggfunc='sum', 
-                    fill_value=0
-                )
-                pivot_df['個人總計'] = pivot_df.sum(axis=1)
-                pivot_df = pivot_df.sort_values(by='個人總計', ascending=False)
+                # 返回順序：[個人實領, 主管實領, 上級實領, 矩陣顯示業績, 獎勵金額, 基礎分潤]
+                return pd.Series([
+                    current_self_total, 
+                    boss_over, 
+                    grand_over, 
+                    display_performance, 
+                    extra_bonus, 
+                    self_base
+                ])
 
-                st.dataframe(
-                    pivot_df.style.format("{:.2f} 萬"),
-                    use_container_width=True,
-                    height=600
-                )
-
-                csv_matrix = pivot_df.to_csv(index=True).encode('utf-8-sig')
-                
-                st.download_button(
-                    label="📥 下載此佣金計算 (CSV)",
-                    data=csv_matrix,
-                    file_name=f"commission_matrix_{start_f}_to_{end_f}.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                    help="下載目前畫面上看到的業務與方案交叉匯總表"
-                )
+            df_all[['個人實領', '主管實領', '上級實領', '本月業績', '規則獎勵', '基礎分潤']] = df_all.apply(calculate_comm_logic, axis=1)
             
-            st.divider()
+            # 💡 重點：過濾掉完全沒錢領也沒業績的單 (這樣舊單只要有獎勵，就會被留下來)
+            df_final = df_all[(df_all['個人實領'] + df_all['主管實領'] + df_all['上級實領'] + df_all['本月業績']) > 0].copy()
 
-            # --- 6. 佣金明細 (完整對帳資訊) ---
-            st.write("### 📄 原始佣金拆解明細")
-            st.dataframe(
-                df_raw[['客戶姓名', '業務姓名', '職級', '金額', '方案名稱(%)', '個人件佣金', '生效日']],
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "個人件佣金": st.column_config.NumberColumn("個人佣金", format="%.2f"),
-                    # "主管加給": st.column_config.NumberColumn("主管差%/補償", format="%.4f"),
-                    # "上級加給": st.column_config.NumberColumn("上級差%/補償", format="%.4f")
-                },
-                height=600
-            )
+            if not df_final.empty:
+                # --- 4. 數據歸併 ---
+                payout_list = []
+                for _, r in df_final.iterrows():
+                    # 高專歸併主管
+                    payee = r['直屬主管'] if r['職級'] == '高專' and pd.notna(r['直屬主管']) else r['業務姓名']
+                    
+                    # 紀錄業績 (X軸顯示成交額)
+                    payout_list.append({'姓名': payee, '方案': r['方案名稱(%)'], '類別': '業績', '數值': r['本月業績']})
+                    # 紀錄佣金 (最後加總用)
+                    payout_list.append({'姓名': payee, '方案': r['方案名稱(%)'], '類別': '佣金', '數值': r['個人實領']})
+                    if r['主管實領'] > 0:
+                        payout_list.append({'姓名': r['直屬主管'], '方案': r['方案名稱(%)'], '類別': '佣金', '數值': r['主管實領']})
+                    if r['上級實領'] > 0:
+                        payout_list.append({'姓名': r['上級主管'], '方案': r['方案名稱(%)'], '類別': '佣金', '數值': r['上級實領']})
 
-            # 7. 下載
-            csv = pivot_df.to_csv(index=True).encode('utf-8-sig')
-            st.download_button("📥 下載佣金結算總表", csv, f"commission_matrix_{date.today()}.csv", "text/csv")
+                df_payout = pd.DataFrame(payout_list)
+                
+                # 製作樞紐分析 (業績矩陣)
+                plans_query = "SELECT plan_name, annual_rate FROM rate_plans ORDER BY annual_rate ASC"
+                ordered_plans = [f"{rp['plan_name']} ({rp['annual_rate']}%)" for _, rp in pd.read_sql(plans_query, conn).iterrows()]
 
-        else:
-            st.warning("🌙 此區間內無生效合約。")
+                pivot_perf = df_payout[df_payout['類別'] == '業績'].pivot_table(index='姓名', columns='方案', values='數值', aggfunc='sum', fill_value=0)
+                pivot_perf = pivot_perf.reindex(columns=ordered_plans, fill_value=0)
+
+                # 計算最終應領佣金
+                comm_sum = df_payout[df_payout['類別'] == '佣金'].groupby('姓名')['數值'].sum()
+                pivot_perf['應領佣金'] = comm_sum.reindex(pivot_perf.index, fill_value=0)
+                pivot_perf = pivot_perf.sort_values(by='應領佣金', ascending=False)
+
+                st.write(f"### 🧩 佣金統計矩陣")
+                format_dict = {plan: "{:.0f}" for plan in ordered_plans}
+                format_dict["應領佣金"] = "{:.2f}"
+                st.dataframe(pivot_perf.style.format(format_dict), use_container_width=True, height=500)
+
+                st.divider()
+                st.write("### 📄 本月發放明細 (含獎勵舊單)")
+                st.dataframe(
+                    df_final[['客戶姓名', '業務姓名', '生效日', '方案名稱(%)', '本月業績', '基礎分潤', '規則獎勵', '個人實領']],
+                    use_container_width=True, hide_index=True,
+                    column_config={"本月業績": "合約金額", "基礎分潤": "佣", "規則獎勵": "獎勵", "個人實領": "小計"}
+                )
+            else:
+                st.warning("🌙 即使套用規則後，此區間仍無應發放之金額。")
 
 # --- 🌳 團隊組織圖 模組 ---
 elif menu == "🌳 團隊組織圖":
