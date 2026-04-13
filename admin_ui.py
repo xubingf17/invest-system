@@ -8,7 +8,7 @@ import time
 # import graphviz
 
 
-CURRENT_VERSION = "1.2.6"
+CURRENT_VERSION = "1.2.7"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -1414,7 +1414,7 @@ elif menu == "📅 到期續約管理":
 
 elif menu == "💰 業務佣金":
     st.title("💰 業務佣金對帳 ")
-    st.info("💡 規則提醒：獎勵期數計算為『放款日次月』算第 1 次。系統將以『結束日期』作為期數計算基準。")
+    st.info("💡 規則提醒：獎勵期數計算為『放款日次月』算第 1 次。若要設定新約（成交月）獎勵，請選擇第 0 次。")
 
     # --- 0. 動態獎勵條件管理區 ---
     with st.expander("🎁 額外活動獎勵管理", expanded=True):
@@ -1426,9 +1426,10 @@ elif menu == "💰 業務佣金":
         
         r_col1, r_col2, r_col3 = st.columns([2, 1, 1])
         with r_col1:
-            sel_rule_plan = st.selectbox("選擇利率方案", all_plans_info['display'].tolist())
+            sel_rule_plan = st.selectbox("選擇利率方案", plan_opts := all_plans_info['display'].tolist())
         with r_col2:
-            sel_rule_time = st.number_input("第幾次領取時獎勵 (次月=1)", min_value=1, value=6, step=1)
+            # 💡 允許設定為 0，代表成交當月即有獎勵
+            sel_rule_time = st.number_input("第幾次領取時獎勵", min_value=0, value=0, step=1)
         with r_col3:
             sel_rule_bonus = st.number_input("加給 % 數", min_value=0.0, value=2.0, format="%.2f")
             
@@ -1486,7 +1487,7 @@ elif menu == "💰 業務佣金":
         if not df_all.empty:
             df_all['方案名稱(%)'] = df_all['plan_name'] + " (" + df_all['利率'].astype(str) + "%)"
 
-            # --- 3. 核心計算邏輯 (進位與隔離) ---
+            # --- 3. 核心計算邏輯 (修正：支援第 0 次新約獎勵) ---
             def calculate_detail_logic(row):
                 start_dt = pd.to_datetime(row['生效日']).date()
                 diff_months = (end_f.year - start_dt.year) * 12 + (end_f.month - start_dt.month)
@@ -1509,7 +1510,6 @@ elif menu == "💰 業務佣金":
                     if pd.notna(row['直屬主管']):
                         if p_b > p_s: boss_over = round(amt * (p_b - p_s), 2)
                         elif p_b == p_s and row['主管職級'] != '主任': boss_over = round(amt * 0.002, 2)
-                    
                     if pd.notna(row['上級主管']):
                         if p_bb > p_b:
                             val = amt * (p_bb - max(p_b, p_s))
@@ -1559,27 +1559,23 @@ elif menu == "💰 業務佣金":
                 
                 pivot_perf = pivot_perf.sort_values(by='應領佣金', ascending=False)
 
-                # --- 6. 顯示圖表 (無色版本) ---
+                # --- 6. 顯示結果 ---
                 st.write("### 🧩 佣金統計矩陣 (細項拆解)")
                 format_dict = {plan: "{:.0f}" for plan in ordered_plans}
-                for extra in ['個人業績佣金', '差%', '獎勵', '應領佣金']:
-                    format_dict[extra] = "{:.2f}"
+                for col in ['個人業績佣金', '差%', '獎勵', '應領佣金']:
+                    format_dict[col] = "{:.2f}"
                 
-                st.dataframe(
-                    pivot_perf.style.format(format_dict), 
-                    use_container_width=True, 
-                    height=500
-                )
+                st.dataframe(pivot_perf.style.format(format_dict), use_container_width=True, height=500)
 
                 st.divider()
-                st.write("### 📄 本月對帳明細 (計算基準)")
+                st.write("### 📄 本月對帳明細 (計算事實源)")
                 st.dataframe(
                     df_final[['客戶姓名', '業務姓名', '生效日', '方案名稱(%)', '計算業績', '職級分潤', '活動獎勵', '主管加給', '上級加給', '個人小計']],
                     use_container_width=True, hide_index=True,
                     column_config={"職級分潤": "本件分潤", "活動獎勵": "獎勵", "個人小計": "小計"}
                 )
             else:
-                st.warning("🌙 此區間無應領佣金或業績資料。")
+                st.warning("🌙 此區間無任何佣金或獎勵支出。")
 
 # --- 🌳 團隊組織圖 模組 ---
 elif menu == "🌳 團隊組織圖":
