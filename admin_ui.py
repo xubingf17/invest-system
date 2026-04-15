@@ -8,7 +8,7 @@ import time
 # import graphviz
 
 
-CURRENT_VERSION = "1.2.8"
+CURRENT_VERSION = "1.2.9"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -192,16 +192,14 @@ if menu == "📊 客戶資料瀏覽":
 
 elif menu == "💰 收益發放試算":
     st.title("💰 收益發放試算 (固定發放日制)")
-    st.info("💡 規則：系統會找出『生效日(Day)』落在指定區間內的合約。排除『生效當月』新件。")
+    # st.info("💡 規則：系統會找出『生效日(Day)』落在指定區間內的合約。排除『生效當月』新件。")
 
     # --- 0. 狀態初始化 ---
     if 'sel_days' not in st.session_state:
-        # 預設選取 1~31 全部的日子
         st.session_state.sel_days = list(range(1, 32))
 
     # --- 1. 美化選日界面 ---
     with st.expander("📅 設定發放日範圍 (僅看日期)", expanded=True):
-        # 快速選擇功能
         c1, c2, c3, c4 = st.columns(4)
         if c1.button("全選 (1-31)", use_container_width=True):
             st.session_state.sel_days = list(range(1, 32))
@@ -216,7 +214,6 @@ elif menu == "💰 收益發放試算":
             st.session_state.sel_days = list(range(21, 32))
             st.rerun()
 
-        # 使用 multiselect，讓它看起來像一堆標籤，使用者可以手動加減
         sel_days = st.multiselect(
             "選擇要試算的日期 (可多選或刪除)：",
             options=list(range(1, 32)),
@@ -231,7 +228,6 @@ elif menu == "💰 收益發放試算":
         first_day_of_this_month = date.today().replace(day=1)
 
     # --- 2. 核心 SQL 查詢 ---
-    # 改用 IN 語法，精確比對選中的日子
     days_str = ",".join(map(str, sel_days))
     query = f"""
     SELECT 
@@ -272,6 +268,7 @@ elif menu == "💰 收益發放試算":
                 cust_opts = sorted(raw_df[raw_df['業務員'].isin(sel_agents)]['客戶姓名'].unique().tolist())
             sel_custs = st.multiselect("👤 篩選客戶", cust_opts, key="payout_cust_filter")
 
+        # 執行過濾
         df_filtered = raw_df.copy()
         if sel_agents: df_filtered = df_filtered[df_filtered['業務員'].isin(sel_agents)]
         if sel_custs: df_filtered = df_filtered[df_filtered['客戶姓名'].isin(sel_custs)]
@@ -293,8 +290,50 @@ elif menu == "💰 收益發放試算":
 
             st.dataframe(
                 df_filtered[['客戶姓名', '業務員', '所屬主管', '金額(萬)', '方案(利率)', '本月預計發放(萬)', '生效日']],
-                use_container_width=True, hide_index=True, height=500
+                use_container_width=True, hide_index=True, height=400
             )
+
+            # --- 6. 底部統計表：業務與方案分布 ---
+            st.divider()
+            st.subheader("📊 業務員與各方案本金統計")
+
+            try:
+                # 建立基礎交叉表
+                pivot_df = df_filtered.pivot_table(
+                    index='業務員',
+                    columns='方案(利率)',
+                    values='金額(萬)',
+                    aggfunc='sum',
+                    fill_value=0
+                )
+                
+                # 取得利率對照表
+                rate_map = df_filtered.drop_duplicates('方案(利率)').set_index('方案(利率)')['利率']
+
+                # 計算收益
+                def calculate_member_income(row):
+                    income_sum = 0
+                    for plan_name in pivot_df.columns:
+                        principal = row[plan_name]
+                        plan_rate = rate_map.get(plan_name, 0)
+                        income_sum += (principal * (plan_rate / 100.0))
+                    return round(income_sum, 2)
+
+                pivot_df['收益(萬)'] = pivot_df.apply(calculate_member_income, axis=1)
+
+                # 計算方案合計
+                total_row = pivot_df.sum(axis=0)
+                total_row.name = '合計'
+                pivot_final = pd.concat([pivot_df, total_row.to_frame().T])
+
+                st.dataframe(
+                    pivot_final.style.format(precision=2, thousands=","),
+                    use_container_width=True
+                )
+                # st.info("💡 說明：表格內數值為『本金(萬)』，最後一欄『收益』為根據各方案利率計算之應發總金額。")
+
+            except Exception as e:
+                st.info(f"暫無足夠資料生成統計表，錯誤訊息：{e}")
 
             # 下載報表
             csv = df_filtered.to_csv(index=False).encode('utf-8-sig')
