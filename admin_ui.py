@@ -5,10 +5,11 @@ from datetime import datetime, date
 from dateutil.relativedelta import relativedelta
 from io import BytesIO
 import time
+from datetime import date, datetime, timedelta
 # import graphviz
 
 
-CURRENT_VERSION = "1.2.9"
+CURRENT_VERSION = "1.3.0"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -191,157 +192,153 @@ if menu == "📊 客戶資料瀏覽":
     st.dataframe(df, use_container_width=True)
 
 elif menu == "💰 收益發放試算":
-    st.title("💰 收益發放試算 (固定發放日制)")
-    # st.info("💡 規則：系統會找出『生效日(Day)』落在指定區間內的合約。排除『生效當月』新件。")
+    st.title("💰 收益發放試算 (精確日期區間版)")
+    st.info("💡 規則：系統會自動比對合約『生效日(Day)』是否落在您的選定區間內。已排除『生效當月』新件。")
 
-    # --- 0. 狀態初始化 ---
-    if 'sel_days' not in st.session_state:
-        st.session_state.sel_days = list(range(1, 32))
+    # --- 0. 狀態初始化 (鎖定篩選條件) ---
+    if 'p_start_date' not in st.session_state:
+        st.session_state.p_start_date = date.today()
+    if 'p_end_date' not in st.session_state:
+        st.session_state.p_end_date = date.today() + timedelta(days=7)
+    
+    # 鎖定進階篩選器 Key 
+    for k in ['p_agent_f', 'p_plan_f', 'p_cust_f']:
+        if k not in st.session_state: st.session_state[k] = []
 
-    # --- 1. 美化選日界面 ---
-    with st.expander("📅 設定發放日範圍 (僅看日期)", expanded=True):
-        c1, c2, c3, c4 = st.columns(4)
-        if c1.button("全選 (1-31)", use_container_width=True):
-            st.session_state.sel_days = list(range(1, 32))
-            st.rerun()
-        if c2.button("上旬 (1-10)", use_container_width=True):
-            st.session_state.sel_days = list(range(1, 11))
-            st.rerun()
-        if c3.button("中旬 (11-20)", use_container_width=True):
-            st.session_state.sel_days = list(range(11, 21))
-            st.rerun()
-        if c4.button("下旬 (21-31)", use_container_width=True):
-            st.session_state.sel_days = list(range(21, 32))
-            st.rerun()
-
-        sel_days = st.multiselect(
-            "選擇要試算的日期 (可多選或刪除)：",
-            options=list(range(1, 32)),
-            default=st.session_state.sel_days,
-            key="sel_days"
-        )
+    # --- 1. 突破月份限制的日期選取介面 ---
+    with st.expander("📅 設定對帳區間 (解決 31 號選取問題)", expanded=True):
+        col_start, col_end = st.columns(2)
         
-        if not sel_days:
-            st.warning("請至少選擇一個日期！")
-            st.stop()
-            
-        first_day_of_this_month = date.today().replace(day=1)
+        with col_start:
+            st.write("**起始日期**")
+            s_year = st.number_input("年", value=st.session_state.p_start_date.year, key="s_y")
+            s_month = st.number_input("月", min_value=1, max_value=12, value=st.session_state.p_start_date.month, key="s_m")
+            s_day = st.number_input("日", min_value=1, max_value=31, value=st.session_state.p_start_date.day, key="s_d")
+            try:
+                start_dt = date(s_year, s_month, s_day)
+            except ValueError:
+                # 自動校正無效日期（如 4/31 -> 4/30）
+                import calendar
+                last_day = calendar.monthrange(s_year, s_month)[1]
+                start_dt = date(s_year, s_month, last_day)
+                st.warning(f"⚠️ 起始日已調整為該月最後一天：{start_dt}")
+
+        with col_end:
+            st.write("**結束日期**")
+            e_year = st.number_input("年", value=st.session_state.p_end_date.year, key="e_y")
+            e_month = st.number_input("月", min_value=1, max_value=12, value=st.session_state.p_end_date.month, key="e_m")
+            e_day = st.number_input("日", min_value=1, max_value=31, value=st.session_state.p_end_date.day, key="e_d")
+            try:
+                end_dt = date(e_year, e_month, e_day)
+            except ValueError:
+                import calendar
+                last_day = calendar.monthrange(e_year, e_month)[1]
+                end_dt = date(e_year, e_month, last_day)
+                st.warning(f"⚠️ 結束日已調整為該月最後一天：{end_dt}")
+
+        st.session_state.p_start_date = start_dt
+        st.session_state.p_end_date = end_dt
 
     # --- 2. 核心 SQL 查詢 ---
-    days_str = ",".join(map(str, sel_days))
     query = f"""
     SELECT 
-        c.name as 客戶姓名,
-        b.name as 業務員,
-        boss.name as 所屬主管,
-        ic.amount / 10000.0 as '金額(萬)',
-        rp.plan_name,
-        rp.annual_rate as '利率',
-        ic.start_date as 生效日,
-        ic.end_date as 結束日
+        c.name as 客戶姓名, b.name as 業務員, boss.name as 所屬主管,
+        ic.amount / 10000.0 as '金額(萬)', rp.plan_name, rp.annual_rate as '利率',
+        ic.start_date as 生效日, ic.end_date as 結束日
     FROM invest_contracts ic
     JOIN customers c ON ic.customer_id = c.customer_id
     JOIN agents b ON c.agent_id = b.agent_id
     LEFT JOIN agents boss ON b.boss_id = boss.agent_id
     JOIN rate_plans rp ON ic.plan_id = rp.plan_id
-    WHERE CAST(strftime('%d', ic.start_date) AS INTEGER) IN ({days_str})
-      AND ic.start_date < '{first_day_of_this_month.isoformat()}'
-      AND ic.end_date >= '{date.today().isoformat()}'
+    WHERE ic.start_date < '{start_dt.replace(day=1).isoformat()}' 
+      AND ic.end_date >= '{start_dt.isoformat()}'
     """
     raw_df = pd.read_sql(query, conn)
 
+    # --- 3. 區間掃描 (核心邏輯) ---
+    if not raw_df.empty:
+        def is_payout_in_range(row, s_dt, e_dt):
+            target_day = pd.to_datetime(row['生效日']).day
+            curr = s_dt
+            while curr <= e_dt:
+                if curr.day == target_day:
+                    return True
+                curr += timedelta(days=1)
+            return False
+
+        mask = raw_df.apply(lambda r: is_payout_in_range(r, start_dt, end_dt), axis=1)
+        raw_df = raw_df[mask].copy()
+
+    # --- 4. 進階篩選與狀態保留 (這就是你要的篩選功能) ---
     if not raw_df.empty:
         raw_df['方案(利率)'] = raw_df['plan_name'] + " (" + raw_df['利率'].astype(str) + "%)"
+        raw_df['本月預計發放(萬)'] = round(raw_df['金額(萬)'] * (raw_df['利率'] / 100.0), 2)
         raw_df = raw_df.sort_values(by=['業務員', '客戶姓名']).reset_index(drop=True)
 
-        # --- 3. 連動篩選面板 ---
+        st.write("### 🔍 進階篩選")
         f_col1, f_col2 = st.columns(2)
+        
+        all_agents = sorted(raw_df['業務員'].unique().tolist())
+        all_plans = sorted(raw_df['方案(利率)'].unique().tolist())
+        
+        # 💡 防止切換日期導致舊選項消失導致 Crash 的過濾邏輯
+        st.session_state.p_agent_f = [x for x in st.session_state.p_agent_f if x in all_agents]
+        st.session_state.p_plan_f = [x for x in st.session_state.p_plan_f if x in all_plans]
+
         with f_col1:
-            agent_opts = sorted(raw_df['業務員'].unique().tolist())
-            sel_agents = st.multiselect("💼 篩選業務員", agent_opts, key="payout_agent_filter")
-            plan_opts = sorted(raw_df['方案(利率)'].unique().tolist())
-            sel_plans = st.multiselect("📈 篩選方案(利率)", plan_opts, key="payout_plan_filter")
+            st.multiselect("💼 篩選業務員", all_agents, key="p_agent_f")
+            st.multiselect("📈 篩選方案(利率)", all_plans, key="p_plan_f")
 
         with f_col2:
-            cust_opts = sorted(raw_df['客戶姓名'].unique().tolist())
-            if sel_agents:
-                cust_opts = sorted(raw_df[raw_df['業務員'].isin(sel_agents)]['客戶姓名'].unique().tolist())
-            sel_custs = st.multiselect("👤 篩選客戶", cust_opts, key="payout_cust_filter")
+            # 客戶選單連動
+            valid_df = raw_df[raw_df['業務員'].isin(st.session_state.p_agent_f)] if st.session_state.p_agent_f else raw_df
+            all_custs = sorted(valid_df['客戶姓名'].unique().tolist())
+            st.session_state.p_cust_f = [x for x in st.session_state.p_cust_f if x in all_custs]
+            st.multiselect("👤 篩選客戶", all_custs, key="p_cust_f")
 
-        # 執行過濾
+        # --- 5. 執行最終過濾 ---
         df_filtered = raw_df.copy()
-        if sel_agents: df_filtered = df_filtered[df_filtered['業務員'].isin(sel_agents)]
-        if sel_custs: df_filtered = df_filtered[df_filtered['客戶姓名'].isin(sel_custs)]
-        if sel_plans: df_filtered = df_filtered[df_filtered['方案(利率)'].isin(sel_plans)]
+        if st.session_state.p_agent_f:
+            df_filtered = df_filtered[df_filtered['業務員'].isin(st.session_state.p_agent_f)]
+        if st.session_state.p_plan_f:
+            df_filtered = df_filtered[df_filtered['方案(利率)'].isin(st.session_state.p_plan_f)]
+        if st.session_state.p_cust_f:
+            df_filtered = df_filtered[df_filtered['客戶姓名'].isin(st.session_state.p_cust_f)]
 
+        # --- 6. 顯示結果指標與表格 ---
         if not df_filtered.empty:
-            # --- 4. 計算發放金額 ---
-            df_filtered['本月預計發放(萬)'] = round(df_filtered['金額(萬)'] * (df_filtered['利率'] / 100.0), 2)
-            total_pay_wan = df_filtered['本月預計發放(萬)'].sum()
-            display_total = f"NT$ {total_pay_wan / 10000:.2f} 億" if total_pay_wan >= 10000 else f"NT$ {total_pay_wan:,.2f} 萬"
-
-            # --- 5. 顯示指標與表格 ---
+            total_pay = df_filtered['本月預計發放(萬)'].sum()
             st.divider()
-            st.subheader(f"📊 預計發放清單 (選中日期共 {len(sel_days)} 天)")
+            st.subheader(f"📊 預計發放清單 ({start_dt} ~ {end_dt})")
             
             m1, m2 = st.columns(2)
             m1.metric("待發放筆數", f"{len(df_filtered)} 筆")
-            m2.metric("總計應發利息", display_total)
+            m2.metric("總計應發利息", f"NT$ {total_pay:,.2f} 萬")
 
             st.dataframe(
-                df_filtered[['客戶姓名', '業務員', '所屬主管', '金額(萬)', '方案(利率)', '本月預計發放(萬)', '生效日']],
+                df_filtered[['客戶姓名', '業務員', '金額(萬)', '方案(利率)', '本月預計發放(萬)', '生效日']],
                 use_container_width=True, hide_index=True, height=400
             )
 
-            # --- 6. 底部統計表：業務與方案分布 ---
+            # --- 7. 底部統計總表 ---
             st.divider()
-            st.subheader("📊 業務員與各方案本金統計")
-
+            st.subheader("📊 業務員與各方案利息統計")
             try:
-                # 建立基礎交叉表
-                pivot_df = df_filtered.pivot_table(
-                    index='業務員',
-                    columns='方案(利率)',
-                    values='金額(萬)',
-                    aggfunc='sum',
-                    fill_value=0
-                )
+                pivot_df = df_filtered.pivot_table(index='業務員', columns='方案(利率)', values='金額(萬)', aggfunc='sum', fill_value=0)
+                pivot_df['合計利息(萬)'] = df_filtered.groupby('業務員')['本月預計發放(萬)'].sum()
                 
-                # 取得利率對照表
-                rate_map = df_filtered.drop_duplicates('方案(利率)').set_index('方案(利率)')['利率']
-
-                # 計算收益
-                def calculate_member_income(row):
-                    income_sum = 0
-                    for plan_name in pivot_df.columns:
-                        principal = row[plan_name]
-                        plan_rate = rate_map.get(plan_name, 0)
-                        income_sum += (principal * (plan_rate / 100.0))
-                    return round(income_sum, 2)
-
-                pivot_df['收益(萬)'] = pivot_df.apply(calculate_member_income, axis=1)
-
-                # 計算方案合計
                 total_row = pivot_df.sum(axis=0)
-                total_row.name = '合計'
-                pivot_final = pd.concat([pivot_df, total_row.to_frame().T])
-
-                st.dataframe(
-                    pivot_final.style.format(precision=2, thousands=","),
-                    use_container_width=True
-                )
-                # st.info("💡 說明：表格內數值為『本金(萬)』，最後一欄『收益』為根據各方案利率計算之應發總金額。")
-
+                total_row.name = '🏁 總計'
+                st.dataframe(pd.concat([pivot_df, total_row.to_frame().T]).style.format(precision=2), use_container_width=True)
             except Exception as e:
-                st.info(f"暫無足夠資料生成統計表，錯誤訊息：{e}")
+                st.info("暫無足夠資料生成統計表")
 
-            # 下載報表
             csv = df_filtered.to_csv(index=False).encode('utf-8-sig')
-            st.download_button("📥 下載發放清單 (CSV)", csv, f"payout_report_{date.today()}.csv", use_container_width=True)
+            st.download_button("📥 下載發放清單 (CSV)", csv, f"payout_{start_dt}_{end_dt}.csv", use_container_width=True)
         else:
-            st.warning("⚠️ 篩選後無符合條件的資料。")
+            st.warning("⚠️ 目前篩選條件下無符合資料。")
     else:
-        st.warning(f"🔔 找不到選中日期中的合約 (已排除當月件)。")
+        st.warning(f"🔔 此日期區間內無任何應發放收益之合約。")
 
 elif menu == "📋 合約總覽":
     st.title("📋 投資合約總覽")
@@ -1420,7 +1417,7 @@ elif menu == "💰 業務佣金":
     """
     agent_map = pd.read_sql(agent_query, conn).set_index('agent_id').to_dict('index')
 
-    # 💡 確保日期狀態不會因為 rerun 而消失
+    # 確保日期狀態與獎勵規則不會因為 rerun 而消失
     if 'comm_date_range' not in st.session_state:
         st.session_state.comm_date_range = (date.today().replace(day=1), date.today())
     if 'extra_rules' not in st.session_state:
@@ -1456,16 +1453,14 @@ elif menu == "💰 業務佣金":
                     if st.button(f"❌", key=f"del_{rule['id']}"):
                         st.session_state.extra_rules.pop(idx); st.rerun()
 
-    # --- 2. 選擇日期範圍 (徹底鎖定 Session State) ---
+    # --- 2. 選擇日期範圍 (鎖定 Session State) ---
     col_date1, col_date2 = st.columns([2, 1])
     with col_date1:
-        # 💡 直接讓 date_input 存取與寫回 session_state.comm_date_range
         date_range = st.date_input(
             "請選擇對帳日期區間", 
             key="comm_date_range" 
         )
     
-    # 確保抓到的是有效的 range
     if isinstance(date_range, tuple) and len(date_range) == 2:
         start_f, end_f = date_range
 
@@ -1507,7 +1502,7 @@ elif menu == "💰 業務佣金":
                 this_self_comm = 0.0
                 hierarchy_log = []
 
-                # (A) 活動獎勵
+                # (A) 活動獎勵 (發放給合約所屬業務)
                 for rule in st.session_state.extra_rules:
                     if plan == rule['plan'] and diff_months == rule['time']:
                         this_reward = round(amt * rule['bonus_rate'], 2)
@@ -1516,14 +1511,19 @@ elif menu == "💰 業務佣金":
 
                 # (B) 職級與組織差% (限新約)
                 if is_new:
+                    # 💡 邏輯修正：高專、累件中、外圍之單併入主管
                     target_aid = aid
-                    if row['職級'] == '高專' and pd.notna(row['boss_id']):
+                    is_merged_rank = row['職級'] in ['高專', '累件中', '外圍']
+                    
+                    if is_merged_rank and pd.notna(row['boss_id']):
                         target_aid = row['boss_id']
                     
+                    # 計算該件分潤
                     this_self_comm = round(amt * row['個人比例'], 2)
                     payouts[target_aid]['個人'] += this_self_comm
                     payouts[target_aid]['業績'][plan] = payouts[target_aid]['業績'].get(plan, 0) + amt
 
+                    # 🚀 無限層級組織爬升 (主任封頂、他階補償)
                     curr_paid_rate = row['個人比例']
                     curr_boss_id = row['boss_id']
                     gen = 1
