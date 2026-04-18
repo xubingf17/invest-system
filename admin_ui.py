@@ -10,7 +10,7 @@ import calendar
 # import graphviz
 
 
-CURRENT_VERSION = "1.3.2"
+CURRENT_VERSION = "1.3.3"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -1521,7 +1521,7 @@ elif menu == "💰 業務佣":
                 m_info = agent_map[m_id]
                 # 1. 級差
                 for sub_id, total_amt in v_data['級差池'].items():
-                    s_rate = round(m_info['rate'] - agent_map[sub_id]['rate'], 2)
+                    s_rate = round(m_info['rate'] - agent_map[sub_id]['rate'], 4)
                     if s_rate > 0:
                         gain = round(total_amt * s_rate, 2)
                         payouts[m_id]['加給'] += gain
@@ -1543,7 +1543,7 @@ elif menu == "💰 業務佣":
                             payouts[m_id]['加給'] += g_gain
                             payouts[payer_id]['加給'] -= g_gain
                             # summary_payout_details.append({'受款人': m_info['name'], '項目': f"{gen_name}平階補償({agent_map[sub_id]['name']}組)", '總業績': total_pool_amt, '計算式': f"{g_rate*100:.2f}%", '金額': g_gain, '支出人': agent_map[payer_id]['name']})
-                            summary_payout_details.append({'受款人': m_info['name'], '項目': f"同階補償)", '總業績': total_pool_amt, '計算式': f"{g_rate*100:.2f}%", '金額': g_gain, '支出人': agent_map[payer_id]['name']})
+                            summary_payout_details.append({'受款人': m_info['name'], '項目': f"同階補償({agent_map[sub_id]['name']}組)", '總業績': total_pool_amt, '計算式': f"{g_rate*100:.2f}%", '金額': g_gain, '支出人': agent_map[payer_id]['name']})
 
 
             # --- 5. 報表呈現 (矩陣 + 明細) ---
@@ -1563,7 +1563,6 @@ elif menu == "💰 業務佣":
                 st.dataframe(pd.DataFrame(summary_data).fillna(0), use_container_width=True)
                 st.write("### 🔍 明細")
                 st.table(pd.DataFrame(summary_payout_details))
-
             else:
                 st.warning("🌙 此區間無數據。")
 
