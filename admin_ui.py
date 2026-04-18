@@ -10,7 +10,7 @@ import calendar
 # import graphviz
 
 
-CURRENT_VERSION = "1.3.1"
+CURRENT_VERSION = "1.3.2"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -125,7 +125,7 @@ with st.sidebar:
     st.title("📂 系統總覽")
     menu = st.sidebar.radio(
         "請選擇功能模組：",
-        ["📋 合約總覽","📅 到期續約管理" , "💰 收益發放試算","💰 業務佣金", "👤 客戶資料管理", "🌳 團隊組織圖","➕ 新增資料", "⚙️ 基礎資料設定"],
+        ["📋 合約總覽","📅 到期續約管理" , "💰 收益發放試算","💰 業務佣", "👤 客戶資料管理", "🌳 團隊組織圖","➕ 新增資料", "⚙️ 基礎資料設定"],
         index=0,
         label_visibility="collapsed"
     )
@@ -416,7 +416,7 @@ elif menu == "📋 合約總覽":
                 date_range = (date.today(), date.today())
 
         # 💡 新增：備註關鍵字搜尋框
-        search_note = st.text_input("📝 搜尋備註內容", placeholder="請輸入關鍵字（支援模糊搜尋）...")
+        search_note = st.text_input("📝 搜尋備註內容", placeholder="請輸入關鍵字...")
 
         st.write("---")
         c_sub1, c_sub2, c_sub3 = st.columns(3)
@@ -1414,184 +1414,156 @@ elif menu == "📅 到期續約管理":
         else:
             st.info(f"📅 在 {r_start} 到 {r_end} 之間沒有到期合約。")
 
-elif menu == "💰 業務佣金":
-    st.title("💰 業務佣金對帳 ")
-    st.info("💡 規則：主任平階不互抽且無補償；襄理（含）以上平階觸發補償，由上層級差支出。")
+elif menu == "💰 業務佣":
+    st.title("💰 Ｃ ")
+    # st.info("💡 規則：級差領全組；平階補償(0.2%/0.1%)母數採「該代數主管之全組業績」。")
 
-    # --- 0. 預載組織快取與 Session State 初始化 ---
+    # --- 0. 預載組織快取 ---
     agent_query = """
     SELECT a.agent_id, a.name, a.boss_id, r.commission_rate as rate, r.rank_name as rank
     FROM agents a JOIN ranks r ON a.rank_id = r.rank_id
     """
     agent_map = pd.read_sql(agent_query, conn).set_index('agent_id').to_dict('index')
 
-    # 確保日期狀態與獎勵規則不會因為 rerun 而消失
     if 'comm_date_range' not in st.session_state:
         st.session_state.comm_date_range = (date.today().replace(day=1), date.today())
     if 'extra_rules' not in st.session_state:
         st.session_state.extra_rules = []
 
-    # --- 1. 動態獎勵條件管理區 ---
-    with st.expander("🎁 額外活動獎勵管理", expanded=True):
-        all_plans_info = pd.read_sql("SELECT plan_name, annual_rate, period_months FROM rate_plans", conn)
-        all_plans_info['display'] = all_plans_info['plan_name'] + " (" + all_plans_info['annual_rate'].astype(str) + "%)"
-        
-        r_col1, r_col2, r_col3 = st.columns([2, 1, 1])
-        with r_col1:
-            sel_rule_plan = st.selectbox("選擇利率方案", all_plans_info['display'].tolist())
-        with r_col2:
-            sel_rule_time = st.number_input("第幾次領取時獎勵", min_value=0, value=0, step=1)
-        with r_col3:
-            sel_rule_bonus = st.number_input("加給 % 數", min_value=0.0, value=2.0, format="%.2f")
-            
-        if st.button("➕ 新增獎勵規則", use_container_width=True):
-            max_p = all_plans_info[all_plans_info['display'] == sel_rule_plan]['period_months'].values[0]
-            if sel_rule_time >= max_p:
-                st.error(f"❌ 獎勵期數 ({sel_rule_time}) 不得大於等於合約總期數 ({max_p})")
-            else:
-                new_rule = {"id": time.time(), "plan": sel_rule_plan, "time": sel_rule_time, "bonus_rate": sel_rule_bonus / 100}
-                st.session_state.extra_rules.append(new_rule)
-                st.rerun() 
-        
-        if st.session_state.extra_rules:
-            for idx, rule in enumerate(st.session_state.extra_rules):
-                rc1, rc2 = st.columns([4, 1])
-                with rc1: st.write(f"📍 {rule['plan']} - 第 {rule['time']} 次：加給 {rule['bonus_rate']*100:.2f}%")
-                with rc2:
-                    if st.button(f"❌", key=f"del_{rule['id']}"):
-                        st.session_state.extra_rules.pop(idx); st.rerun()
-
-    # --- 2. 選擇日期範圍 (鎖定 Session State) ---
-    col_date1, col_date2 = st.columns([2, 1])
-    with col_date1:
-        date_range = st.date_input(
-            "請選擇對帳日期區間", 
-            key="comm_date_range" 
-        )
-    
+    # --- 1. 獎勵管理與日期選擇 (省略) ---
+    date_range = st.date_input("請選擇對帳日期區間", key="comm_date_range")
     if isinstance(date_range, tuple) and len(date_range) == 2:
         start_f, end_f = date_range
-
-        # 3. SQL 查詢
         query = """
-        SELECT 
-            ic.contract_id, c.name as 客戶姓名, a.name as 業務姓名, a.agent_id, a.boss_id,
-            r.rank_name as 職級, r.commission_rate as 個人比例,
-            ic.amount / 10000.0 as '金額', rp.plan_name, rp.annual_rate as '利率', 
-            ic.start_date as 生效日, rp.period_months as 總期數
-        FROM invest_contracts ic
-        JOIN customers c ON ic.customer_id = c.customer_id
-        JOIN agents a ON c.agent_id = a.agent_id
-        JOIN ranks r ON a.rank_id = r.rank_id
-        JOIN rate_plans rp ON ic.plan_id = rp.plan_id
+        SELECT ic.contract_id, c.name as 客戶姓名, a.name as 業務姓名, a.agent_id, a.boss_id, 
+               r.rank_name as 職級, r.commission_rate as 個人比例, ic.amount / 10000.0 as '金額', 
+               rp.plan_name, rp.annual_rate as '利率', ic.start_date as 生效日, rp.period_months as 總期數 
+        FROM invest_contracts ic 
+        JOIN customers c ON ic.customer_id = c.customer_id 
+        JOIN agents a ON c.agent_id = a.agent_id 
+        JOIN ranks r ON a.rank_id = r.rank_id 
+        JOIN rate_plans rp ON ic.plan_id = rp.plan_id 
         WHERE ic.start_date <= ?
         """
         df_raw = pd.read_sql(query, conn, params=(end_f.isoformat(),))
 
         if not df_raw.empty:
             df_raw['方案名稱(%)'] = df_raw['plan_name'] + " (" + df_raw['利率'].astype(str) + "%)"
-
-            # --- 4. 核心計算引擎 ---
             payouts = {aid: {'個人':0.0, '加給':0.0, '獎勵':0.0, '業績':{}} for aid in agent_map}
-            detail_rows = []
+            volume_box = {aid: {'級差池': {}, '子代池': {}, '孫代池': {}} for aid in agent_map}
+            summary_payout_details = []
+            contract_flow_logs = []
 
             for _, row in df_raw.iterrows():
+                amt, aid, plan = row['金額'], row['agent_id'], row['方案名稱(%)']
                 start_dt = pd.to_datetime(row['生效日']).date()
                 diff_months = (end_f.year - start_dt.year) * 12 + (end_f.month - start_dt.month)
                 is_new = (row['生效日'] >= start_f.isoformat() and row['生效日'] <= end_f.isoformat())
-                
                 if diff_months < 0 or diff_months >= row['總期數']: continue
 
-                amt = row['金額']
-                aid = row['agent_id']
-                plan = row['方案名稱(%)']
-                
-                this_reward = 0.0
-                this_self_comm = 0.0
-                hierarchy_log = []
+                this_contract_log = {
+                    "客戶": row['客戶姓名'], "業務": row['業務姓名'], 
+                    "金額": amt, "生效日": row['生效日'], "分潤流向": []
+                }
 
-                # (A) 活動獎勵 (發放給合約所屬業務)
+                # 獎勵
                 for rule in st.session_state.extra_rules:
                     if plan == rule['plan'] and diff_months == rule['time']:
-                        this_reward = round(amt * rule['bonus_rate'], 2)
-                        payouts[aid]['獎勵'] += this_reward
-                        payouts[aid]['業績'][plan] = payouts[aid]['業績'].get(plan, 0) + amt
+                        payouts[aid]['獎勵'] += round(amt * rule['bonus_rate'], 2)
 
-                # (B) 職級與組織差% (限新約)
+                # 核心分潤
                 if is_new:
-                    # 💡 邏輯修正：高專、累件中、外圍之單併入主管
                     target_aid = aid
-                    is_merged_rank = row['職級'] in ['高專', '累件中', '外圍']
-                    
-                    if is_merged_rank and pd.notna(row['boss_id']):
+                    if row['職級'] in ['高專', '累件中', '外圍'] and pd.notna(row['boss_id']):
                         target_aid = row['boss_id']
                     
-                    # 計算該件分潤
-                    this_self_comm = round(amt * row['個人比例'], 2)
-                    payouts[target_aid]['個人'] += this_self_comm
+                    base_agent = agent_map.get(target_aid)
+                    if not base_agent: continue
+                    
+                    base_rate, base_rank = base_agent['rate'], base_agent['rank']
+                    payouts[target_aid]['個人'] += round(amt * base_rate, 2)
                     payouts[target_aid]['業績'][plan] = payouts[target_aid]['業績'].get(plan, 0) + amt
 
-                    # 🚀 無限層級組織爬升 (主任封頂、他階補償)
-                    curr_paid_rate = row['個人比例']
-                    curr_boss_id = row['boss_id']
-                    gen = 1
+                    # 🚀 爬升引擎：全組滾動判定
+                    last_rate = base_rate
+                    child_group_id = target_aid 
+                    curr_id = base_agent['boss_id']
                     
-                    while curr_boss_id in agent_map:
-                        boss = agent_map[curr_boss_id]
-                        over_money = 0.0
-                        
-                        if boss['rate'] > curr_paid_rate:
-                            over_money = amt * (boss['rate'] - curr_paid_rate)
-                            curr_paid_rate = boss['rate']
-                        elif boss['rate'] == curr_paid_rate and boss['rank'] != '主任':
-                            if gen == 1: over_money = amt * 0.002
-                            elif gen == 2: over_money = amt * 0.001
-                        
-                        if over_money > 0:
-                            over_money = round(over_money, 2)
-                            payouts[curr_boss_id]['加給'] += over_money
-                            hierarchy_log.append(f"{boss['name']}:{over_money}")
-                        
-                        if boss['rank'] == '主任': break
-                        curr_boss_id = boss['boss_id']
-                        gen += 1
+                    # 這一點最重要：紀錄這筆單在向上爬的過程中，所屬的「平階主管代數」
+                    # peer_track[代數] = 該代的主管 ID
+                    peer_track = {} 
+                    peer_count = 0
 
-                if this_self_comm > 0 or this_reward > 0 or hierarchy_log:
-                    detail_rows.append({
-                        '客戶姓名': row['客戶姓名'], '業務姓名': row['業務姓名'], 
-                        '生效日': row['生效日'], '方案名稱(%)': plan, 
-                        '金額': amt, '職級分潤': this_self_comm, 
-                        '獎勵': this_reward, '差%流向': ", ".join(hierarchy_log)
-                    })
+                    while curr_id in agent_map:
+                        boss = agent_map[curr_id]
+                        
+                        # A. 級差領取 (領取下方整組差額)
+                        if boss['rate'] > last_rate:
+                            volume_box[curr_id]['級差池'][child_group_id] = volume_box[curr_id]['級差池'].get(child_group_id, 0) + amt
+                            child_group_id = curr_id 
+                            last_rate = boss['rate']
+                        
+                        # B. 平階判定 (找平階主管)
+                        elif boss['rate'] == last_rate and boss['rank'] != '主任':
+                            # 只要職級一樣，不論這筆單是誰簽的，它都屬於這個平階主管的「一代」或「二代」
+                            peer_count += 1
+                            if peer_count == 1:
+                                # 對這個主管來說，這筆單(不論誰簽)屬於他的子代組
+                                volume_box[curr_id]['子代池'][target_aid] = volume_box[curr_id]['子代池'].get(target_aid, 0) + amt
+                            elif peer_count == 2:
+                                # 對這個主管來說，這筆單屬於他的孫代組
+                                volume_box[curr_id]['孫代池'][target_aid] = volume_box[curr_id]['孫代池'].get(target_aid, 0) + amt
+                        
+                        curr_id = boss['boss_id']
 
-            # --- 5. 製作統計矩陣 ---
+            # --- 第二階段：結算總額 ---
+            for m_id, v_data in volume_box.items():
+                m_info = agent_map[m_id]
+                # 1. 級差
+                for sub_id, total_amt in v_data['級差池'].items():
+                    s_rate = round(m_info['rate'] - agent_map[sub_id]['rate'], 2)
+                    if s_rate > 0:
+                        gain = round(total_amt * s_rate, 2)
+                        payouts[m_id]['加給'] += gain
+                        summary_payout_details.append({'受款人': m_info['name'], '項目': f"【{agent_map[sub_id]['name']}組】全組差", '總業績': total_amt, '計算式': f"{s_rate*100:.1f}%", '金額': gain, '支出人': '-'})
+                
+                # 2. 滾動平階 (全組業績母數)
+                for gen_name, pool_key, g_rate in [('子代', '子代池', 0.002), ('孫代', '孫代池', 0.001)]:
+                    # 這裡的 sub_id 代表的是提供業績的「源頭組」
+                    total_pool_amt = sum(v_data[pool_key].values())
+                    if total_pool_amt > 0:
+                        g_gain = round(total_pool_amt * g_rate, 2)
+                        payer_id, t_id = None, m_info['boss_id']
+                        while t_id in agent_map:
+                            if agent_map[t_id]['rate'] > m_info['rate']:
+                                payer_id = t_id; break
+                            t_id = agent_map[t_id]['boss_id']
+                        
+                        if payer_id:
+                            payouts[m_id]['加給'] += g_gain
+                            payouts[payer_id]['加給'] -= g_gain
+                            # summary_payout_details.append({'受款人': m_info['name'], '項目': f"{gen_name}平階補償({agent_map[sub_id]['name']}組)", '總業績': total_pool_amt, '計算式': f"{g_rate*100:.2f}%", '金額': g_gain, '支出人': agent_map[payer_id]['name']})
+                            summary_payout_details.append({'受款人': m_info['name'], '項目': f"同階補償)", '總業績': total_pool_amt, '計算式': f"{g_rate*100:.2f}%", '金額': g_gain, '支出人': agent_map[payer_id]['name']})
+
+
+            # --- 5. 報表呈現 (矩陣 + 明細) ---
+            st.write("### 🧩 Matrix C")
             summary_data = []
             for aid, data in payouts.items():
-                if data['個人'] > 0 or data['加給'] > 0 or data['獎勵'] > 0 or data['業績']:
+                if any(v > 0 for v in data['業績'].values()) or data['加給'] != 0:
                     r_data = {'姓名': agent_map[aid]['name']}
                     r_data.update(data['業績'])
-                    r_data['個人業績佣金'] = round(data['個人'], 2)
-                    r_data['差%'] = round(data['加給'], 2)
+                    r_data['個人業績'] = round(sum(data['業績'].values()), 2)
+                    r_data['差%加給'] = round(data['加給'], 2)
                     r_data['獎勵'] = round(data['獎勵'], 2)
-                    r_data['應領佣金'] = round(data['個人'] + data['加給'] + data['獎勵'], 2)
+                    r_data['應領總計'] = round(data['個人'] + data['加給'] + data['獎勵'], 2)
                     summary_data.append(r_data)
-
+            
             if summary_data:
-                pivot_df = pd.DataFrame(summary_data).fillna(0)
-                plans_query = "SELECT plan_name, annual_rate FROM rate_plans ORDER BY annual_rate ASC"
-                ordered_plans = [f"{rp['plan_name']} ({rp['annual_rate']}%)" for _, rp in pd.read_sql(plans_query, conn).iterrows()]
-                actual_plans = [p for p in ordered_plans if p in pivot_df.columns]
-                col_order = ['姓名'] + actual_plans + ['個人業績佣金', '差%', '獎勵', '應領佣金']
-                pivot_df = pivot_df.reindex(columns=col_order).sort_values(by='應領佣金', ascending=False)
+                st.dataframe(pd.DataFrame(summary_data).fillna(0), use_container_width=True)
+                st.write("### 🔍 明細")
+                st.table(pd.DataFrame(summary_payout_details))
 
-                st.write("### 🧩 佣金統計矩陣")
-                f_dict = {p: "{:.0f}" for p in actual_plans}
-                for c in ['個人業績佣金', '差%', '獎勵', '應領佣金']: f_dict[c] = "{:.2f}"
-                st.dataframe(pivot_df.style.format(f_dict), use_container_width=True, height=500)
-
-                st.divider()
-                st.write("### 📄 本月對帳明細")
-                st.dataframe(pd.DataFrame(detail_rows), use_container_width=True, hide_index=True)
             else:
                 st.warning("🌙 此區間無數據。")
 
