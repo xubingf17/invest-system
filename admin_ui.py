@@ -10,7 +10,7 @@ import calendar
 # import graphviz
 
 
-CURRENT_VERSION = "1.3.5"
+CURRENT_VERSION = "1.3.6"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -1232,9 +1232,11 @@ elif menu == "➕ 新增資料":
 elif menu == "📅 到期續約管理":
     st.title("📅 到期續約管理")
     
-    # 💡 初始化強制刷新金鑰
+    # --- 0. 初始化狀態與記憶金鑰 ---
     if 'renew_sync_key' not in st.session_state:
         st.session_state.renew_sync_key = 0
+    if 'renew_checked_ids' not in st.session_state:
+        st.session_state.renew_checked_ids = set()
 
     # --- 1. 時間區間選擇器 ---
     with st.expander("📅 篩選合約到期日期區間", expanded=True):
@@ -1247,19 +1249,11 @@ elif menu == "📅 到期續約管理":
     if isinstance(renew_range, tuple) and len(renew_range) == 2:
         r_start, r_end = renew_range
 
-        # 2. 核心 SQL 查詢
+        # --- 2. 核心 SQL 查詢 ---
         query = """
-        SELECT 
-            ic.contract_id, 
-            c.name as 客戶姓名, 
-            a.name as 業務姓名,
-            ic.amount / 10000.0 as '金額', 
-            rp.plan_name, 
-            rp.annual_rate,
-            rp.plan_id,
-            ic.end_date as 原結束日,
-            ic.is_renewed,
-            ic.note
+        SELECT ic.contract_id, c.name as 客戶姓名, a.name as 業務姓名,
+               ic.amount / 10000.0 as '金額', rp.plan_name, rp.annual_rate,
+               ic.end_date as 原結束日, ic.is_renewed
         FROM invest_contracts ic
         JOIN customers c ON ic.customer_id = c.customer_id
         JOIN agents a ON c.agent_id = a.agent_id
@@ -1269,147 +1263,129 @@ elif menu == "📅 到期續約管理":
         all_df = pd.read_sql(query, conn, params=(r_start.isoformat(), r_end.isoformat()))
 
         if not all_df.empty:
-            # ⚡️ 關鍵修正：建立「唯一方案標籤」，解決同名不同利率的問題
-            # 格式： 半年期 (6.0%)
             all_df['方案(利率)'] = all_df['plan_name'] + " (" + all_df['annual_rate'].astype(str) + "%)"
-            
-            # ⚡️ 強制按姓名筆劃排序
             all_df = all_df.sort_values(by=['業務姓名', '客戶姓名']).reset_index(drop=True)
             
-            # --- 3. 進階連動篩選面板 ---
+            # --- 3. 進階篩選面板 ---
             f_col1, f_col2 = st.columns(2)
             with f_col1:
-                # 業務清單排序
-                agent_opts = sorted(all_df['業務姓名'].unique().tolist())
-                sel_agents = st.multiselect("💼 篩選業務員", agent_opts, key="renew_agent_filter")
-                
-                # ⚡️ 方案清單：現在會列出所有「名稱+利率」的組合，不會再遺漏
-                plan_rate_opts = sorted(all_df['方案(利率)'].unique().tolist())
-                sel_plans = st.multiselect("📈 篩選方案(利率)", plan_rate_opts, key="renew_plan_filter")
-
+                sel_agents = st.multiselect("💼 篩選業務員", sorted(all_df['業務姓名'].unique().tolist()))
+                sel_plans = st.multiselect("📈 篩選方案", sorted(all_df['方案(利率)'].unique().tolist()))
             with f_col2:
-                # 客戶連動：只顯示選中業務員的客戶 (並排序)
-                if sel_agents:
-                    cust_opts = sorted(all_df[all_df['業務姓名'].isin(sel_agents)]['客戶姓名'].unique().tolist())
-                else:
-                    cust_opts = sorted(all_df['客戶姓名'].unique().tolist())
-                
-                sel_custs = st.multiselect("🔍 篩選客戶", cust_opts, key="renew_cust_filter")
+                cust_pool = all_df[all_df['業務姓名'].isin(sel_agents)] if sel_agents else all_df
+                sel_custs = st.multiselect("🔍 篩選客戶", sorted(cust_pool['客戶姓名'].unique().tolist()))
 
-            # 執行篩選過濾
+            # 執行篩選
             df_filtered = all_df.copy()
-            if sel_agents:
-                df_filtered = df_filtered[df_filtered['業務姓名'].isin(sel_agents)]
-            if sel_custs:
-                df_filtered = df_filtered[df_filtered['客戶姓名'].isin(sel_custs)]
-            if sel_plans:
-                df_filtered = df_filtered[df_filtered['方案(利率)'].isin(sel_plans)]
+            if sel_agents: df_filtered = df_filtered[df_filtered['業務姓名'].isin(sel_agents)]
+            if sel_custs: df_filtered = df_filtered[df_filtered['客戶姓名'].isin(sel_custs)]
+            if sel_plans: df_filtered = df_filtered[df_filtered['方案(利率)'].isin(sel_plans)]
 
-            # --- 4. 區塊一：待處理續約 ---
-            # 只抓 is_renewed 為 0 (未處理) 的
+            # 區分待處理與已完成
             pending_df = df_filtered[df_filtered['is_renewed'].fillna(0).astype(int) == 0].copy()
+            done_df = df_filtered[df_filtered['is_renewed'] == 1].copy()
+
+            # --- 🚀 4. 頂部數字看板 ---
+            st.divider()
+            m_col1, m_col2, m_col3 = st.columns(3)
             
-            st.subheader(f"⚠️ 待處理續約名單 ({len(pending_df)} 筆)")
-            
+            # 計算目前畫面上看得到且已勾選的 ID
+            current_viewing_ids = set(pending_df['contract_id'].tolist())
+            viewing_selected_count = len(current_viewing_ids.intersection(st.session_state.renew_checked_ids))
+            total_checked = len(st.session_state.renew_checked_ids)
+
+            with m_col1:
+                st.metric("📋 篩選後待處理件數", f"{len(pending_df)} 筆")
+            with m_col2:
+                st.metric("💰 篩選後總金額", f"{pending_df['金額'].sum():,.2f}")
+            with m_col3:
+                # st.metric("✅ 勾選狀態", f"目前畫面 {viewing_selected_count} / 總勾選 {total_checked}")
+                st.metric("✅ 勾選狀態", f"總勾選 {total_checked}")
+
+            # --- 5. 待處理續約編輯器 ---
             if not pending_df.empty:
                 def get_wed(d_str):
                     d = pd.to_datetime(d_str).date()
                     days_until_wed = (2 - d.weekday() + 7) % 7
                     return d + relativedelta(days=days_until_wed)
-                
                 pending_df['下週三生效'] = pending_df['原結束日'].apply(get_wed)
                 
-                select_all = st.checkbox("全選畫面上所有待處理合約", value=False, key="select_all_btn")
-                pending_df['確認續約'] = select_all
+                # ✅ 智慧全選功能
+                is_all_selected = current_viewing_ids.issubset(st.session_state.renew_checked_ids) if current_viewing_ids else False
                 
-                # 使用動態 Key 強制刷新編輯器
-                dynamic_key = f"renew_editor_{st.session_state.renew_sync_key}"
-                
-                ed_p = st.data_editor(
+                def on_all_check_change():
+                    if st.session_state.all_sel_trigger:
+                        st.session_state.renew_checked_ids.update(current_viewing_ids)
+                    else:
+                        st.session_state.renew_checked_ids.difference_update(current_viewing_ids)
+
+                st.checkbox("全選目前篩選結果", value=is_all_selected, key="all_sel_trigger", on_change=on_all_check_change)
+
+                # 從背景 Set 恢復勾選狀態
+                pending_df['確認續約'] = pending_df['contract_id'].apply(lambda x: x in st.session_state.renew_checked_ids)
+
+                # ✅ 核心同步函式 (解決手動取消沒反應的問題)
+                def sync_editor_to_state():
+                    ed_key = f"renew_ed_{st.session_state.renew_sync_key}"
+                    if ed_key in st.session_state:
+                        edited_rows = st.session_state[ed_key]["edited_rows"]
+                        for row_idx, changes in edited_rows.items():
+                            cid = int(pending_df.iloc[int(row_idx)]['contract_id'])
+                            if "確認續約" in changes:
+                                if changes["確認續約"]: st.session_state.renew_checked_ids.add(cid)
+                                else: st.session_state.renew_checked_ids.discard(cid)
+
+                st.data_editor(
                     pending_df[['確認續約', '客戶姓名', '業務姓名', '金額', '方案(利率)', '原結束日', '下週三生效']], 
-                    hide_index=True, use_container_width=True, key=dynamic_key,
-                    height=800
+                    hide_index=True, use_container_width=True, 
+                    key=f"renew_ed_{st.session_state.renew_sync_key}",
+                    on_change=sync_editor_to_state,
+                    height=500
                 )
 
-                if st.button("🚀 執行批次續約並歸檔", type="primary", use_container_width=True):
-                    # 💡 1. 取得編輯器中被勾選的行
-                    # 我們直接將 ed_p 跟 pending_df 的 contract_id 合併，確保抓到的是正確的 ID
-                    selected_rows = ed_p[ed_p['確認續約'] == True]
-                    
-                    if not selected_rows.empty:
-                        try:
-                            cursor = conn.cursor()
-                            msg_placeholder = st.empty()
-                            
-                            # 💡 2. 這裡改用 selected_rows 的資料，因為 ed_p 可能不包含 contract_id
-                            # 我們要從原本的 pending_df 找回對應的 ID
-                            # 為了保險，我們直接從 pending_df 篩選出跟 ed_p 勾選內容一致的資料
-                            # 最穩的方法是：直接利用 pending_df 的索引來對應 ed_p
-                            
-                            processed_count = 0
-                            for idx in selected_rows.index:
-                                # 從原始 pending_df 抓取真正的資料庫 ID
-                                real_row = pending_df.loc[idx]
-                                oid = int(real_row['contract_id'])
-                                
-                                # 3. 抓取原約資訊 (與你原本邏輯相同)
-                                cursor.execute("SELECT customer_id, plan_id, amount FROM invest_contracts WHERE contract_id = ?", (oid,))
-                                info = cursor.fetchone()
-                                
-                                if info:
-                                    c_id, p_id, amt = info
+                # 執行按鈕區
+                col_btn1, col_btn2 = st.columns([4, 1])
+                with col_btn1:
+                    if st.button("🚀 執行批次續約 (針對所有勾選項目)", type="primary", use_container_width=True):
+                        if st.session_state.renew_checked_ids:
+                            try:
+                                cursor = conn.cursor()
+                                for oid in list(st.session_state.renew_checked_ids):
+                                    cursor.execute("SELECT customer_id, plan_id, amount, end_date FROM invest_contracts WHERE contract_id = ?", (oid,))
+                                    c_id, p_id, amt, old_end = cursor.fetchone()
                                     cursor.execute("SELECT period_months FROM rate_plans WHERE plan_id = ?", (p_id,))
-                                    p_months = int(cursor.fetchone()[0])
-                                    
-                                    # 計算日期
-                                    ns = real_row['下週三生效']
+                                    p_months = cursor.fetchone()[0]
+                                    ns = get_wed(old_end)
                                     ne = ns + relativedelta(months=p_months)
                                     
-                                    # 4. 執行資料庫變更
-                                    # A. 建立新約
                                     cursor.execute("""
-                                        INSERT INTO invest_contracts (
-                                            customer_id, plan_id, amount, start_date, end_date, 
-                                            status, is_renewed, note, contract_type
-                                        ) VALUES (?, ?, ?, ?, ?, 'Active', 0, ?, '續約')
+                                        INSERT INTO invest_contracts (customer_id, plan_id, amount, start_date, end_date, status, is_renewed, note, contract_type)
+                                        VALUES (?, ?, ?, ?, ?, 'Active', 0, ?, '續約')
                                     """, (c_id, p_id, amt, ns.isoformat(), ne.isoformat(), f"由 ID:{oid} 續約轉入"))
-                                    
-                                    # B. 更新舊約 (關鍵：強制轉型 oid 確保 SQL 匹配)
-                                    cursor.execute("""
-                                        UPDATE invest_contracts 
-                                        SET is_renewed = 1, status = 'Closed' 
-                                        WHERE contract_id = ?
-                                    """, (oid,))
-                                    
-                                    processed_count += 1
-                            
-                            # 💡 5. 執行存檔
-                            conn.commit()
-                            
-                            # 💡 6. 更新 Session State 強制 UI 刷新
-                            st.session_state.renew_sync_key += 1
-                            
-                            msg_placeholder.success(f"✅ 成功處理 {processed_count} 筆續約！資料已存入。5 秒後自動刷新...")
-                            time.sleep(5)
-                            msg_placeholder.empty()
-                            st.rerun()
-
-                        except Exception as e:
-                            conn.rollback()
-                            st.error(f"❌ 續約失敗：{e}")
-                    else:
-                        st.warning("⚠️ 請先勾選要續約的項目。")
+                                    cursor.execute("UPDATE invest_contracts SET is_renewed = 1, status = 'Closed' WHERE contract_id = ?", (oid,))
+                                
+                                conn.commit()
+                                st.session_state.renew_checked_ids.clear()
+                                st.session_state.renew_sync_key += 1
+                                st.success("✅ 已完成批次續約！")
+                                time.sleep(1); st.rerun()
+                            except Exception as e:
+                                conn.rollback(); st.error(f"❌ 續約失敗：{e}")
+                with col_btn2:
+                    if st.button("🗑️ 清空勾選"):
+                        st.session_state.renew_checked_ids.clear(); st.rerun()
             else:
-                st.success("🎉 選定條件下所有合約皆已處理完成。")
+                st.success("🎉 選定條件下，無待處理合約。")
 
             st.divider()
 
-            # --- 5. 區塊二：已處理完成清單 ---
-            done_df = df_filtered[df_filtered['is_renewed'] == 1].copy()
+            # --- 🚀 6. 已處理完成清單 (補回此處) ---
             st.subheader(f"✅ 已處理完成清單 ({len(done_df)} 筆)")
             if not done_df.empty:
                 done_df = done_df.sort_values(by='原結束日', ascending=False)
                 st.dataframe(done_df[['客戶姓名', '業務姓名', '金額', '方案(利率)', '原結束日']], use_container_width=True, hide_index=True)
+            else:
+                st.info("💡 目前區間內尚無已處理完成的續約。")
 
         else:
             st.info(f"📅 在 {r_start} 到 {r_end} 之間沒有到期合約。")
