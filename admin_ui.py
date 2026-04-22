@@ -10,7 +10,7 @@ import calendar
 # import graphviz
 
 
-CURRENT_VERSION = "1.3.6"
+CURRENT_VERSION = "1.3.7"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -1463,6 +1463,7 @@ elif menu == "💰 業務佣":
                 amt, aid, plan = row['金額'], row['agent_id'], row['方案名稱(%)']
                 start_dt = pd.to_datetime(row['生效日']).date()
                 diff_months = (end_f.year - start_dt.year) * 12 + (end_f.month - start_dt.month)
+                is_in_date_range = (start_f <= start_dt <= end_f)
                 is_new = (row['生效日'] >= start_f.isoformat() and row['生效日'] <= end_f.isoformat())
                 if diff_months < 0 or diff_months >= row['總期數']: continue
 
@@ -1471,8 +1472,9 @@ elif menu == "💰 業務佣":
 
                 # ✅ (A) 獎勵計算 (套用規則)
                 for rule in st.session_state.extra_rules:
-                    if plan == rule['plan'] and diff_months == rule['time']:
+                    if plan == rule['plan'] and diff_months == rule['time']and is_in_date_range:
                         rew_amt = round(amt * rule['bonus_rate'], 2)
+                        # print("amt",amt,"*",rule['bonus_rate'],"=",rew_amt)
                         payouts[aid]['獎勵'] += rew_amt
                         this_log["分配明細"].append(f"🎁獎勵({row['業務姓名']}):+{rew_amt}")
 
