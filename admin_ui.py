@@ -10,7 +10,7 @@ import calendar
 # import graphviz
 
 
-CURRENT_VERSION = "1.3.9"
+CURRENT_VERSION = "1.4.0"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -977,12 +977,22 @@ elif menu == "➕ 新增資料":
                     target_cust_name = st.selectbox("👤 選擇現有客戶", cust_df['name'] if not cust_df.empty else ["⚠️ 該業務名下尚無客戶"])
                 else:
                     target_cust_name = st.selectbox("👤 選擇現有客戶", ["請先選擇業務員"])
+        
+        if 'default_amt' not in st.session_state:
+            st.session_state.default_amt = None
 
         # --- ⚡️ 第三層：合約細節表單 ---
-        with st.form("single_contract_combined"):
+        with st.form("single_contract_combined", clear_on_submit=True):
             col_amt, col_plan = st.columns(2)
             with col_amt:
-                amt_wan = st.number_input("💰 投資金額 (萬)", min_value=0.0, value=100.0, step=10.0)
+                amt_wan = st.number_input(
+                    "💰 投資金額", 
+                    min_value=0.0, 
+                    value=st.session_state.default_amt, 
+                    step=10.0,
+                    placeholder="請輸入金額...",
+                    key="amt_wan_input"
+                )
             with col_plan:
                 sel_plan_display = st.selectbox("📈 選擇方案 (利率)", plan_df['展示名稱'] if not plan_df.empty else ["⚠️ 請先設定方案"])
 
@@ -1002,6 +1012,8 @@ elif menu == "➕ 新增資料":
                     st.error("❌ 請先選擇業務員。")
                 elif not target_cust_name or "⚠️" in target_cust_name or target_cust_name == "請先選擇業務員":
                     st.error("❌ 請選擇或輸入正確的客戶姓名。")
+                elif amt_wan is None or amt_wan <= 0:
+                    st.error("❌ 請輸入有效的投資金額！")
                 else:
                     try:
                         cursor = conn.cursor()
@@ -1040,6 +1052,7 @@ elif menu == "➕ 新增資料":
                         ))
                         
                         conn.commit()
+                        st.session_state.default_amt = None
                         st.balloons()
                         st.success(f"🎉 成功！已為【{cust_name_clean}】建立合約。")
                         time.sleep(1)
