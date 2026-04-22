@@ -10,7 +10,7 @@ import calendar
 # import graphviz
 
 
-CURRENT_VERSION = "1.3.8"
+CURRENT_VERSION = "1.3.9"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -102,7 +102,7 @@ def apply_zebra_style(df, format_cols=None):
     # 斑馬線邏輯
     def zebra_logic(x):
         df_style = pd.DataFrame('', index=x.index, columns=x.columns)
-        df_style.iloc[1::2, :] = 'background-color: #D3D3D3' # 深灰色
+        df_style.iloc[1::2, :] = 'background-color: #EEEAE7' # 深灰色
         return df_style
 
     styler = display_df.style.apply(zebra_logic, axis=None)
