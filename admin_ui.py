@@ -10,14 +10,14 @@ import calendar
 # import graphviz
 
 
-CURRENT_VERSION = "1.3.7"
+CURRENT_VERSION = "1.3.8"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
 
 st.markdown("""
     <style>
-        /* 1. 側邊欄樣式 (維持你原本的設定) */
+        /* 1. 側邊欄樣式 */
         section[data-testid="stSidebar"] { width: 300px !important; }
         section[data-testid="stSidebar"] .st-emotion-cache-17l2ba9, 
         section[data-testid="stSidebar"] p {
@@ -32,15 +32,29 @@ st.markdown("""
         }
         section[data-testid="stSidebar"] h2 { font-size: 35px !important; }
 
-        /* 2. 核心：強制表格與指標全域置中 */
+        /* 2. 核心：強制置中與斑馬條紋 */
         
-        /* 針對 st.dataframe 的容器與內容 */
+        /* 針對所有表格容器置中 */
         [data-testid="stDataFrame"] {
             display: flex;
             justify-content: center;
         }
 
-        /* 關鍵：強制 Glide Data Grid 內部的文字節點對齊 */
+        /* 🚀 斑馬條紋：針對 st.dataframe 與 st.data_editor 的底色 */
+        /* 偶數行 (#F0F2F6 是 Streamlit 預設淺灰) */
+        [data-testid="stDataFrame"] div[data-testid="stTable"] tr:nth-child(even),
+        div[data-grid-container] tr:nth-child(even),
+        .glideDataGridCanvas tr:nth-child(even) {
+            background-color: #F0F2F6 !important;
+        }
+
+        /* 針對 st.data_editor 內部的渲染單元格 (Glide Data Grid) */
+        /* 這可以確保在捲動或編輯時背景色依舊存在 */
+        .st-emotion-cache-6v0v6f tr:nth-child(even) td {
+            background-color: #F0F2F6 !important;
+        }
+
+        /* 關鍵：強制文字節點對齊與置中 */
         div[data-testid="stSelectionDataNode"] {
             display: flex !important;
             justify-content: center !important;
@@ -56,17 +70,44 @@ st.markdown("""
             align-items: center;
         }
 
-        /* 針對傳統 st.table (如果有的話) */
+        /* 針對傳統 st.table 置中與條紋 */
         .stTable td, .stTable th {
             text-align: center !important;
+        }
+        .stTable tr:nth-child(even) {
+            background-color: #F0F2F6 !important;
         }
 
         /* 移除數字欄位預設的靠右對齊 */
         [data-testid="stTable"] td {
             text-align: center !important;
         }
+            
+        div[data-testid="stDataEditor"] tr:nth-child(even) {
+            background-color: #D3D3D3 !important;
+        }
     </style>
 """, unsafe_allow_html=True)
+
+def apply_zebra_style(df, format_cols=None):
+    # 先做一份拷貝，不要改到原始數據
+    display_df = df.copy()
+    
+    # 🎯 關鍵：手動找出所有數字欄位，把它們變成兩位小數的「字串」
+    # 這樣 Streamlit 看到的就只是文字，不會自動補 0
+    num_cols = display_df.select_dtypes(include=['number']).columns.tolist()
+    for col in num_cols:
+        display_df[col] = display_df[col].apply(lambda x: f"{x:.2f}")
+
+    # 斑馬線邏輯
+    def zebra_logic(x):
+        df_style = pd.DataFrame('', index=x.index, columns=x.columns)
+        df_style.iloc[1::2, :] = 'background-color: #D3D3D3' # 深灰色
+        return df_style
+
+    styler = display_df.style.apply(zebra_logic, axis=None)
+    return styler
+
 
 # --- 資料庫連線 (使用 check_same_thread=False 確保 Streamlit 運行穩定) ---
 def get_connection():
@@ -326,20 +367,41 @@ elif menu == "💰 收益發放試算":
             m2.metric("總計應發利息", f"NT$ {total_pay:,.2f} 萬")
 
             st.dataframe(
-                df_filtered[['客戶姓名', '業務員', '金額', '方案(利率)', '本月預計發放', '生效日']],
+                apply_zebra_style(df_filtered[['客戶姓名', '業務員', '金額', '方案(利率)', '本月預計發放', '生效日']], format_cols=['金額', '本月預計發放']),
+                # df_filtered[['客戶姓名', '業務員', '金額', '方案(利率)', '本月預計發放', '生效日']],
                 use_container_width=True, hide_index=True, height=400
             )
 
             # --- 7. 底部統計總表 ---
             st.divider()
-            st.subheader("📊 業務員與各方案利息統計")
+            st.subheader("📊 合約類別總表")
             try:
-                pivot_df = df_filtered.pivot_table(index='業務員', columns='方案(利率)', values='金額', aggfunc='sum', fill_value=0)
+                pivot_df = df_filtered.pivot_table(
+                    index='業務員', 
+                    columns='方案(利率)', 
+                    values='金額', 
+                    aggfunc='sum', 
+                    fill_value=0
+                )
+                # 計算合計列
                 pivot_df['合計'] = df_filtered.groupby('業務員')['本月預計發放'].sum()
                 
+                # 準備合計列 (🏁 總計)
                 total_row = pivot_df.sum(axis=0)
                 total_row.name = '🏁 總計'
-                st.dataframe(pd.concat([pivot_df, total_row.to_frame().T]).style.format(precision=2), use_container_width=True)
+                
+                # 合併表格
+                pivot_final = pd.concat([pivot_df, total_row.to_frame().T])
+                
+                # 💡 修正：將 index (業務員姓名) 轉回欄位，這樣 hide_index 才會好看，且能套用條紋
+                pivot_final = pivot_final.reset_index().rename(columns={'index': '業務員'})
+
+                # 🎨 套用深色斑馬條紋樣式 (這會自動處理兩位小數並消滅多餘的 0)
+                st.dataframe(
+                    apply_zebra_style(pivot_final), 
+                    use_container_width=True, 
+                    hide_index=True
+                )
             except Exception as e:
                 st.info("暫無足夠資料生成統計表")
 
@@ -681,7 +743,7 @@ elif menu == "⚙️ 基礎資料設定":
     with col_p1:
         st.write("📌 **目前利率方案**")
         if not plan_df.empty:
-            st.dataframe(plan_df[['方案', '年利率', '週期']], hide_index=True)
+            st.dataframe(apply_zebra_style(plan_df[['方案', '年利率', '週期']]), hide_index=True)
         else:
             st.info("尚未建立方案。")
 
@@ -779,7 +841,7 @@ elif menu == "👤 客戶資料管理":
         # --- 3. 顯示客戶清單 (優化欄位寬度) ---
         st.write(f"📅 目前顯示：**{sel_agent}** 的客戶 (共 {len(df_display)} 筆)")
         st.dataframe(
-            df_display, 
+            apply_zebra_style(df_display), 
             use_container_width=False,
             hide_index=True,
             height=600,
@@ -1336,11 +1398,19 @@ elif menu == "📅 到期續約管理":
                                 else: st.session_state.renew_checked_ids.discard(cid)
 
                 st.data_editor(
+                    # 這裡絕對維持原始 df，不套用樣式
                     pending_df[['確認續約', '客戶姓名', '業務姓名', '金額', '方案(利率)', '原結束日', '下週三生效']], 
-                    hide_index=True, use_container_width=True, 
+                    hide_index=True, 
+                    use_container_width=True, 
                     key=f"renew_ed_{st.session_state.renew_sync_key}",
                     on_change=sync_editor_to_state,
-                    height=500
+                    height=500,
+                    # 💡 透過配置讓欄位「看起來」有被設計過
+                    column_config={
+                        "確認續約": st.column_config.CheckboxColumn("確認續約", help="點擊方框執行續約"),
+                        "金額": st.column_config.NumberColumn("金額 (萬)", format="%.2f"),
+                        "下週三生效": st.column_config.DateColumn("預計生效日期")
+                    }
                 )
 
                 # 執行按鈕區
@@ -1383,7 +1453,7 @@ elif menu == "📅 到期續約管理":
             st.subheader(f"✅ 已處理完成清單 ({len(done_df)} 筆)")
             if not done_df.empty:
                 done_df = done_df.sort_values(by='原結束日', ascending=False)
-                st.dataframe(done_df[['客戶姓名', '業務姓名', '金額', '方案(利率)', '原結束日']], use_container_width=True, hide_index=True)
+                st.dataframe(apply_zebra_style(done_df[['客戶姓名', '業務姓名', '金額', '方案(利率)', '原結束日']]), use_container_width=True, hide_index=True)
             else:
                 st.info("💡 目前區間內尚無已處理完成的續約。")
 
@@ -1549,7 +1619,7 @@ elif menu == "💰 業務佣":
                             if payer_id:
                                 payouts[m_id]['加給'] += g_gain
                                 payouts[payer_id]['加給'] -= g_gain
-                                summary_payout_details.append({'受款人': m_info['name'], '項目': f"{gen_name}補償({agent_map[sub_id]['name']}單)", '總業績': group_amt, '計算式': f"{g_rate*100:.2f}%", '金額': g_gain, '支出人': agent_map[payer_id]['name']})
+                                summary_payout_details.append({'受款人': m_info['name'], '項目': f"{gen_name}補償({agent_map[sub_id]['name']}單)", '總業績': round(group_amt, 2), '計算式': f"{g_rate*100:.2f}%", '金額': g_gain, '支出人': agent_map[payer_id]['name']})
 
             # --- 5. 報表呈現 ---
             # --- 5. 報表呈現 (矩陣 + 明細) ---
@@ -1601,16 +1671,36 @@ elif menu == "💰 業務佣":
                 base_cols = ['姓名'] + all_plan_cols + ['總業績', '個人Ｃ', '差%加給', '活動獎勵', '應領總計']
                 df_with_total = df_with_total[base_cols]
 
+                fmt_cols = [c for c in df_final.columns if c != '姓名']
+
                 # 格式化輸出
-                st.dataframe(df_with_total.style.format(subset=df_with_total.columns[1:], formatter="{:.2f}"), use_container_width=True)
+                # st.dataframe(df_with_total.style.format(subset=df_with_total.columns[1:], formatter="{:.2f}"), use_container_width=True)
+                st.dataframe(
+                    apply_zebra_style(df_with_total, format_cols=fmt_cols), 
+                    use_container_width=True, 
+                    hide_index=True
+                )
                 
                 st.divider()
                 st.write("### 🔍 明細")
                 if summary_payout_details:
-                    st.table(pd.DataFrame(summary_payout_details))
+                    df_details = pd.DataFrame(summary_payout_details)
+                    # 直接丟進去，它會自動找「總業績」與「金額」這兩欄來切掉 0
+                    st.dataframe(
+                        apply_zebra_style(df_details), 
+                        use_container_width=True, 
+                        hide_index=True
+                    )
                 
                 st.write("### 📄 明細紀錄")
-                st.dataframe(pd.DataFrame(contract_flow_logs), use_container_width=True)
+                if contract_flow_logs:
+                    df_logs = pd.DataFrame(contract_flow_logs)
+                    # 明細紀錄通常包含文字，直接套用條紋樣式即可
+                    st.dataframe(
+                        apply_zebra_style(df_logs), 
+                        use_container_width=True,
+                        hide_index=True
+                    )
             else:
                 st.warning("🌙 此區間無數據。")
 
