@@ -10,7 +10,7 @@ import calendar
 # import graphviz
 
 
-CURRENT_VERSION = "1.4.0"
+CURRENT_VERSION = "1.4.1"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -234,7 +234,7 @@ if menu == "📊 客戶資料瀏覽":
     st.dataframe(df, use_container_width=True)
 
 elif menu == "💰 收益發放試算":
-    st.title("💰 收益發放試算 (精確日期區間版)")
+    st.title("💰 收益發放試算")
     st.info("💡 規則：系統會自動比對合約『生效日(Day)』是否落在您的選定區間內。已排除『生效當月』新件。")
 
     # --- 0. 狀態初始化 (鎖定篩選條件) ---
@@ -1475,7 +1475,6 @@ elif menu == "📅 到期續約管理":
 
 elif menu == "💰 業務佣":
     st.title("💰 C")
-    # st.info("💡 規則：級差領全組；平階補償(0.2%/0.1%)母數採「該代數主管之全組業績」。")
 
     # --- 0. 預載組織快取 ---
     agent_query = """
@@ -1525,7 +1524,8 @@ elif menu == "💰 業務佣":
         query = """
         SELECT ic.contract_id, c.name as 客戶姓名, a.name as 業務姓名, a.agent_id, a.boss_id, 
                r.rank_name as 職級, r.commission_rate as 個人比例, ic.amount / 10000.0 as '金額', 
-               rp.plan_name, rp.annual_rate as '利率', ic.start_date as 生效日, rp.period_months as 總期數 
+               rp.plan_name, rp.annual_rate as '利率', ic.start_date as 生效日, 
+               rp.period_months as 總期數, ic.contract_type
         FROM invest_contracts ic 
         JOIN customers c ON ic.customer_id = c.customer_id 
         JOIN agents a ON c.agent_id = a.agent_id 
@@ -1540,29 +1540,34 @@ elif menu == "💰 業務佣":
             payouts = {aid: {'個人':0.0, '加給':0.0, '獎勵':0.0, '業績':{}} for aid in agent_map}
             volume_box = {aid: {'級差池': {}, '子代池': {}, '孫代池': {}} for aid in agent_map}
             summary_payout_details = []
-            contract_flow_logs = [] # 用於記錄單筆保單的詳細流向
+            contract_flow_logs = [] 
 
             for _, row in df_raw.iterrows():
                 amt, aid, plan = row['金額'], row['agent_id'], row['方案名稱(%)']
+                
+                # ✅ 判定性質 (新/續)
+                raw_type = row['contract_type'] if pd.notna(row['contract_type']) else "續約"
+                suffix = "新" if "新" in raw_type else "續"
+                detailed_plan_key = f"{plan}-{suffix}"
+                
                 start_dt = pd.to_datetime(row['生效日']).date()
                 diff_months = (end_f.year - start_dt.year) * 12 + (end_f.month - start_dt.month)
                 is_in_date_range = (start_f <= start_dt <= end_f)
-                is_new = (row['生效日'] >= start_f.isoformat() and row['生效日'] <= end_f.isoformat())
+                
+                # 過期或未開始則跳過
                 if diff_months < 0 or diff_months >= row['總期數']: continue
 
-                # 初始化單筆保單拆解紀錄
                 this_log = {"客戶": row['客戶姓名'], "業務": row['業務姓名'], "金額": amt, "生效日": row['生效日'], "分配明細": []}
 
-                # ✅ (A) 獎勵計算 (套用規則)
+                # ✅ (A) 獎勵計算
                 for rule in st.session_state.extra_rules:
-                    if plan == rule['plan'] and diff_months == rule['time']and is_in_date_range:
+                    if plan == rule['plan'] and diff_months == rule['time'] and is_in_date_range:
                         rew_amt = round(amt * rule['bonus_rate'], 2)
-                        # print("amt",amt,"*",rule['bonus_rate'],"=",rew_amt)
                         payouts[aid]['獎勵'] += rew_amt
                         this_log["分配明細"].append(f"🎁獎勵({row['業務姓名']}):+{rew_amt}")
 
-                # ✅ (B) 核心分潤：全組滾動判定 (僅限當月新約)
-                if is_new:
+                # ✅ (B) 核心分潤與業績歸帳 (僅計算選定區間內的新業績)
+                if is_in_date_range:
                     target_aid = aid
                     if row['職級'] in ['高專', '累件中', '外圍'] and pd.notna(row['boss_id']):
                         target_aid = row['boss_id']
@@ -1570,15 +1575,15 @@ elif menu == "💰 業務佣":
                     base_agent = agent_map.get(target_aid)
                     if not base_agent: continue
                     
-                    base_rate, base_rank = base_agent['rate'], base_agent['rank']
+                    # 業績歸帳到對應的 [方案-新/續]
+                    payouts[target_aid]['業績'][detailed_plan_key] = payouts[target_aid]['業績'].get(detailed_plan_key, 0) + amt
                     
-                    # 1. 個人佣金
+                    base_rate = base_agent['rate']
                     self_comm = round(amt * base_rate, 2)
                     payouts[target_aid]['個人'] += self_comm
-                    payouts[target_aid]['業績'][plan] = payouts[target_aid]['業績'].get(plan, 0) + amt
                     this_log["分配明細"].append(f"個人({base_agent['name']}):+{self_comm}")
 
-                    # 🚀 爬升引擎
+                    # 🚀 爬升引擎 (級差與平階)
                     last_rate = base_rate
                     child_group_id = target_aid 
                     curr_id = base_agent['boss_id']
@@ -1586,14 +1591,12 @@ elif menu == "💰 業務佣":
 
                     while curr_id in agent_map:
                         boss = agent_map[curr_id]
-                        # 情況 A: 級差領取 (領取全組差額)
                         if boss['rate'] > last_rate:
                             volume_box[curr_id]['級差池'][child_group_id] = volume_box[curr_id]['級差池'].get(child_group_id, 0) + amt
                             s_rate = round(boss['rate'] - last_rate, 4)
                             this_log["分配明細"].append(f"級差({boss['name']}):+{round(amt*s_rate, 2)}")
                             child_group_id = curr_id 
                             last_rate = boss['rate']
-                        # 情況 B: 平階判定
                         elif boss['rate'] == last_rate and boss['rank'] != '主任':
                             peer_count += 1
                             if peer_count == 1:
@@ -1604,12 +1607,11 @@ elif menu == "💰 業務佣":
                                 this_log["分配明細"].append(f"孫代({boss['name']}):+0.1%")
                         curr_id = boss['boss_id']
                 
-                # 存入拆解紀錄
                 if this_log["分配明細"]:
                     this_log["分配明細"] = " | ".join(this_log["分配明細"])
                     contract_flow_logs.append(this_log)
 
-            # --- 第二階段：結算總額 (斷點支出) ---
+            # --- 第二階段：結算加給 ---
             for m_id, v_data in volume_box.items():
                 m_info = agent_map[m_id]
                 for sub_id, total_amt in v_data['級差池'].items():
@@ -1617,10 +1619,9 @@ elif menu == "💰 業務佣":
                     if s_rate > 0:
                         gain = round(total_amt * s_rate, 2)
                         payouts[m_id]['加給'] += gain
-                        summary_payout_details.append({'受款人': m_info['name'], '項目': f"【{agent_map[sub_id]['name']}組】全組級差", '總業績': total_amt, '計算式': f"{s_rate*100:.1f}%", '金額': gain, '支出人': '-'})
+                        summary_payout_details.append({'受款人': m_info['name'], '項目': f"【{agent_map[sub_id]['name']}組】級差", '總業績': total_amt, '計算式': f"{s_rate*100:.1f}%", '金額': gain, '支出人': '-'})
                 
                 for gen_name, pool_key, g_rate in [('子代', '子代池', 0.002), ('孫代', '孫代池', 0.001)]:
-                    # 統計該代數的所有來源單據總和
                     for sub_id, group_amt in v_data[pool_key].items():
                         if group_amt > 0:
                             g_gain = round(group_amt * g_rate, 2)
@@ -1634,86 +1635,58 @@ elif menu == "💰 業務佣":
                                 payouts[payer_id]['加給'] -= g_gain
                                 summary_payout_details.append({'受款人': m_info['name'], '項目': f"{gen_name}補償({agent_map[sub_id]['name']}單)", '總業績': round(group_amt, 2), '計算式': f"{g_rate*100:.2f}%", '金額': g_gain, '支出人': agent_map[payer_id]['name']})
 
-            # --- 5. 報表呈現 ---
-            # --- 5. 報表呈現 (矩陣 + 明細) ---
-            st.write("### 🧩 Matrix C")
+            # --- 3. 欄位排序與生成 (利率由小到大) ---
+            raw_keys = set([k for d in payouts.values() for k in d['業績'].keys()])
+            base_plans = set([k.rsplit('-', 1)[0] for k in raw_keys])
             
+            def get_rate_val(p_str):
+                import re
+                match = re.search(r"\((.*?)%\)", p_str)
+                return float(match.group(1)) if match else 0.0
+
+            sorted_base_plans = sorted(list(base_plans), key=get_rate_val)
+            all_detailed_cols = []
+            for bp in sorted_base_plans:
+                all_detailed_cols.append(f"{bp}-新")
+                all_detailed_cols.append(f"{bp}-續")
+
+            # --- 4. 生成 Matrix C 表格數據 ---
             summary_data = []
-            # 取得所有出現過的方案名稱
-            all_plan_cols = []
-            for aid, data in payouts.items():
-                for p_name in data['業績'].keys():
-                    if p_name not in all_plan_cols:
-                        all_plan_cols.append(p_name)
-            
             for aid, data in payouts.items():
                 if any(v > 0 for v in data['業績'].values()) or data['加給'] != 0 or data['獎勵'] != 0:
                     r_data = {'姓名': agent_map[aid]['name']}
-                    
-                    # 放入各方案業績
-                    p_total_val = 0.0
-                    for p_col in all_plan_cols:
-                        val = data['業績'].get(p_col, 0)
-                        r_data[p_col] = round(val, 2)
-                        p_total_val += val
+                    for p_col in all_detailed_cols:
+                        r_data[p_col] = data['業績'].get(p_col, 0)
 
-                    # 🎯 修正重點：計算「個人佣金 = 總業績 * 該業務職級%」
-                    # 直接從 payouts[aid]['個人'] 抓取最準確，因為它是每筆單算完 round 累加的
-                    self_comm_total = data['個人']
-
-                    r_data['總業績'] = round(p_total_val, 2)
-                    r_data['個人Ｃ'] = round(self_comm_total, 2) # 👈 你要的欄位
-                    r_data['差%加給'] = round(data['加給'], 2)
-                    r_data['活動獎勵'] = round(data['獎勵'], 2)
-                    r_data['應領總計'] = round(self_comm_total + data['加給'] + data['獎勵'], 2)
+                    r_data['總業績'] = sum(data['業績'].values())
+                    r_data['個人Ｃ'] = data['個人']
+                    r_data['差%加給'] = data['加給']
+                    r_data['活動獎勵'] = data['獎勵']
+                    r_data['應領總計'] = data['個人'] + data['加給'] + data['獎勵']
                     summary_data.append(r_data)
             
+            # --- 5. 呈現表格 ---
             if summary_data:
                 df_final = pd.DataFrame(summary_data).fillna(0)
-                
-                # --- 新增最上方的 Total 合計列 ---
                 total_row = {'姓名': '⭐ 合計 (Total)'}
                 for col in df_final.columns:
-                    if col != '姓名':
-                        total_row[col] = df_final[col].sum()
+                    if col != '姓名': total_row[col] = df_final[col].sum()
                 
-                # 將合計列放到第一行
                 df_with_total = pd.concat([pd.DataFrame([total_row]), df_final], ignore_index=True)
-                
-                # 重新排序列順序
-                base_cols = ['姓名'] + all_plan_cols + ['總業績', '個人Ｃ', '差%加給', '活動獎勵', '應領總計']
-                df_with_total = df_with_total[base_cols]
+                display_cols = ['姓名'] + all_detailed_cols + ['總業績', '個人Ｃ', '差%加給', '活動獎勵', '應領總計']
+                df_with_total = df_with_total[display_cols]
 
-                fmt_cols = [c for c in df_final.columns if c != '姓名']
-
-                # 格式化輸出
-                # st.dataframe(df_with_total.style.format(subset=df_with_total.columns[1:], formatter="{:.2f}"), use_container_width=True)
-                st.dataframe(
-                    apply_zebra_style(df_with_total, format_cols=fmt_cols), 
-                    use_container_width=True, 
-                    hide_index=True
-                )
+                st.write("### 🧩 Matrix C (按利率排序)")
+                st.dataframe(apply_zebra_style(df_with_total), use_container_width=True, hide_index=True)
                 
                 st.divider()
                 st.write("### 🔍 明細")
                 if summary_payout_details:
-                    df_details = pd.DataFrame(summary_payout_details)
-                    # 直接丟進去，它會自動找「總業績」與「金額」這兩欄來切掉 0
-                    st.dataframe(
-                        apply_zebra_style(df_details), 
-                        use_container_width=True, 
-                        hide_index=True
-                    )
+                    st.dataframe(apply_zebra_style(pd.DataFrame(summary_payout_details)), use_container_width=True, hide_index=True)
                 
                 st.write("### 📄 明細紀錄")
                 if contract_flow_logs:
-                    df_logs = pd.DataFrame(contract_flow_logs)
-                    # 明細紀錄通常包含文字，直接套用條紋樣式即可
-                    st.dataframe(
-                        apply_zebra_style(df_logs), 
-                        use_container_width=True,
-                        hide_index=True
-                    )
+                    st.dataframe(apply_zebra_style(pd.DataFrame(contract_flow_logs)), use_container_width=True, hide_index=True)
             else:
                 st.warning("🌙 此區間無數據。")
 
