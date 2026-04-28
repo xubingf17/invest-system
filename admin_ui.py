@@ -10,7 +10,7 @@ import calendar
 # import graphviz
 
 
-CURRENT_VERSION = "1.4.1"
+CURRENT_VERSION = "1.4.2"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -509,7 +509,7 @@ elif menu == "📋 合約總覽":
             df_display = df_display[df_display['備註'].str.contains(search_note, case=False, na=False, regex=False)]
 
         total_wan = df_display['金額'].sum()
-        display_total = f"{total_wan/10000:.2f} 億" if total_wan >= 10000 else f"{total_wan:,.0f} 萬"
+        display_total = f"{total_wan/10000:.4f} 億" if total_wan >= 10000 else f"{total_wan:,.0f} 萬"
         st.divider()
         m1, m2 = st.columns(2)
         m1.metric("符合條件筆數", f"{len(df_display)} 筆")
