@@ -10,7 +10,7 @@ import calendar
 # import graphviz
 
 
-CURRENT_VERSION = "1.4.2"
+CURRENT_VERSION = "1.4.3"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -1690,12 +1690,11 @@ elif menu == "💰 業務佣":
             else:
                 st.warning("🌙 此區間無數據。")
 
-# --- 🌳 團隊組織圖 模組 ---
 elif menu == "🌳 團隊組織圖":
     st.title("🌳 團隊組織架構圖")
-    st.info("💡 提示：此圖表根據業務員設定之「直屬主管」自動生成。若要調整隸屬關係，請至「基礎資料設定」。")
+    st.info("💡 提示：此圖表根據業務員設定之「直屬主管」自動生成。不同職級將顯示不同顏色。")
 
-    # 1. 執行 SQL 抓取關係 (包含業務姓名、主管姓名、職級)
+    # 1. 執行 SQL 抓取關係
     query = """
         SELECT 
             a.name as employee, 
@@ -1708,31 +1707,74 @@ elif menu == "🌳 團隊組織圖":
     hierarchy_df = pd.read_sql(query, conn)
 
     if not hierarchy_df.empty:
+        # 🎨 根據你提供的利率由高至低定義配色
+        # 邏輯：利率越高，藍色系越深；基層與特殊職級使用灰/淺綠
+        # rank_colors = {
+        #     "協理": "#002b5c",    # 4.8% - 極深藍
+        #     "經理": "#004080",    # 4.5% - 深藍
+        #     "資副": "#0059b3",    # 4.1% - 藍
+        #     "副理": "#3385ff",    # 3.7% - 標準藍
+        #     "主任": "#80b3ff",    # 3.0% - 天藍
+        #     "高專": "#b3d1ff",    # 2.0% - 淺藍
+        #     "累件中": "#d1e0e0",  # 2.0% - 灰綠 (特殊狀態)
+        #     "外圍": "#f2f2f2"     # 1.0% - 極淺灰
+        # }
+        rank_colors = {
+            "協理": "#0000FF",    # 正藍
+            "經理": "#FF0000",    # 正紅
+            "資副": "#FF8C00",    # 深橘
+            "副理": "#9400D3",    # 紫色
+            "主任": "#008000",    # 綠色
+            "高專": "#FFFF00",    # 黃色
+            "累件中": "#00FFFF",  # 青色
+            "外圍": "#FF00FF"     # 桃紅
+        }
+        default_color = "#000000"
         
-        # 2. 構建 Graphviz 語法字串 (使用高相容性語法)
-        # TB 代表 Top to Bottom (由上而下)
+        # 預設顏色
+        # default_color = "#1f77b4"
+
+        # 2. 構建 Graphviz 語法
         dot_code = """
         digraph {
-            graph [rankdir=TB, nodesep=0.5, ranksep=0.8];
+            graph [rankdir=TB, nodesep=0.5, ranksep=0.8, bgcolor="transparent"];
             node [
                 shape=box, 
                 style="filled,rounded", 
-                color="#1f77b4", 
-                fillcolor="#1f77b4", 
-                fontcolor=white, 
                 fontname="Arial",
-                width=1.5,
-                height=0.6
+                width=1.8,
+                height=0.7,
+                penwidth=0.5,
+                color="#ffffff"
             ];
-            edge [color="#777777", penwidth=1.5];
+            edge [color="#666666", penwidth=1.5, arrowhead=vee];
         """
+        st.write("---")
+        st.caption("🎨 **職級配色參考**")
+        cols = st.columns(len(rank_colors))
+        for i, (name, color) in enumerate(rank_colors.items()):
+            cols[i].markdown(f'<div style="background-color:{color}; padding:5px; border-radius:5px; text-align:center; color:{"white" if i<4 else "black"}; font-size:12px;">{name}</div>', unsafe_allow_html=True)
+        st.write("")
+        st.write("")
+        st.write("")
+        st.write("")
 
         for _, row in hierarchy_df.iterrows():
-            # 節點顯示：姓名 \n (職級)
-            node_label = f"{row['employee']}\\n({row['rank']})"
-            dot_code += f'    "{row["employee"]}" [label="{node_label}"];\n'
+            current_rank = row['rank']
+            node_color = rank_colors.get(current_rank, default_color)
             
-            # 如果有主管，建立連線 (主管 -> 部屬)
+            # ✅ 智慧調整文字顏色：背景太深則用白字，背景太淺則用黑字
+            # 協理、經理、資副、副理 使用白字
+            if current_rank in ["協理", "經理", "資副", "副理"]:
+                text_color = "white"
+            else:
+                text_color = "#333333" # 深灰色文字
+            
+            # 節點標籤加入職級
+            node_label = f"{row['employee']}\\n({current_rank})"
+            dot_code += f'    "{row["employee"]}" [label="{node_label}", fillcolor="{node_color}", fontcolor="{text_color}"];\n'
+            
+            # 主管連線
             if row['boss']:
                 dot_code += f'    "{row["boss"]}" -> "{row["employee"]}";\n'
 
@@ -1742,16 +1784,23 @@ elif menu == "🌳 團隊組織圖":
         try:
             st.graphviz_chart(dot_code)
         except Exception as e:
-            st.error(f"圖表渲染失敗，請確保已安裝 graphviz 套件。錯誤：{e}")
+            st.error(f"圖表渲染失敗。錯誤：{e}")
         
-        # 4. 附上清單方便核對
+        st.write("")
+        st.write("")
+        st.write("")
+        st.write("")
+        st.write("")
+        st.write("")
+        
+        # 5. 文字清單核對
         with st.expander("📋 查看文字版隸屬清單"):
             display_h = hierarchy_df.copy()
             display_h.columns = ['業務姓名', '直屬主管', '職級']
             st.table(display_h.fillna("-(最高階)-"))
             
     else:
-        st.warning("目前資料庫中尚無業務員資料，請先至「新增資料」建立。")
+        st.warning("目前資料庫中尚無業務員資料。")
 
 st.markdown("---")
 st.caption(f"© 2026 Bing Xu. All Rights Reserved. | 投資管理系統 v{CURRENT_VERSION}")
