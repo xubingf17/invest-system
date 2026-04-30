@@ -10,7 +10,7 @@ import calendar
 # import graphviz
 
 
-CURRENT_VERSION = "1.4.3"
+CURRENT_VERSION = "1.4.4"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -1691,15 +1691,11 @@ elif menu == "💰 業務佣":
                 st.warning("🌙 此區間無數據。")
 
 elif menu == "🌳 團隊組織圖":
-    st.title("🌳 團隊組織架構圖")
-    st.info("💡 提示：此圖表根據業務員設定之「直屬主管」自動生成。不同職級將顯示不同顏色。")
-
+    st.title("🌳 團隊組織架構圖 (橫向排版)")
+    
     # 1. 執行 SQL 抓取關係
     query = """
-        SELECT 
-            a.name as employee, 
-            b.name as boss, 
-            r.rank_name as rank
+        SELECT a.name as employee, b.name as boss, r.rank_name as rank
         FROM agents a
         LEFT JOIN agents b ON a.boss_id = b.agent_id
         JOIN ranks r ON a.rank_id = r.rank_id
@@ -1707,100 +1703,155 @@ elif menu == "🌳 團隊組織圖":
     hierarchy_df = pd.read_sql(query, conn)
 
     if not hierarchy_df.empty:
-        # 🎨 根據你提供的利率由高至低定義配色
-        # 邏輯：利率越高，藍色系越深；基層與特殊職級使用灰/淺綠
-        # rank_colors = {
-        #     "協理": "#002b5c",    # 4.8% - 極深藍
-        #     "經理": "#004080",    # 4.5% - 深藍
-        #     "資副": "#0059b3",    # 4.1% - 藍
-        #     "副理": "#3385ff",    # 3.7% - 標準藍
-        #     "主任": "#80b3ff",    # 3.0% - 天藍
-        #     "高專": "#b3d1ff",    # 2.0% - 淺藍
-        #     "累件中": "#d1e0e0",  # 2.0% - 灰綠 (特殊狀態)
-        #     "外圍": "#f2f2f2"     # 1.0% - 極淺灰
-        # }
+        # 🎨 職級配色定義
         rank_colors = {
-            "協理": "#0000FF",    # 正藍
-            "經理": "#FF0000",    # 正紅
-            "資副": "#FF8C00",    # 深橘
-            "副理": "#9400D3",    # 紫色
-            "主任": "#008000",    # 綠色
-            "高專": "#FFFF00",    # 黃色
-            "累件中": "#00FFFF",  # 青色
-            "外圍": "#FF00FF"     # 桃紅
+            "協理": "#0000FF", "經理": "#FF0000", "資副": "#FF8C00", 
+            "副理": "#9400D3", "主任": "#008000", "高專": "#FFFF00", 
+            "累件中": "#00FFFF", "外圍": "#FF00FF"
         }
-        default_color = "#000000"
-        
-        # 預設顏色
-        # default_color = "#1f77b4"
 
-        # 2. 構建 Graphviz 語法
-        dot_code = """
-        digraph {
-            graph [rankdir=TB, nodesep=0.5, ranksep=0.8, bgcolor="transparent"];
-            node [
-                shape=box, 
-                style="filled,rounded", 
-                fontname="Arial",
-                width=1.8,
-                height=0.7,
-                penwidth=0.5,
-                color="#ffffff"
-            ];
-            edge [color="#666666", penwidth=1.5, arrowhead=vee];
-        """
+        # 5. 職級對照表
         st.write("---")
-        st.caption("🎨 **職級配色參考**")
+        st.markdown("##### 🎨 職級配色參考")
         cols = st.columns(len(rank_colors))
         for i, (name, color) in enumerate(rank_colors.items()):
-            cols[i].markdown(f'<div style="background-color:{color}; padding:5px; border-radius:5px; text-align:center; color:{"white" if i<4 else "black"}; font-size:12px;">{name}</div>', unsafe_allow_html=True)
+            t_color = "black" if name in ["高專", "累件中", "外圍"] else "white"
+            cols[i].markdown(f'<div style="background-color:{color}; padding:10px; border-radius:8px; text-align:center; color:{t_color}; font-size:14px; font-weight:bold;">{name}</div>', unsafe_allow_html=True)
+
+        st.write("")
+        st.write("")
         st.write("")
         st.write("")
         st.write("")
         st.write("")
 
+        # 2. 構建樹狀結構
+        nodes = {row['employee']: {'rank': row['rank'], 'children': []} for _, row in hierarchy_df.iterrows()}
+        roots = []
         for _, row in hierarchy_df.iterrows():
-            current_rank = row['rank']
-            node_color = rank_colors.get(current_rank, default_color)
-            
-            # ✅ 智慧調整文字顏色：背景太深則用白字，背景太淺則用黑字
-            # 協理、經理、資副、副理 使用白字
-            if current_rank in ["協理", "經理", "資副", "副理"]:
-                text_color = "white"
+            if row['boss'] and row['boss'] in nodes:
+                nodes[row['boss']]['children'].append(row['employee'])
             else:
-                text_color = "#333333" # 深灰色文字
-            
-            # 節點標籤加入職級
-            node_label = f"{row['employee']}\\n({current_rank})"
-            dot_code += f'    "{row["employee"]}" [label="{node_label}", fillcolor="{node_color}", fontcolor="{text_color}"];\n'
-            
-            # 主管連線
-            if row['boss']:
-                dot_code += f'    "{row["boss"]}" -> "{row["employee"]}";\n'
+                roots.append(row['employee'])
 
-        dot_code += "}"
+        def generate_horizontal_html(node_name):
+            rk = nodes[node_name]['rank']
+            bg_color = rank_colors.get(rk, "#000")
+            txt_color = "black" if rk in ["高專", "累件中", "外圍"] else "white"
+            has_children = len(nodes[node_name]['children']) > 0
+            html = f'<li>'
+            html += f'''<div class="node-card" style="background-color: {bg_color}; color: {txt_color};"><div class="name">{node_name}</div><div class="rank">{rk}</div></div>'''
+            if has_children:
+                html += '<ul>' + "".join([generate_horizontal_html(c) for c in nodes[node_name]['children']]) + '</ul>'
+            html += '</li>'
+            return html
 
-        # 3. 渲染圖表
-        try:
-            st.graphviz_chart(dot_code)
-        except Exception as e:
-            st.error(f"圖表渲染失敗。錯誤：{e}")
-        
+        tree_content = "".join([generate_horizontal_html(root) for root in roots])
+
+        # 🎯 3. 控制面板
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            main_zoom = st.slider("🔍 主網頁預覽縮放", 0.05, 1.0, 0.25, 0.05)
+        with col2:
+            st.write("") 
+            import base64
+            # 🚀 全螢幕版本 HTML：重點在於 @media print 的修正
+            full_html = f"""
+            <html>
+            <head>
+                <meta charset='utf-8'>
+                <style>
+                    body {{ margin:0; font-family:"Microsoft JhengHei", Arial; background:#fdfdfd; }}
+                    #vp {{ width:100vw; height:100vh; overflow: auto; display: block; }}
+                    #sf {{ 
+                        display: inline-block;
+                        padding: 60px; 
+                        transform-origin: 0 0; 
+                        transform: scale(0.7); 
+                        white-space: nowrap; 
+                        transition: transform 0.1s ease;
+                    }}
+                    .tree-hor ul {{ padding-left: 60px; position: relative; list-style-type: none; margin: 0; }}
+                    .tree-hor li {{ position: relative; padding: 10px 0 10px 60px; display: flex; align-items: center; }}
+                    .tree-hor li::after {{
+                        content: ''; position: absolute; top: 0; left: 0;
+                        border-left: 3px solid #444; height: 100%; width: 0;
+                    }}
+                    .tree-hor li:first-child::after {{ height: 50%; top: 50%; }}
+                    .tree-hor li:last-child::after {{ height: 50%; }}
+                    .tree-hor li:only-child::after {{ display: none; }}
+                    .tree-hor li::before {{
+                        content: ''; position: absolute; top: 50%; left: 0;
+                        border-top: 3px solid #444; width: 60px; height: 0;
+                    }}
+                    .tree-hor > ul > li::before, .tree-hor > ul > li::after {{ display: none; }}
+                    .tree-hor > ul > li {{ padding-left: 0; }}
+                    .node-card {{ border: 3px solid #fff; padding: 12px 25px; min-width: 160px; text-align: center; border-radius: 10px; box-shadow: 4px 4px 10px rgba(0,0,0,0.15); z-index: 10; position: relative; }}
+                    .node-card .name {{ font-size: 28px; font-weight: bold; }}
+                    .node-card .rank {{ font-size: 16px; border-top: 1px solid rgba(255,255,255,0.3); margin-top: 5px; }}
+                    .controls {{ position:fixed; top:20px; left:20px; z-index:9999; display:flex; gap:10px; background:white; padding:10px; border-radius:10px; box-shadow:0 4px 15px rgba(0,0,0,0.1); }}
+                    .btn {{ padding:8px 15px; border:none; border-radius:5px; cursor:pointer; font-weight:bold; background:#f0f2f6; }}
+
+                    /* 🎯 關鍵列印優化：確保印出完整表格而非只有視窗內的部分 */
+                    @media print {{
+                        .controls {{ display:none; }}
+                        body, #vp {{ overflow: visible !important; height: auto !important; width: auto !important; }}
+                        #sf {{ transform: scale(0.6) !important; position: relative !important; padding: 0 !important; top: 0 !important; left: 0 !important; }}
+                    }}
+                </style>
+            </head>
+            <body>
+                <div class="controls">
+                    <button class="btn" onclick="z(0.1)">➕ 放大</button>
+                    <button class="btn" onclick="z(-0.1)">➖ 縮小</button>
+                    <button class="btn" onclick="window.print()" style="background:#FF4B4B; color:white;">🖨️ 列印完整 PDF</button>
+                </div>
+                <div id='vp'><div id='sf'><div class='tree-hor'><ul>{tree_content}</ul></div></div></div>
+                <script>
+                    let s=0.7; const f=document.getElementById('sf');
+                    function z(d){{ s=Math.min(Math.max(0.1,s+d),3); f.style.transform=`scale(${{s}})`; }}
+                </script>
+            </body>
+            </html>
+            """
+            b64 = base64.b64encode(full_html.encode('utf-8')).decode('utf-8')
+            st.markdown(f'<a href="data:text/html;base64,{b64}" target="_blank" style="text-decoration:none;"><div style="background:#81D4FA;color:white;padding:10px;border-radius:8px;text-align:center;font-weight:bold;cursor:pointer;">全螢幕瀏覽</div></a>', unsafe_allow_html=True)
+
+        # 4. 主頁面預覽
+        preview_html = f"""
+        <html><head><style>
+            body {{ margin: 0; background: #fdfdfd; }}
+            #vp {{ width: 100%; height: 800px; overflow: auto; }}
+            #sf {{ display: inline-block; transform-origin: 0 0; transform: scale({main_zoom}) !important; white-space: nowrap; padding: 50px; }}
+            .tree-hor ul {{ padding-left: 60px; position: relative; list-style-type: none; margin: 0; }}
+            .tree-hor li {{ position: relative; padding: 10px 0 10px 60px; display: flex; align-items: center; }}
+            .tree-hor li::after {{ content: ''; position: absolute; top: 0; left: 0; border-left: 3px solid #444; height: 100%; }}
+            .tree-hor li:first-child::after {{ height: 50%; top: 50%; }}
+            .tree-hor li:last-child::after {{ height: 50%; }}
+            .tree-hor li:only-child::after {{ display: none; }}
+            .tree-hor li::before {{ content: ''; position: absolute; top: 50%; left: 0; border-top: 3px solid #444; width: 60px; }}
+            .tree-hor > ul > li::before, .tree-hor > ul > li::after {{ display: none; }}
+            .tree-hor > ul > li {{ padding-left: 0; }}
+            .node-card {{ border: 3px solid #fff; padding: 12px 25px; min-width: 160px; text-align: center; border-radius: 10px; box-shadow: 4px 4px 10px rgba(0,0,0,0.1); }}
+            .node-card .name {{ font-size: 28px; font-weight: bold; }}
+            .node-card .rank {{ font-size: 16px; border-top: 1px solid rgba(255,255,255,0.3); margin-top: 5px; }}
+        </style></head>
+        <body><div id="vp"><div id="sf"><div class="tree-hor"><ul>{tree_content}</ul></div></div></div></body></html>
+        """
+        st.components.v1.html(preview_html, height=800)
+
         st.write("")
         st.write("")
         st.write("")
         st.write("")
         st.write("")
-        st.write("")
-        
-        # 5. 文字清單核對
+
+        # 6. 文字版隸屬清單
         with st.expander("📋 查看文字版隸屬清單"):
-            display_h = hierarchy_df.copy()
-            display_h.columns = ['業務姓名', '直屬主管', '職級']
-            st.table(display_h.fillna("-(最高階)-"))
+            st.table(hierarchy_df.rename(columns={'employee':'業務姓名','boss':'直屬主管','rank':'職級'}).fillna("-(最高階主管)-"))
             
     else:
-        st.warning("目前資料庫中尚無業務員資料。")
+        st.warning("目前尚無資料。")
 
 st.markdown("---")
 st.caption(f"© 2026 Bing Xu. All Rights Reserved. | 投資管理系統 v{CURRENT_VERSION}")
