@@ -10,7 +10,7 @@ import calendar
 # import graphviz
 
 
-CURRENT_VERSION = "1.4.4"
+CURRENT_VERSION = "1.4.5"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -143,6 +143,13 @@ def force_add_columns(conn):
     if 'contract_type' not in contract_cols:
         conn.execute("ALTER TABLE invest_contracts ADD COLUMN contract_type TEXT DEFAULT '續約';")
         conn.commit()
+
+    try:
+        cursor.execute("ALTER TABLE agents ADD COLUMN sort_order INTEGER DEFAULT 999")
+        conn.commit()
+    except sqlite3.OperationalError:
+        # 如果欄位已經存在，SQLite 會拋出錯誤，這裡抓到後不做事即可
+        pass
     
     # try:
     #     conn.execute("UPDATE invest_contracts SET contract_type = '續約' WHERE contract_type = '新約'")
@@ -166,7 +173,7 @@ with st.sidebar:
     st.title("📂 系統總覽")
     menu = st.sidebar.radio(
         "請選擇功能模組：",
-        ["📋 合約總覽","📅 到期續約管理" , "💰 收益發放試算","💰 業務佣", "👤 客戶資料管理", "🌳 團隊組織圖","➕ 新增資料", "⚙️ 基礎資料設定"],
+        ["📋 合約總覽","📅 到期續約管理" , "💰 收益發放試算","💰 業務佣", "👤 客戶資料管理", "🌳 團隊組織圖","➕ 新增資料", "⚙️ 基礎資料設定", "⚙️ 業務排序設定"],
         index=0,
         label_visibility="collapsed"
     )
@@ -286,7 +293,8 @@ elif menu == "💰 收益發放試算":
     SELECT 
         c.name as 客戶姓名, b.name as 業務員, boss.name as 所屬主管,
         ic.amount / 10000.0 as '金額', rp.plan_name, rp.annual_rate as '利率',
-        ic.start_date as 生效日, ic.end_date as 結束日
+        ic.start_date as 生效日, ic.end_date as 結束日,
+        b.sort_order as 業務權重
     FROM invest_contracts ic
     JOIN customers c ON ic.customer_id = c.customer_id
     JOIN agents b ON c.agent_id = b.agent_id
@@ -294,6 +302,7 @@ elif menu == "💰 收益發放試算":
     JOIN rate_plans rp ON ic.plan_id = rp.plan_id
     WHERE ic.start_date < '{start_dt.replace(day=1).isoformat()}' 
       AND ic.end_date >= '{start_dt.isoformat()}'
+    ORDER BY b.sort_order ASC, ic.start_date ASC
     """
     raw_df = pd.read_sql(query, conn)
 
@@ -324,13 +333,13 @@ elif menu == "💰 收益發放試算":
     if not raw_df.empty:
         raw_df['方案(利率)'] = raw_df['plan_name'] + " (" + raw_df['利率'].astype(str) + "%)"
         raw_df['本月預計發放'] = round(raw_df['金額'] * (raw_df['利率'] / 100.0), 2)
-        raw_df = raw_df.sort_values(by=['業務員', '客戶姓名']).reset_index(drop=True)
+        # raw_df = raw_df.sort_values(by=['業務員', '客戶姓名']).reset_index(drop=True)
 
         st.write("### 🔍 進階篩選")
         f_col1, f_col2 = st.columns(2)
         
-        all_agents = sorted(raw_df['業務員'].unique().tolist())
-        all_plans = sorted(raw_df['方案(利率)'].unique().tolist())
+        all_agents = raw_df['業務員'].unique().tolist()
+        all_plans = raw_df['方案(利率)'].unique().tolist()
         
         # 💡 防止切換日期導致舊選項消失導致 Crash 的過濾邏輯
         st.session_state.p_agent_f = [x for x in st.session_state.p_agent_f if x in all_agents]
@@ -358,6 +367,10 @@ elif menu == "💰 收益發放試算":
 
         # --- 6. 顯示結果指標與表格 ---
         if not df_filtered.empty:
+            # 🎯 [修正 1] 確保顯示清單前，先按權重與日期排序
+            # 假設 SQL 裡有抓 b.sort_order as 業務權重
+            df_filtered = df_filtered.sort_values(by=['業務權重', '生效日'], ascending=[True, True]).reset_index(drop=True)
+
             total_pay = df_filtered['本月預計發放'].sum()
             st.divider()
             st.subheader(f"📊 預計發放清單 ({start_dt} ~ {end_dt})")
@@ -366,9 +379,9 @@ elif menu == "💰 收益發放試算":
             m1.metric("待發放筆數", f"{len(df_filtered)} 筆")
             m2.metric("總計應發利息", f"NT$ {total_pay:,.2f} 萬")
 
+            # 顯示清單
             st.dataframe(
                 apply_zebra_style(df_filtered[['客戶姓名', '業務員', '金額', '方案(利率)', '本月預計發放', '生效日']], format_cols=['金額', '本月預計發放']),
-                # df_filtered[['客戶姓名', '業務員', '金額', '方案(利率)', '本月預計發放', '生效日']],
                 use_container_width=True, hide_index=True, height=400
             )
 
@@ -376,6 +389,9 @@ elif menu == "💰 收益發放試算":
             st.divider()
             st.subheader("📊 合約類別總表")
             try:
+                # 🎯 [修正 2] 取得正確的業務員排序清單 (根據原始 raw_df 的權重)
+                ordered_names = raw_df.sort_values('業務權重')['業務員'].unique().tolist()
+
                 pivot_df = df_filtered.pivot_table(
                     index='業務員', 
                     columns='方案(利率)', 
@@ -383,6 +399,10 @@ elif menu == "💰 收益發放試算":
                     aggfunc='sum', 
                     fill_value=0
                 )
+
+                # 🎯 [修正 3] 強制樞紐表按照權重重新索引，並過濾掉沒資料的人
+                pivot_df = pivot_df.reindex(ordered_names).dropna(how='all')
+
                 # 計算合計列
                 pivot_df['合計'] = df_filtered.groupby('業務員')['本月預計發放'].sum()
                 
@@ -393,16 +413,17 @@ elif menu == "💰 收益發放試算":
                 # 合併表格
                 pivot_final = pd.concat([pivot_df, total_row.to_frame().T])
                 
-                # 💡 修正：將 index (業務員姓名) 轉回欄位，這樣 hide_index 才會好看，且能套用條紋
+                # 轉回欄位
                 pivot_final = pivot_final.reset_index().rename(columns={'index': '業務員'})
 
-                # 🎨 套用深色斑馬條紋樣式 (這會自動處理兩位小數並消滅多餘的 0)
+                # 🎨 顯示樞紐表
                 st.dataframe(
                     apply_zebra_style(pivot_final), 
                     use_container_width=True, 
                     hide_index=True
                 )
             except Exception as e:
+                # 可以考慮印出 e 來除錯：st.write(e)
                 st.info("暫無足夠資料生成統計表")
 
             csv = df_filtered.to_csv(index=False).encode('utf-8-sig')
@@ -1334,12 +1355,14 @@ elif menu == "📅 到期續約管理":
         JOIN agents a ON c.agent_id = a.agent_id
         JOIN rate_plans rp ON ic.plan_id = rp.plan_id
         WHERE ic.end_date >= ? AND ic.end_date <= ?
+        ORDER BY CAST(a.sort_order AS INTEGER) ASC, ic.end_date ASC
         """
+
         all_df = pd.read_sql(query, conn, params=(r_start.isoformat(), r_end.isoformat()))
 
         if not all_df.empty:
             all_df['方案(利率)'] = all_df['plan_name'] + " (" + all_df['annual_rate'].astype(str) + "%)"
-            all_df = all_df.sort_values(by=['業務姓名', '客戶姓名']).reset_index(drop=True)
+            # all_df = all_df.sort_values(by=['業務姓名', '客戶姓名']).reset_index(drop=True)
             
             # --- 3. 進階篩選面板 ---
             f_col1, f_col2 = st.columns(2)
@@ -1478,7 +1501,8 @@ elif menu == "💰 業務佣":
 
     # --- 0. 預載組織快取 ---
     agent_query = """
-    SELECT a.agent_id, a.name, a.boss_id, r.commission_rate as rate, r.rank_name as rank
+    SELECT a.agent_id, a.name, a.boss_id, r.commission_rate as rate, r.rank_name as rank,
+            a.sort_order
     FROM agents a JOIN ranks r ON a.rank_id = r.rank_id
     """
     agent_map = pd.read_sql(agent_query, conn).set_index('agent_id').to_dict('index')
@@ -1525,13 +1549,15 @@ elif menu == "💰 業務佣":
         SELECT ic.contract_id, c.name as 客戶姓名, a.name as 業務姓名, a.agent_id, a.boss_id, 
                r.rank_name as 職級, r.commission_rate as 個人比例, ic.amount / 10000.0 as '金額', 
                rp.plan_name, rp.annual_rate as '利率', ic.start_date as 生效日, 
-               rp.period_months as 總期數, ic.contract_type
+               rp.period_months as 總期數, ic.contract_type,
+               a.sort_order as 業務權重
         FROM invest_contracts ic 
         JOIN customers c ON ic.customer_id = c.customer_id 
         JOIN agents a ON c.agent_id = a.agent_id 
         JOIN ranks r ON a.rank_id = r.rank_id 
         JOIN rate_plans rp ON ic.plan_id = rp.plan_id 
         WHERE ic.start_date <= ?
+        ORDER BY a.sort_order ASC
         """
         df_raw = pd.read_sql(query, conn, params=(end_f.isoformat(),))
 
@@ -1652,9 +1678,18 @@ elif menu == "💰 業務佣":
 
             # --- 4. 生成 Matrix C 表格數據 ---
             summary_data = []
-            for aid, data in payouts.items():
+
+            sorted_aids = sorted(
+                payouts.keys(), 
+                key=lambda x: agent_map.get(x, {}).get('sort_order', 999)
+            )
+
+            # for aid, data in payouts.items():
+            for aid in sorted_aids:
+                data = payouts[aid]
                 if any(v > 0 for v in data['業績'].values()) or data['加給'] != 0 or data['獎勵'] != 0:
                     r_data = {'姓名': agent_map[aid]['name']}
+                    r_data['_sort'] = agent_map[aid].get('sort_order', 999)
                     for p_col in all_detailed_cols:
                         r_data[p_col] = data['業績'].get(p_col, 0)
 
@@ -1676,13 +1711,30 @@ elif menu == "💰 業務佣":
                 display_cols = ['姓名'] + all_detailed_cols + ['總業績', '個人Ｃ', '差%加給', '活動獎勵', '應領總計']
                 df_with_total = df_with_total[display_cols]
 
-                st.write("### 🧩 Matrix C (按利率排序)")
+                st.write("### 🧩 Matrix C")
                 st.dataframe(apply_zebra_style(df_with_total), use_container_width=True, hide_index=True)
                 
                 st.divider()
                 st.write("### 🔍 明細")
                 if summary_payout_details:
-                    st.dataframe(apply_zebra_style(pd.DataFrame(summary_payout_details)), use_container_width=True, hide_index=True)
+                    # st.dataframe(apply_zebra_style(pd.DataFrame(summary_payout_details)), use_container_width=True, hide_index=True)
+                    det_df = pd.DataFrame(summary_payout_details)
+                    if not det_df.empty:
+                        # 1. 建立對照表，增加 .get() 的預設值 999 避免 NaN
+                        name_to_order = {v['name']: v.get('sort_order', 999) for v in agent_map.values()}
+                        
+                        # 2. 映射排序權重，使用 .fillna(999) 防止有人的姓名不在 agent_map 中導致報錯
+                        det_df['_sort'] = det_df['受款人'].map(name_to_order).fillna(999)
+                        
+                        # 3. 排序並過濾輔助欄位
+                        # 建議也把 '受款人' 放在前面排序，這樣同一人的明細會聚在一起
+                        det_df = det_df.sort_values(by=['_sort', '受款人']).drop(columns=['_sort'])
+                        
+                        st.dataframe(
+                            apply_zebra_style(det_df), 
+                            use_container_width=True, 
+                            hide_index=True
+                        )
                 
                 st.write("### 📄 明細紀錄")
                 if contract_flow_logs:
@@ -1852,6 +1904,38 @@ elif menu == "🌳 團隊組織圖":
             
     else:
         st.warning("目前尚無資料。")
+
+elif menu == "⚙️ 業務排序設定":
+    st.title("⚙️ 業務人員自定義排序")
+    st.info("💡 說明：在「排序權重」欄位輸入數字（數字越小，排名越靠前）。修改後請點擊左下角按鈕儲存。")
+
+    # 抓取目前的業務清單
+    query = "SELECT agent_id, name, rank_id, sort_order FROM agents ORDER BY sort_order ASC, agent_id ASC"
+    df_agents = pd.read_sql(query, conn)
+    
+    # 建立一個編輯器
+    edited_df = st.data_editor(
+        df_agents,
+        column_config={
+            "agent_id": None, # 隱藏 ID
+            "name": st.column_config.Column("業務姓名", disabled=True),
+            "rank_id": st.column_config.Column("職級ID", disabled=True),
+            "sort_order": st.column_config.NumberColumn("排序權重", help="數字越小排越前面", min_value=0, step=1)
+        },
+        hide_index=True,
+        use_container_width=True
+    )
+
+    if st.button("💾 儲存排序設定"):
+        try:
+            cursor = conn.cursor()
+            for index, row in edited_df.iterrows():
+                cursor.execute("UPDATE agents SET sort_order = ? WHERE agent_id = ?", (row['sort_order'], row['agent_id']))
+            conn.commit()
+            st.success("✅ 排序設定已成功同步至資料庫！")
+            st.rerun()
+        except Exception as e:
+            st.error(f"❌ 儲存失敗：{e}")
 
 st.markdown("---")
 st.caption(f"© 2026 Bing Xu. All Rights Reserved. | 投資管理系統 v{CURRENT_VERSION}")
