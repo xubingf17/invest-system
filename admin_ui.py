@@ -10,7 +10,7 @@ import calendar
 # import graphviz
 
 
-CURRENT_VERSION = "1.4.5"
+CURRENT_VERSION = "1.4.6"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -1580,24 +1580,29 @@ elif menu == "💰 業務佣":
                 diff_months = (end_f.year - start_dt.year) * 12 + (end_f.month - start_dt.month)
                 is_in_date_range = (start_f <= start_dt <= end_f)
                 
+                target_aid = aid
+                if row['職級'] in ['高專', '累件中', '外圍'] and pd.notna(row['boss_id']):
+                    target_aid = row['boss_id']
+                
                 # 過期或未開始則跳過
                 if diff_months < 0 or diff_months >= row['總期數']: continue
 
-                this_log = {"客戶": row['客戶姓名'], "業務": row['業務姓名'], "金額": amt, "生效日": row['生效日'], "分配明細": []}
+                # this_log = {"客戶": row['客戶姓名'], "業務": row['業務姓名'], "金額": amt, "生效日": row['生效日'], "分配明細": []}
+                this_log = {"客戶": row['客戶姓名'], "業務": agent_map[target_aid]['name'], "金額": amt, "生效日": row['生效日'], "分配明細": []}
 
                 # ✅ (A) 獎勵計算
                 for rule in st.session_state.extra_rules:
                     if plan == rule['plan'] and diff_months == rule['time'] and is_in_date_range:
                         rew_amt = round(amt * rule['bonus_rate'], 2)
-                        payouts[aid]['獎勵'] += rew_amt
-                        this_log["分配明細"].append(f"🎁獎勵({row['業務姓名']}):+{rew_amt}")
+                        # payouts[aid]['獎勵'] += rew_amt
+                        # payouts[target_aid]['獎勵'] += rew_amt
+                        # this_log["分配明細"].append(f"🎁獎勵({row['業務姓名']}):+{rew_amt}")
+                        payouts[target_aid]['獎勵'] += rew_amt 
+                        this_log["分配明細"].append(f"🎁獎勵({agent_map[target_aid]['name']}):+{rew_amt}")
 
                 # ✅ (B) 核心分潤與業績歸帳 (僅計算選定區間內的新業績)
                 if is_in_date_range:
-                    target_aid = aid
-                    if row['職級'] in ['高專', '累件中', '外圍'] and pd.notna(row['boss_id']):
-                        target_aid = row['boss_id']
-                    
+                    # target_aid = aid
                     base_agent = agent_map.get(target_aid)
                     if not base_agent: continue
                     
