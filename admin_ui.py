@@ -10,7 +10,7 @@ import calendar
 # import graphviz
 
 
-CURRENT_VERSION = "1.4.6"
+CURRENT_VERSION = "1.4.7"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -288,7 +288,7 @@ elif menu == "💰 收益發放試算":
         st.session_state.p_start_date = start_dt
         st.session_state.p_end_date = end_dt
 
-    # --- 2. 核心 SQL 查詢 ---
+    # --- 2. 核心 SQL 查詢（解開日期鎖定缺陷） ---
     query = f"""
     SELECT 
         c.name as 客戶姓名, b.name as 業務員, boss.name as 所屬主管,
@@ -300,33 +300,70 @@ elif menu == "💰 收益發放試算":
     JOIN agents b ON c.agent_id = b.agent_id
     LEFT JOIN agents boss ON b.boss_id = boss.agent_id
     JOIN rate_plans rp ON ic.plan_id = rp.plan_id
-    WHERE ic.start_date < '{start_dt.replace(day=1).isoformat()}' 
-      AND ic.end_date >= '{start_dt.isoformat()}'
+    WHERE ic.start_date <= '{end_dt.isoformat()}'   -- 🎯 只要在查詢結束日前生效的都要
+      AND ic.end_date >= '{start_dt.isoformat()}'   -- 🎯 且合約還沒過期的都要
     ORDER BY b.sort_order ASC, ic.start_date ASC
     """
     raw_df = pd.read_sql(query, conn)
 
-    # --- 3. 區間掃描 (核心邏輯) ---
-    if not raw_df.empty:
-        def is_payout_in_range(row, s_dt, e_dt):
-            target_day = pd.to_datetime(row['生效日']).day
-            curr = s_dt
-            while curr <= e_dt:
-                # 取得當前掃描月份的最後一天是幾號
-                _, last_day_of_month = calendar.monthrange(curr.year, curr.month)
+    # # --- 3. 區間掃描 (核心邏輯) ---
+    # if not raw_df.empty:
+    #     def is_payout_in_range(row, s_dt, e_dt):
+    #         target_day = pd.to_datetime(row['生效日']).day
+    #         curr = s_dt
+    #         while curr <= e_dt:
+    #             # 取得當前掃描月份的最後一天是幾號
+    #             _, last_day_of_month = calendar.monthrange(curr.year, curr.month)
                 
-                # 判定邏輯：
-                # 1. 日期完全吻合 (例如 5/31 對 31號)
-                # 2. 或者：該月比較小，且今天是該月最後一天，而單子是 31 號 (例如 4/30 對 31號)
-                if curr.day == target_day:
-                    return True
-                elif curr.day == last_day_of_month and target_day > last_day_of_month:
-                    return True
+    #             # 判定邏輯：
+    #             # 1. 日期完全吻合 (例如 5/31 對 31號)
+    #             # 2. 或者：該月比較小，且今天是該月最後一天，而單子是 31 號 (例如 4/30 對 31號)
+    #             if curr.day == target_day:
+    #                 return True
+    #             elif curr.day == last_day_of_month and target_day > last_day_of_month:
+    #                 return True
                     
-                curr += timedelta(days=1)
+    #             curr += timedelta(days=1)
+    #         return False
+
+    #     mask = raw_df.apply(lambda r: is_payout_in_range(r, start_dt, end_dt), axis=1)
+    #     raw_df = raw_df[mask].copy()
+
+        # --- 3. 區間掃描 (核心邏輯：修正跨月不一致問題) ---
+    # --- 3. 區間掃描 (核心邏輯：完美版) ---
+    if not raw_df.empty:
+        def is_payout_in_range_final(row, s_dt, e_dt):
+            start_date_raw = pd.to_datetime(row['生效日']).date()
+            target_day = int(start_date_raw.day)
+            
+            # 遍歷查詢區間內包含的所有「年-月」
+            current_yr_mo = (s_dt.year, s_dt.month)
+            end_yr_mo = (e_dt.year, e_dt.month)
+            
+            y, m = current_yr_mo
+            while (y, m) <= end_yr_mo:
+                # 🎯 核心防線：排除合約生效當月的發放 (新件當月不發利息)
+                if y == start_date_raw.year and m == start_date_raw.month:
+                    # 這是生效當月，跳過不計算
+                    pass
+                else:
+                    # 取得該月實際有幾天並計算借位
+                    _, last_day_of_month = calendar.monthrange(y, m)
+                    actual_payout_day = min(target_day, last_day_of_month)
+                    actual_payout_date = date(y, m, actual_payout_day)
+                    
+                    # 檢查算出來的發放日有沒有落在畫面選定的區間內
+                    if s_dt <= actual_payout_date <= e_dt:
+                        return True
+                
+                # 前進下個月
+                if m == 12: y += 1; m = 1
+                else: m += 1
+                    
             return False
 
-        mask = raw_df.apply(lambda r: is_payout_in_range(r, start_dt, end_dt), axis=1)
+        # 套用終極過濾邏輯
+        mask = raw_df.apply(lambda r: is_payout_in_range_final(r, start_dt, end_dt), axis=1)
         raw_df = raw_df[mask].copy()
 
     # --- 4. 進階篩選與狀態保留 (這就是你要的篩選功能) ---
