@@ -10,7 +10,7 @@ import calendar
 # import graphviz
 
 
-CURRENT_VERSION = "1.4.7"
+CURRENT_VERSION = "1.4.8"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -1785,7 +1785,7 @@ elif menu == "💰 業務佣":
                 st.warning("🌙 此區間無數據。")
 
 elif menu == "🌳 團隊組織圖":
-    st.title("🌳 團隊組織架構圖 (橫向排版)")
+    st.title("🌳 團隊組織架構圖")
     
     # 1. 執行 SQL 抓取關係
     query = """
@@ -1941,9 +1941,52 @@ elif menu == "🌳 團隊組織圖":
         st.write("")
 
         # 6. 文字版隸屬清單
+       # 6. 文字版隸屬清單
         with st.expander("📋 查看文字版隸屬清單"):
-            st.table(hierarchy_df.rename(columns={'employee':'業務姓名','boss':'直屬主管','rank':'職級'}).fillna("-(最高階主管)-"))
+            # 🎯 步驟 1：建立一個「主管 -> 直屬屬員」的快速對照表
+            boss_to_direct_children = {}
+            for _, row in hierarchy_df.iterrows():
+                if row['boss']:
+                    if row['boss'] not in boss_to_direct_children:
+                        boss_to_direct_children[row['boss']] = []
+                    boss_to_direct_children[row['boss']].append(row['employee'])
+
+            # 🎯 步驟 2：定義一個遞迴函式，用來數出某個人「下面所有的子孫代」
+            def count_all_descendants(name):
+                # 拿他的直屬屬員
+                direct_children = boss_to_direct_children.get(name, [])
+                total = len(direct_children) # 先加上直屬人數
+                
+                # 再去數他屬員下面的所有人（無限往下延伸）
+                for child in direct_children:
+                    total += count_all_descendants(child)
+                return total
+
+            # 🎯 步驟 3：複製一份 DataFrame 來做畫面顯示，並計算人數
+            display_df = hierarchy_df.copy()
             
+            # 算出每個人手下的直屬人數（僅供參考對照）
+            direct_counts = display_df['employee'].map(lambda x: len(boss_to_direct_children.get(x, [])))
+            
+            # 算出每個人手下的「傘下總人數」（直屬 + 所有的下線）
+            total_team_counts = display_df['employee'].map(count_all_descendants)
+            
+            # 🎯 步驟 4：把人數塞進表格欄位
+            display_df['直屬人數'] = direct_counts
+            display_df['團隊總人數(含下線所有子孫)'] = total_team_counts
+
+            # 🎯 步驟 5：排序（讓團隊大的人排在上面，找人更好找）
+            display_df = display_df.sort_values(by='團隊總人數(含下線所有子孫)', ascending=False)
+
+            # 更改名稱並填補空值顯示
+            display_df = display_df.rename(columns={
+                'employee': '業務姓名',
+                'boss': '直屬主管',
+                'rank': '職級'
+            }).fillna("-(最高階主管)-")
+
+            # 🎨 呈現優化後的表格
+            st.table(display_df[['業務姓名', '職級', '直屬主管', '直屬人數', '團隊總人數']])
     else:
         st.warning("目前尚無資料。")
 
