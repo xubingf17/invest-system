@@ -10,7 +10,7 @@ import calendar
 # import graphviz
 
 
-CURRENT_VERSION = "1.4.9"
+CURRENT_VERSION = "1.5.0"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -886,18 +886,38 @@ elif menu == "👤 客戶資料管理":
     if df_all_cust.empty:
         st.info("目前資料庫中尚無客戶資料。")
     else:
-        # --- 2. 頂部篩選面板 (影響下方的表格顯示) ---
+        # --- 2. 頂部篩選面板 (加上客戶數量顯示) ---
         st.subheader("🔍 篩選客戶名單")
-        agent_opts = ["全部"] + sorted(df_all_cust['業務姓名'].unique().tolist())
+        
+        # 🎯 步驟 1：算出每個業務員擁有的客戶數量
+        # 產生的對照表會像這樣：{'王小明': 23, '張三': 5, '⚠️ 未分配': 1}
+        agent_counts = df_all_cust['業務姓名'].value_counts().to_dict()
+        
+        # 🎯 步驟 2：組裝選單顯示用的文字，例如 "王小明 (23)"
+        # 排序時用原本的姓名排，這樣比較整齊
+        sorted_raw_agents = sorted(df_all_cust['業務姓名'].unique().tolist())
+        agent_opts_with_count = [
+            f"{name} ({agent_counts.get(name, 0)})" for name in sorted_raw_agents
+        ]
+        
+        # 加上全選選項
+        agent_opts = ["全部"] + agent_opts_with_count
+        
+        # 渲染下拉選單
         sel_agent = st.selectbox("請選擇業務員進行過濾：", agent_opts, key="filter_agent_top")
 
-        # 執行過濾邏輯
+        # 🎯 步驟 3：還原過濾邏輯 (要把 "王小明 (23)" 剝離回 "王小明")
         df_display = df_all_cust.copy()
         if sel_agent != "全部":
-            df_display = df_display[df_display['業務姓名'] == sel_agent]
+            # 用左括號 ' (' 把字串切開，前半段就是原本的業務姓名
+            real_agent_name = sel_agent.split(" (")[0]
+            df_display = df_display[df_display['業務姓名'] == real_agent_name]
+            st.write(f"📅 目前顯示：**{real_agent_name}** 的客戶 (共 {len(df_display)} 筆)")
+        else:
+            st.write(f"📅 目前顯示：**全部** 的客戶 (共 {len(df_display)} 筆)")
 
         # --- 3. 顯示客戶清單 (優化欄位寬度) ---
-        st.write(f"📅 目前顯示：**{sel_agent}** 的客戶 (共 {len(df_display)} 筆)")
+        # st.write(f"📅 目前顯示：**{sel_agent}** 的客戶 (共 {len(df_display)} 筆)")
         st.dataframe(
             apply_zebra_style(df_display), 
             use_container_width=False,
