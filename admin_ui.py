@@ -10,7 +10,7 @@ import calendar
 # import graphviz
 
 
-CURRENT_VERSION = "1.4.8"
+CURRENT_VERSION = "1.4.9"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -1973,10 +1973,10 @@ elif menu == "🌳 團隊組織圖":
             
             # 🎯 步驟 4：把人數塞進表格欄位
             display_df['直屬人數'] = direct_counts
-            display_df['團隊總人數(含下線所有子孫)'] = total_team_counts
+            display_df['團隊總人數'] = total_team_counts
 
             # 🎯 步驟 5：排序（讓團隊大的人排在上面，找人更好找）
-            display_df = display_df.sort_values(by='團隊總人數(含下線所有子孫)', ascending=False)
+            display_df = display_df.sort_values(by='團隊總人數', ascending=False)
 
             # 更改名稱並填補空值顯示
             display_df = display_df.rename(columns={
