@@ -10,7 +10,7 @@ import calendar
 # import graphviz
 
 
-CURRENT_VERSION = "1.5.0"
+CURRENT_VERSION = "1.5.1"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -474,7 +474,8 @@ elif menu == "📋 合約總覽":
     st.title("📋 合約總覽")
     
     # --- 1. 基礎資料與環境設定 ---
-    all_agents_df = pd.read_sql("SELECT agent_id, name FROM agents ORDER BY name", conn)
+    # all_agents_df = pd.read_sql("SELECT agent_id, name FROM agents ORDER BY name", conn)
+    all_agents_df = pd.read_sql("SELECT agent_id, name, sort_order FROM agents ORDER BY sort_order ASC, name ASC", conn)
     
     query = """
         SELECT 
@@ -595,6 +596,7 @@ elif menu == "📋 合約總覽":
             pass
 
         # --- 4. 🛠️ 快速維護區 ---
+        # --- 4. 🛠️ 快速維護區 ---
         st.divider()
         st.subheader("🛠️ 合約快速維護區")
         op_col1, op_col2 = st.columns(2)
@@ -619,43 +621,79 @@ elif menu == "📋 合約總覽":
                 det_df = pd.read_sql(detail_query, conn, params=(edit_id,))
                 if not det_df.empty:
                     info = det_df.iloc[0]
-                    st.info(f"📍 編輯：ID {edit_id} | 👤 客戶：{info['customer_name']}")
+                    st.info(f"📍 編輯：ID {edit_id} | 👤 當前單據客戶：{info['customer_name']}")
 
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        new_c_name = st.text_input("修正姓名", value=info['customer_name'])
-                    with c2:
-                        a_names = all_agents_df['name'].tolist()
-                        new_a_name = st.selectbox("變更業務", a_names, index=a_names.index(info['agent_name']))
-                        new_a_id = int(all_agents_df[all_agents_df['name'] == new_a_name]['agent_id'].values[0])
+                    # 1. 變更業務選單 (先渲染業務，因為客戶要跟它連動)
+                    # 🎯 這裡的業務清單也同步套用你的自定義權重排序
+                    ordered_agents_df = pd.read_sql("SELECT agent_id, name FROM agents ORDER BY sort_order ASC, name ASC", conn)
+                    a_names = ordered_agents_df['name'].tolist()
+                    
+                    curr_agent_name = info['agent_name']
+                    def_a_idx = a_names.index(curr_agent_name) if curr_agent_name in a_names else 0
+                    
+                    new_a_name = st.selectbox("變更業務", a_names, index=def_a_idx, key=f"edit_agent_sel_{edit_id}")
+                    new_a_id = int(ordered_agents_df[ordered_agents_df['name'] == new_a_name]['agent_id'].values[0])
 
+                    # 2. 修正姓名 (🎯 核心改造：連動選單，只抓選定業務底下的客戶)
+                    cust_query = "SELECT customer_id, name FROM customers WHERE agent_id = ? ORDER BY name"
+                    current_agent_customers = pd.read_sql(cust_query, conn, params=(new_a_id,))
+                    
+                    if not current_agent_customers.empty:
+                        # 組裝選單，例如 "張三 (ID: 15)"
+                        cust_opts = [f"{r['name']} (ID: {r['customer_id']})" for _, r in current_agent_customers.iterrows()]
+                        
+                        # 判斷這筆單原本的客戶是不是還在這個業務下面，在的話就預選它
+                        curr_cust_str = f"{info['customer_name']} (ID: {info['customer_id']})"
+                        def_c_idx = cust_opts.index(curr_cust_str) if curr_cust_str in cust_opts else 0
+                        
+                        selected_cust_opt = st.selectbox("修正姓名 (限選所選業務下之客戶)", cust_opts, index=def_c_idx, key=f"edit_cust_sel_{edit_id}")
+                        # 剖析解析出最終選中的真實 customer_id
+                        final_cust_id = int(selected_cust_opt.split("(ID: ")[1].split(")")[0])
+                    else:
+                        st.warning(f"⚠️ 業務【{new_a_name}】名下目前沒有建立任何客戶資料，請先前往『新增資料』建立客戶。")
+                        final_cust_id = None
+
+                    # 3. 變更方案與其他細節
                     plans_df = pd.read_sql("SELECT plan_id, plan_name, annual_rate, period_months FROM rate_plans", conn)
                     plans_df['display'] = plans_df['plan_name'] + " (" + plans_df['annual_rate'].astype(str) + "%)"
                     p_opts = plans_df['display'].tolist()
                     curr_p = f"{info['plan_name']} ({info['annual_rate']}%)"
-                    new_p_label = st.selectbox("變更方案", p_opts, index=p_opts.index(curr_p) if curr_p in p_opts else 0)
+                    new_p_label = st.selectbox("變更方案", p_opts, index=p_opts.index(curr_p) if curr_p in p_opts else 0, key=f"edit_plan_sel_{edit_id}")
                     
                     p_info = plans_df[plans_df['display'] == new_p_label].iloc[0]
                     new_p_id, new_p_m = int(p_info['plan_id']), int(p_info['period_months'])
 
-                    new_s_dt = st.date_input("開始日", value=pd.to_datetime(info['start_date']).date())
+                    new_s_dt = st.date_input("開始日", value=pd.to_datetime(info['start_date']).date(), key=f"edit_sdt_{edit_id}")
                     new_e_dt = new_s_dt + relativedelta(months=new_p_m)
                     st.caption(f"📅 自動計算結束日：**{new_e_dt}**")
 
                     amt_c, type_c = st.columns(2)
                     with amt_c:
-                        new_amt = st.number_input("金額", value=float(info['amount']/10000))
+                        new_amt = st.number_input("金額", value=float(info['amount']/10000), key=f"edit_amt_{edit_id}")
                     with type_c:
-                        new_type = st.radio("性質", ["新約", "續約"], index=0 if info['contract_type'] == "新約" else 1, horizontal=True)
+                        new_type = st.radio("性質", ["新約", "續約"], index=0 if info['contract_type'] == "新約" else 1, horizontal=True, key=f"edit_type_{edit_id}")
                     
-                    new_n = st.text_input("備註", value=str(info['note']) if info['note'] else "")
+                    new_n = st.text_input("備註", value=str(info['note']) if info['note'] else "", key=f"edit_note_{edit_id}")
                     
-                    if st.button("💾 儲存修正", use_container_width=True, type="primary"):
-                        conn.execute("UPDATE invest_contracts SET plan_id=?, amount=?, start_date=?, end_date=?, note=?, contract_type=? WHERE contract_id=?", 
-                                     (new_p_id, new_amt*10000, new_s_dt.isoformat(), new_e_dt.isoformat(), new_n, new_type, edit_id))
-                        conn.execute("UPDATE customers SET name=?, agent_id=? WHERE customer_id=?", 
-                                     (new_c_name, new_a_id, int(info['customer_id'])))
-                        conn.commit(); st.success("修正成功！"); time.sleep(1); st.rerun()
+                    # 4. 執行儲存
+                    if st.button("💾 儲存修正", use_container_width=True, type="primary", key=f"save_edit_btn_{edit_id}"):
+                        if final_cust_id is None:
+                            st.error("❌ 無法儲存：必須選擇有效的客戶姓名。")
+                        else:
+                            try:
+                                # 🎯 【核心修正：只更新這一單 invest_contracts 的 customer_id，不改動舊客戶名稱】
+                                conn.execute("""
+                                    UPDATE invest_contracts 
+                                    SET customer_id=?, plan_id=?, amount=?, start_date=?, end_date=?, note=?, contract_type=? 
+                                    WHERE contract_id=?
+                                """, (final_cust_id, new_p_id, new_amt*10000, new_s_dt.isoformat(), new_e_dt.isoformat(), new_n, new_type, edit_id))
+                                
+                                conn.commit()
+                                st.success("🎉 本單據合約資料已成功修正！")
+                                time.sleep(1)
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"❌ 修正失敗：{e}")
 
         with op_col2:
             st.markdown("##### ❌ 刪除合約紀錄")
@@ -931,17 +969,22 @@ elif menu == "👤 客戶資料管理":
         )
 
         # --- 4. 刪除客戶功能 (業務員連動版) ---
+        # --- 4. 🛠️ 維護與刪除客戶功能 (功能升級版) ---
         st.divider()
-        st.subheader("🗑️ 刪除客戶資料")
-        st.caption("流程：先選業務員 ➔ 再選該業務下的客戶 ➔ 系統檢查後刪除")
+        st.subheader("🛠️ 維護與刪除客戶資料")
+        st.caption("流程：先選業務員 ➔ 再選該業務下的客戶 ➔ 執行資料修正或永久刪除")
+
+        # 預載按權重排好序的業務清單，供編輯變更業務時使用
+        all_agents_ordered = pd.read_sql("SELECT agent_id, name FROM agents ORDER BY sort_order ASC, name ASC", conn)
+        ordered_agent_names = all_agents_ordered['name'].tolist()
 
         col_del1, col_del2 = st.columns(2)
         
         with col_del1:
-            # 這裡列出所有在資料庫中有客戶的業務員
+            # 這裡列出所有在資料庫中有客戶的業務員 (原本有客戶的)
             del_agent_list = sorted(df_all_cust['業務姓名'].unique().tolist())
             sel_del_agent = st.selectbox(
-                "1. 選擇該客戶的所屬業務", 
+                "1. 選擇該客戶的目前所屬業務", 
                 ["請選擇業務..."] + del_agent_list,
                 key="del_agent_step_1"
             )
@@ -955,7 +998,7 @@ elif menu == "👤 客戶資料管理":
                 
                 if not sub_list.empty:
                     cust_opts = [f"{r['客戶姓名']} (ID: {r['ID']})" for _, r in sub_list.iterrows()]
-                    selected_cust = st.selectbox("2. 選擇欲刪除的客戶", ["請選擇客戶..."] + cust_opts)
+                    selected_cust = st.selectbox("2. 選擇操作目標客戶", ["請選擇客戶..."] + cust_opts)
                     
                     if "請選擇" not in selected_cust:
                         target_id = int(selected_cust.split("(ID: ")[1].split(")")[0])
@@ -963,29 +1006,72 @@ elif menu == "👤 客戶資料管理":
                 else:
                     st.warning("⚠️ 該業務目前名下無客戶。")
             else:
-                st.selectbox("2. 選擇欲刪除的客戶", ["請先完成第一步"], disabled=True)
+                st.selectbox("2. 選擇操作目標客戶", ["請先完成第一步"], disabled=True)
 
-        # 執行刪除
+        # 🎯 當選定客戶後，展開「修改」與「刪除」的並排操作區
         if target_id:
-            st.error(f"即將刪除：**{target_name_only}** (業務：{sel_del_agent})")
-            if st.button("🔥 確認永久刪除此客戶", use_container_width=True):
-                try:
-                    # 安全檢查：若有合約則不給刪
-                    check_cnt = pd.read_sql(
-                        "SELECT COUNT(*) as n FROM invest_contracts WHERE customer_id = ?", 
-                        conn, params=(target_id,)
-                    ).iloc[0]['n']
-
-                    if check_cnt > 0:
-                        st.error(f"❌ 無法刪除：此客戶名下尚有 {check_cnt} 筆合約紀錄，請先移除合約。")
+            st.write("---")
+            op_tab1, op_tab2 = st.tabs(["📝 修正客戶資料", "🔥 永久刪除客戶"])
+            
+            # 【A. 編輯客戶面板】
+            with op_tab1:
+                # 撈取該客戶當前的詳細舊資料
+                cust_detail = pd.read_sql("SELECT name, agent_id, bank_info, note FROM customers WHERE customer_id = ?", conn, params=(target_id,)).iloc[0]
+                
+                # 找出目前業務的名字
+                curr_agent_name = df_all_cust[df_all_cust['ID'] == target_id]['業務姓名'].values[0]
+                
+                c1, c2 = st.columns(2)
+                with c1:
+                    edit_c_name = st.text_input("修正客戶姓名", value=cust_detail['name'], key=f"c_name_edit_{target_id}")
+                with c2:
+                    # 變更業務的下拉選單已套用自定義權重排序
+                    def_agent_idx = ordered_agent_names.index(curr_agent_name) if curr_agent_name in ordered_agent_names else 0
+                    edit_a_name = st.selectbox("變更所屬業務", ordered_agent_names, index=def_agent_idx, key=f"c_agent_edit_{target_id}")
+                    edit_a_id = int(all_agents_ordered[all_agents_ordered['name'] == edit_a_name]['agent_id'].values[0])
+                
+                edit_bank = st.text_input("修正銀行資訊", value=str(cust_detail['bank_info']) if cust_detail['bank_info'] else "", key=f"c_bank_edit_{target_id}")
+                edit_note = st.text_area("修正備註", value=str(cust_detail['note']) if cust_detail['note'] else "", key=f"c_note_edit_{target_id}")
+                
+                if st.button("💾 儲存修改內容", use_container_width=True, type="primary", key=f"save_cust_btn_{target_id}"):
+                    if not edit_c_name.strip():
+                        st.error("客戶姓名不能為空！")
                     else:
-                        conn.execute("DELETE FROM customers WHERE customer_id = ?", (target_id,))
-                        conn.commit()
-                        st.success(f"✅ 已成功移除客戶：{target_name_only}")
-                        time.sleep(1.5)
-                        st.rerun()
-                except Exception as e:
-                    st.error(f"❌ 刪除失敗：{e}")
+                        try:
+                            conn.execute(
+                                "UPDATE customers SET name = ?, agent_id = ?, bank_info = ?, note = ? WHERE customer_id = ?",
+                                (edit_c_name.strip(), edit_a_id, edit_bank.strip(), edit_note.strip(), target_id)
+                            )
+                            conn.commit()
+                            st.success(f"重新整理中... 已成功修正客戶：{edit_c_name}")
+                            time.sleep(1.2)
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"❌ 修正失敗：{e}")
+
+            # 【B. 刪除客戶面板】
+            with op_tab2:
+                st.error(f"⚠️ 警告：您即將永久刪除客戶 **{target_name_only}** (現屬業務：{sel_del_agent})")
+                st.caption("注意：若客戶名下仍有未結束的投資合約，系統將會拒絕刪除。")
+                
+                if st.button("🔥 確認永久刪除此客戶", use_container_width=True, key=f"del_cust_btn_{target_id}"):
+                    try:
+                        # 安全檢查：若有合約則不給刪
+                        check_cnt = pd.read_sql(
+                            "SELECT COUNT(*) as n FROM invest_contracts WHERE customer_id = ?", 
+                            conn, params=(target_id,)
+                        ).iloc[0]['n']
+
+                        if check_cnt > 0:
+                            st.error(f"❌ 無法刪除：此客戶名下尚有 {check_cnt} 筆合約紀錄，請先前往合約總覽移除合約。")
+                        else:
+                            conn.execute("DELETE FROM customers WHERE customer_id = ?", (target_id,))
+                            conn.commit()
+                            st.success(f"✅ 已成功移除客戶：{target_name_only}")
+                            time.sleep(1.5)
+                            st.rerun()
+                    except Exception as e:
+                        st.error(f"❌ 刪除失敗：{e}")
 
 # --- 4. 資料總覽 ---
 elif menu == "📋 資料總覽":
@@ -1021,8 +1107,9 @@ elif menu == "➕ 新增資料":
     if add_mode == "單筆手動填寫":
         st.info("💡 預設使用選單選擇舊客戶。若要建立新客戶，請勾選『手動輸入新客戶』。")
         
-        # 1. 抓取基礎資料
-        agent_df = pd.read_sql("SELECT agent_id, name FROM agents ORDER BY name", conn)
+        # 🎯 【修正 1：承辦業務員】從資料庫抓取時，強制加入 ORDER BY sort_order ASC
+        agent_df = pd.read_sql("SELECT agent_id, name FROM agents ORDER BY sort_order ASC, name ASC", conn)
+        
         plan_df = pd.read_sql("""
             SELECT 
                 plan_id, 
@@ -1031,7 +1118,7 @@ elif menu == "➕ 新增資料":
             FROM rate_plans
         """, conn)
 
-        # --- ⚡️ 第一層：選擇業務 (這決定了後面的客戶名單) ---
+        # --- ⚡️ 第一層：選擇業務 (現在選單順序已完美套用權重排序) ---
         sel_agent_name = st.selectbox(
             "💼 承辦業務員", 
             agent_df['name'] if not agent_df.empty else ["⚠️ 請先新增業務員"],
@@ -1041,14 +1128,12 @@ elif menu == "➕ 新增資料":
         # --- ⚡️ 第二層：客戶選擇邏輯 (選單與手動輸入切換) ---
         col_c1, col_c2 = st.columns([1, 2])
         with col_c1:
-            # 切換開關
             is_new_cust = st.checkbox("手動輸入新客戶", value=False)
         
         with col_c2:
             if is_new_cust:
                 target_cust_name = st.text_input("👤 請輸入新客戶姓名", placeholder="例如：王大明")
             else:
-                # 連動顯示該業務名下的舊客戶
                 if not agent_df.empty and sel_agent_name != "⚠️ 請先新增業務員":
                     t_agent_id = int(agent_df[agent_df['name'] == sel_agent_name]['agent_id'].values[0])
                     cust_df = pd.read_sql("SELECT name FROM customers WHERE agent_id = ? ORDER BY name", conn, params=(t_agent_id,))
@@ -1085,7 +1170,6 @@ elif menu == "➕ 新增資料":
             submit_btn = st.form_submit_button("🚀 確認送出合約", use_container_width=True, type="primary")
 
             if submit_btn:
-                # 基礎驗證
                 if not sel_agent_name or sel_agent_name == "⚠️ 請先新增業務員":
                     st.error("❌ 請先選擇業務員。")
                 elif not target_cust_name or "⚠️" in target_cust_name or target_cust_name == "請先選擇業務員":
@@ -1098,7 +1182,6 @@ elif menu == "➕ 新增資料":
                         final_agent_id = int(agent_df[agent_df['name'] == sel_agent_name]['agent_id'].values[0])
                         cust_name_clean = target_cust_name.strip()
 
-                        # 🔍 檢查並處理客戶 (不論手動還是選單，都過一次檢查最保險)
                         cursor.execute("SELECT customer_id FROM customers WHERE name = ? AND agent_id = ?", 
                                      (cust_name_clean, final_agent_id))
                         res = cursor.fetchone()
@@ -1106,19 +1189,16 @@ elif menu == "➕ 新增資料":
                         if res:
                             final_cust_id = res[0]
                         else:
-                            # 如果沒找到，自動建立 (這解決了手動輸入的問題)
                             cursor.execute("INSERT INTO customers (name, agent_id) VALUES (?, ?)", 
                                          (cust_name_clean, final_agent_id))
                             final_cust_id = cursor.lastrowid
 
-                        # 解析方案與日期
                         p_row = plan_df[plan_df['展示名稱'] == sel_plan_display]
                         p_id = int(p_row['plan_id'].values[0])
                         months = int(p_row['period_months'].values[0])
                         real_amount = amt_wan * 10000
                         end_dt = start_dt + relativedelta(months=months)
                         
-                        # 寫入合約
                         cursor.execute("""
                             INSERT INTO invest_contracts (
                                 customer_id, plan_id, amount, start_date, end_date, 
@@ -1140,7 +1220,6 @@ elif menu == "➕ 新增資料":
     else:
         st.write("### 🚀 批量匯入投資合約")
         
-        # --- 1. 下載範本 ---
         st.markdown("#### 📥 第一步：下載範本")
         today = date.today()
         roc_year = today.year - 1911
@@ -1163,15 +1242,12 @@ elif menu == "➕ 新增資料":
 
         st.divider()
 
-        # --- 2. 上傳與預檢 ---
         uploaded_file = st.file_uploader("選擇填寫好的 CSV 檔案", type="csv")
         
-        # ⚡️ 初始化 session_state 用來存儲錯誤
         if 'batch_errors' not in st.session_state:
             st.session_state.batch_errors = []
 
         if uploaded_file:
-            # 💡 當有新檔案上傳時，自動清空之前的錯誤紀錄
             if "last_file_name" not in st.session_state or st.session_state.last_file_name != uploaded_file.name:
                 st.session_state.batch_errors = []
                 st.session_state.last_file_name = uploaded_file.name
@@ -1201,7 +1277,6 @@ elif menu == "➕ 新增資料":
                 st.success("✅ 業務員預檢通過！")
                 st.dataframe(df_upload, use_container_width=True, hide_index=True)
                 
-                # --- 執行按鈕 ---
                 if st.button("🔥 確定執行智慧匯入", type="primary", use_container_width=True):
                     current_errors = [] 
                     cursor = conn.cursor()
@@ -1212,15 +1287,12 @@ elif menu == "➕ 新增資料":
                         cust_name = str(row['客戶姓名']).strip()
                         agent_name = str(row['歸屬業務姓名']).strip()
                         
-                        # 1. 取得業務 ID (已預檢必存在)
                         target_agent_id = db_agents_dict[agent_name]
 
-                        # 2. 處理合約性質
                         c_type = str(row.get('合約性質', '續約')).strip()
                         if not c_type or c_type == 'nan': c_type = "續約"
                         if c_type not in ["新約", "續約"]: c_type = "續約"
 
-                        # 3. 方案自動對照
                         try:
                             target_rate = float(row['年利率(%)'])
                             target_period = int(row['週期(月)'])
@@ -1233,7 +1305,6 @@ elif menu == "➕ 新增資料":
                             current_errors.append(f"❌ 行號 {row_idx}：利率或週期格式錯誤")
                             continue
 
-                        # 4. 日期與金額檢查
                         try:
                             y, m, d = int(row['生效年'])+1911, int(row['生效月']), int(row['生效日'])
                             s_dt = date(y, m, d)
@@ -1243,31 +1314,25 @@ elif menu == "➕ 新增資料":
                             current_errors.append(f"❌ 行號 {row_idx}：日期日期或金額格式錯誤")
                             continue
 
-                        # 5. ⚡️ 客戶處理 (防撞名邏輯：姓名 + 業務ID)
-                        # 檢查該業務名下是否已有同名客戶
                         check_cust = pd.read_sql(
                             "SELECT customer_id FROM customers WHERE name = ? AND agent_id = ?", 
                             conn, params=(cust_name, target_agent_id)
                         )
                         
                         if check_cust.empty:
-                            # 建立該業務員名下的新客戶
                             cursor.execute("INSERT INTO customers (name, agent_id) VALUES (?, ?)", (cust_name, target_agent_id))
                             conn.commit()
                             cust_id = cursor.lastrowid
                         else:
                             cust_id = int(check_cust['customer_id'][0])
 
-                        # 6. 寫入合約
                         cursor.execute("""
                             INSERT INTO invest_contracts (customer_id, plan_id, amount, start_date, end_date, status, note, contract_type, is_renewed)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
-                        """, (cust_id, p_id, real_amt, s_dt.isoformat(), e_dt.isoformat(), "Active", str(row.get('備註', '')), c_type))
+                            VALUES (?, ?, ?, ?, ?, 'Active', ?, ?, 0)
+                        """, (cust_id, p_id, real_amt, s_dt.isoformat(), e_dt.isoformat(), str(row.get('備註', '')), c_type))
                         success_count += 1
                     
                     conn.commit()
-                    
-                    # 💡 將錯誤存入 session_state 供 Rerun 後顯示
                     st.session_state.batch_errors = current_errors
                     
                     if not current_errors:
@@ -1278,11 +1343,9 @@ elif menu == "➕ 新增資料":
                     else:
                         st.warning(f"⚠️ 匯入完成，但發現 {len(current_errors)} 處錯誤 (已跳過該行)。")
 
-        # --- 3. 顯示錯誤清單 ---
         if st.session_state.batch_errors:
             st.divider()
             st.error("🚨 匯入異常報告 (請修正 CSV 後重新上傳)：")
-            # 使用 container 讓錯誤訊息排版整齊
             with st.container():
                 for err in st.session_state.batch_errors:
                     st.write(err)
@@ -1321,7 +1384,8 @@ elif menu == "➕ 新增資料":
             rank_query = pd.read_sql("SELECT rank_id, rank_name FROM ranks", conn)
             sel_rank = st.selectbox("分配職級", rank_query['rank_name'] if not rank_query.empty else ["請先新增職級"])
             
-            all_agents = pd.read_sql("SELECT agent_id, name FROM agents", conn)
+            # 🎯 【修正 2：新增業務員時的直屬主管】加入自定義排序 ORDER BY sort_order ASC
+            all_agents = pd.read_sql("SELECT agent_id, name FROM agents ORDER BY sort_order ASC, name ASC", conn)
             sel_boss = st.selectbox("直屬主管", ["None (最高主管)"] + all_agents['name'].tolist())
             
             if st.form_submit_button("確認建立業務"):
@@ -1343,7 +1407,10 @@ elif menu == "➕ 新增資料":
         with st.form("form_customer"):
             st.write("#### 新增客戶")
             c_name = st.text_input("客戶姓名")
-            agent_query = pd.read_sql("SELECT agent_id, name FROM agents", conn)
+            
+            # 🎯 【修正 3：新增客戶時的歸屬業務】加入自定義排序 ORDER BY sort_order ASC
+            agent_query = pd.read_sql("SELECT agent_id, name FROM agents ORDER BY sort_order ASC, name ASC", conn)
+            
             sel_agent = st.selectbox("歸屬業務", agent_query['name'] if not agent_query.empty else ["請先新增業務員"])
             bank = st.text_input("銀行資訊")
             c_note = st.text_area("備註") 
@@ -1362,7 +1429,7 @@ elif menu == "➕ 新增資料":
     # 4. 新增利率方案
     with tab_plan:
         with st.form("form_rate_plan"):
-            st.write("#### 設定投資方案參數")
+            st.write("#### 設定投資方案 parameters")
             p_name = st.text_input("方案名稱 (如：半年期穩健方案、一年期高利方案)")
             p_rate = st.number_input("年利率 (%)", min_value=0.0, max_value=100.0, value=6.0, step=0.1)
             p_period = st.number_input("合約週期 (月)", min_value=1, max_value=120, value=12)
@@ -1424,7 +1491,15 @@ elif menu == "📅 到期續約管理":
             # --- 3. 進階篩選面板 ---
             f_col1, f_col2 = st.columns(2)
             with f_col1:
-                sel_agents = st.multiselect("💼 篩選業務員", sorted(all_df['業務姓名'].unique().tolist()))
+                # 🎯 【核心修正：按照 sort_order 排序篩選業務員名單】
+                agent_weight_df = pd.read_sql("SELECT name FROM agents ORDER BY sort_order ASC, name ASC", conn)
+                ordered_agent_list = agent_weight_df['name'].tolist()
+                
+                # 僅留下目前到期合約中有出現的業務員，並維持權重順序
+                current_agents = all_df['業務姓名'].unique().tolist()
+                sorted_sel_agents = [name for name in ordered_agent_list if name in current_agents]
+                
+                sel_agents = st.multiselect("💼 篩選業務員", sorted_sel_agents)
                 sel_plans = st.multiselect("📈 篩選方案", sorted(all_df['方案(利率)'].unique().tolist()))
             with f_col2:
                 cust_pool = all_df[all_df['業務姓名'].isin(sel_agents)] if sel_agents else all_df
@@ -1542,16 +1617,13 @@ elif menu == "📅 到期續約管理":
 
             st.divider()
 
-            # --- 🚀 6. 已處理完成清單 (補回此處) ---
+            # --- 🚀 6. 已處理完成清單 ---
             st.subheader(f"✅ 已處理完成清單 ({len(done_df)} 筆)")
             if not done_df.empty:
                 done_df = done_df.sort_values(by='原結束日', ascending=False)
                 st.dataframe(apply_zebra_style(done_df[['客戶姓名', '業務姓名', '金額', '方案(利率)', '原結束日']]), use_container_width=True, hide_index=True)
             else:
                 st.info("💡 目前區間內尚無已處理完成的續約。")
-
-        else:
-            st.info(f"📅 在 {r_start} 到 {r_end} 之間沒有到期合約。")
 
 elif menu == "💰 業務佣":
     st.title("💰 C")
