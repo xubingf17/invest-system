@@ -10,7 +10,7 @@ import calendar
 # import graphviz
 
 
-CURRENT_VERSION = "1.5.2"
+CURRENT_VERSION = "1.5.3"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -1308,7 +1308,10 @@ elif menu == "➕ 新增資料":
                     success_count = 0
                     
                     # 🎯 智慧防線：預先拉出系統所有合法的方案利率清單 (加上 0.0 新約錨點)
+                    # 🎯 【完美升級版：智慧小數點校正防線】
+                    # 先將資料庫的合法利率通通拉出來，並強制四捨五入到小數點後兩位，確保對齊
                     db_valid_rates = pd.read_sql("SELECT DISTINCT annual_rate FROM rate_plans", conn)['annual_rate'].tolist()
+                    db_valid_rates = [round(float(r), 2) for r in db_valid_rates]
                     if 0.0 not in db_valid_rates:
                         db_valid_rates.insert(0, 0.0)
                     
@@ -1321,9 +1324,11 @@ elif menu == "➕ 新增資料":
                         c_type = str(row.get('合約性質', '續約')).strip()
                         if not c_type or c_type == 'nan': c_type = "續約"
 
-                        # 1. 🎯 【核心升級】解析並強制校正預檢「上次歷史利率」
+                        # 1. 🎯 解析並強制四捨五入校正「上次歷史利率」
                         try:
                             csv_prev_rate = float(row['上次歷史利率(%)']) if '上次歷史利率(%)' in row and pd.notna(row['上次歷史利率(%)']) else 0.0
+                            csv_prev_rate = round(csv_prev_rate, 2) # 💡 自動把 1.2 轉成 1.2，把 2 轉成 2.0 進行無縫對齊
+                            
                             # 檢查上次利率是否為合法利率
                             if csv_prev_rate not in db_valid_rates:
                                 current_errors.append(f"❌ 行號 {row_idx}：『上次歷史利率 ({csv_prev_rate}%)』並不存在於系統目前的利率方案設定中，請檢查是否輸入錯誤！")
@@ -1332,12 +1337,13 @@ elif menu == "➕ 新增資料":
                             current_errors.append(f"❌ 行號 {row_idx}：『上次歷史利率』格式錯誤 (請輸入純數字，如 1.5)")
                             continue
 
-                        # 2. 解析並預檢「本次方案利率」與週期
+                        # 2. 🎯 解析並強制四捨五入校正「本次方案利率」與週期
                         try:
                             target_rate = float(row['年利率(%)'])
+                            target_rate = round(target_rate, 2) # 💡 自動把整數 2 轉成 2.0 對齊
                             target_period = int(row['週期(月)'])
                             
-                            # 加強防線：檢查本次利率是否合法
+                            # 檢查本次利率是否合法
                             if target_rate not in db_valid_rates:
                                 current_errors.append(f"❌ 行號 {row_idx}：『年利率 ({target_rate}%)』在系統中找不到對應的方案設定")
                                 continue
@@ -1388,15 +1394,61 @@ elif menu == "➕ 新增資料":
                     else:
                         st.warning(f"⚠️ 匯入完成，但因利率或格式不符，自動攔截並跳過了 {len(current_errors)} 處錯誤。")
 
+        # --- 🎯 核心升級：精美表格化呈現匯入異常報告，並支援錯誤下載 ---
         if st.session_state.batch_errors:
             st.divider()
-            st.error("🚨 匯入異常報告 (請修正 CSV 後重新上傳)：")
-            with st.container():
-                for err in st.session_state.batch_errors:
-                    st.write(err)
-            if st.button("🗑️ 清除錯誤訊息"):
-                st.session_state.batch_errors = []
-                st.rerun()
+            st.error("🚨 批量匯入異常報告 (系統已自動攔截並跳過以下不成功單據)：")
+            st.caption("💡 提示：您可以點擊下方按鈕將錯誤清單下載成 CSV，方便對照原 Excel 檔案進行修正。")
+
+            # 1. 將錯誤訊息陣列拆解、組裝成結構化的 DataFrame
+            error_data = []
+            for err_msg in st.session_state.batch_errors:
+                # 嘗試從文字中解析出列號
+                import re
+                row_match = re.search(r"行號\s*(\d+)", err_msg)
+                row_num = f"第 {row_match.group(1)} 行" if row_match else "未知行"
+                
+                # 清除掉訊息前方的 ❌ 符號保持表格乾淨
+                clean_msg = err_msg.replace("❌ ", "")
+                # 如果有抓到行號，把行號字眼從詳細原因中拿掉
+                if row_match:
+                    clean_msg = re.sub(r"行號\s*\d+：", "", clean_msg)
+
+                error_data.append({
+                    "Excel 位置": row_num,
+                    "系統攔截原因 / 格式不符明細": clean_msg
+                })
+            
+            df_errors = pd.DataFrame(error_data)
+
+            # 2. 以強制置中、斑馬線表格呈現錯誤明細
+            st.dataframe(
+                apply_zebra_style(df_errors),
+                use_container_width=True,
+                hide_index=True,
+                height=300,
+                column_config={
+                    "Excel 位置": st.column_config.TextColumn("Excel 位置", width="medium"),
+                    "系統攔截原因 / 格式不符明細": st.column_config.TextColumn("系統攔截原因 / 格式不符明細", width="large")
+                }
+            )
+
+            # 3. 提供一鍵導出錯誤 CSV 功能
+            csv_err = df_errors.to_csv(index=False).encode('utf-8-sig')
+            
+            col_err1, col_err2 = st.columns([4, 1])
+            with col_err1:
+                st.download_button(
+                    "📥 下載本次不成功明細 (CSV 對帳表)", 
+                    csv_err, 
+                    f"import_errors_{date.today()}.csv", 
+                    "text/csv", 
+                    use_container_width=True
+                )
+            with col_err2:
+                if st.button("🗑️ 清除報告", use_container_width=True):
+                    st.session_state.batch_errors = []
+                    st.rerun()
 
     # --- 第二部分：建立基礎對象 ---
     st.markdown("### 2. 建立基礎對象")
