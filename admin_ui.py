@@ -10,7 +10,7 @@ import calendar
 # import graphviz
 
 
-CURRENT_VERSION = "1.5.1"
+CURRENT_VERSION = "1.5.2"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -162,6 +162,16 @@ def force_add_columns(conn):
     # 這行非常重要，它能把所有「隱形成空值」的舊資料全部校正回 0
     conn.execute("UPDATE invest_contracts SET is_renewed = 0 WHERE is_renewed IS NULL")
     conn.commit()
+
+    cursor.execute("PRAGMA table_info(invest_contracts)")
+    contract_cols = [row[1] for row in cursor.fetchall()]
+    
+    if 'parent_contract_id' not in contract_cols:
+        conn.execute("ALTER TABLE invest_contracts ADD COLUMN parent_contract_id INTEGER;")
+        conn.commit()
+    if 'prev_annual_rate' not in contract_cols:
+        conn.execute("ALTER TABLE invest_contracts ADD COLUMN prev_annual_rate REAL;")
+        conn.commit()
     
     # st.toast("資料庫結構檢查完成", icon="🔍")
 
@@ -473,8 +483,7 @@ elif menu == "💰 收益發放試算":
 elif menu == "📋 合約總覽":
     st.title("📋 合約總覽")
     
-    # --- 1. 基礎資料與環境設定 ---
-    # all_agents_df = pd.read_sql("SELECT agent_id, name FROM agents ORDER BY name", conn)
+    # --- 1. 基礎資料與環境設定 (補上撈取 prev_annual_rate) ---
     all_agents_df = pd.read_sql("SELECT agent_id, name, sort_order FROM agents ORDER BY sort_order ASC, name ASC", conn)
     
     query = """
@@ -487,6 +496,7 @@ elif menu == "📋 合約總覽":
             ic.amount / 10000.0 as '金額', 
             rp.plan_name as 方案名稱, 
             rp.annual_rate as '利率',
+            ic.prev_annual_rate as 上次利率,
             ic.start_date as 開始日, 
             ic.end_date as 結束日, 
             ic.note as 備註
@@ -512,7 +522,6 @@ elif menu == "📋 合約總覽":
     # --- 2. 進階篩選面板 ---
     with st.expander("🔍 進階篩選面板", expanded=True):
         col_f1, col_f2 = st.columns(2)
-        
         show_expired = st.session_state.get("show_exp_key", False)
 
         with col_f1:
@@ -536,7 +545,6 @@ elif menu == "📋 合約總覽":
             else:
                 date_range = (date.today(), date.today())
 
-        # 💡 新增：備註關鍵字搜尋框
         search_note = st.text_input("📝 搜尋備註內容", placeholder="請輸入關鍵字...")
 
         st.write("---")
@@ -551,6 +559,10 @@ elif menu == "📋 合約總覽":
             st.write("") 
             show_expired = st.checkbox("顯示已過期合約", value=False, key="show_exp_key")
 
+    # 🎯 核心控制：是否展開顯示上一期利率
+    st.write("---")
+    show_prev_rate_table = st.checkbox("🔍 顯示歷史上一期利率比對欄位", value=False)
+
     # --- 3. 執行過濾與顯示 ---
     if not df_raw.empty:
         df_display = df_raw.copy()
@@ -562,25 +574,29 @@ elif menu == "📋 合約總覽":
             df_display = df_display[(df_display['開始日'] >= date_range[0]) & (df_display['開始日'] <= date_range[1])]
         if filter_type != "全部": df_display = df_display[df_display['類型'] == filter_type]
         if filter_status != "全部": df_display = df_display[df_display['狀態'] == filter_status]
-        
-        # 💡 執行備註關鍵字過濾
         if search_note:
             df_display = df_display[df_display['備註'].str.contains(search_note, case=False, na=False, regex=False)]
 
         total_wan = df_display['金額'].sum()
         display_total = f"{total_wan/10000:.4f} 億" if total_wan >= 10000 else f"{total_wan:,.0f} 萬"
-        st.divider()
+        
         m1, m2 = st.columns(2)
         m1.metric("符合條件筆數", f"{len(df_display)} 筆")
         m2.metric("篩選總金額 (NT$)", display_total)
 
+        # 根據勾選決定是否在 Dataframe 中渲染「上次利率」
+        cols_to_render = ['ID', '客戶姓名', '業務員', '類型', '金額', '方案名稱', '利率', '開始日', '結束日', '備註', '狀態']
+        if show_prev_rate_table:
+            cols_to_render.insert(7, '上次利率') # 插在利率後面
+
         event = st.dataframe(
-            df_display.drop(columns=['agent_id', '方案(利率)', '方案名稱']), 
+            df_display[cols_to_render], 
             use_container_width=True, 
             hide_index=True,
             column_config={
                 "ID": st.column_config.NumberColumn("ID", width=60, format="%d"),
-                "利率": st.column_config.NumberColumn("利率", format="%.1f%%")
+                "利率": st.column_config.NumberColumn("本次利率", format="%.1f%%"),
+                "上次利率": st.column_config.NumberColumn("上次利率", format="%.1f%%")
             },
             on_select="rerun",
             selection_mode="single-row",
@@ -595,12 +611,9 @@ elif menu == "📋 合約總覽":
         except:
             pass
 
-        # --- 4. 🛠️ 快速維護區 ---
-        # --- 4. 🛠️ 快速維護區 ---
-        st.divider()
+        # --- 4. 🛠️ 快速維護區 (升級支援本次/上次利率修正) ---
         st.subheader("🛠️ 合約快速維護區")
         op_col1, op_col2 = st.columns(2)
-
         id_list = df_display['ID'].tolist()
         current_idx = id_list.index(auto_selected_id) + 1 if auto_selected_id in id_list else 0
 
@@ -623,43 +636,30 @@ elif menu == "📋 合約總覽":
                     info = det_df.iloc[0]
                     st.info(f"📍 編輯：ID {edit_id} | 👤 當前單據客戶：{info['customer_name']}")
 
-                    # 1. 變更業務選單 (先渲染業務，因為客戶要跟它連動)
-                    # 🎯 這裡的業務清單也同步套用你的自定義權重排序
                     ordered_agents_df = pd.read_sql("SELECT agent_id, name FROM agents ORDER BY sort_order ASC, name ASC", conn)
                     a_names = ordered_agents_df['name'].tolist()
-                    
                     curr_agent_name = info['agent_name']
                     def_a_idx = a_names.index(curr_agent_name) if curr_agent_name in a_names else 0
-                    
                     new_a_name = st.selectbox("變更業務", a_names, index=def_a_idx, key=f"edit_agent_sel_{edit_id}")
                     new_a_id = int(ordered_agents_df[ordered_agents_df['name'] == new_a_name]['agent_id'].values[0])
 
-                    # 2. 修正姓名 (🎯 核心改造：連動選單，只抓選定業務底下的客戶)
                     cust_query = "SELECT customer_id, name FROM customers WHERE agent_id = ? ORDER BY name"
                     current_agent_customers = pd.read_sql(cust_query, conn, params=(new_a_id,))
-                    
                     if not current_agent_customers.empty:
-                        # 組裝選單，例如 "張三 (ID: 15)"
                         cust_opts = [f"{r['name']} (ID: {r['customer_id']})" for _, r in current_agent_customers.iterrows()]
-                        
-                        # 判斷這筆單原本的客戶是不是還在這個業務下面，在的話就預選它
                         curr_cust_str = f"{info['customer_name']} (ID: {info['customer_id']})"
                         def_c_idx = cust_opts.index(curr_cust_str) if curr_cust_str in cust_opts else 0
-                        
-                        selected_cust_opt = st.selectbox("修正姓名 (限選所選業務下之客戶)", cust_opts, index=def_c_idx, key=f"edit_cust_sel_{edit_id}")
-                        # 剖析解析出最終選中的真實 customer_id
+                        selected_cust_opt = st.selectbox("修正姓名", cust_opts, index=def_c_idx, key=f"edit_cust_sel_{edit_id}")
                         final_cust_id = int(selected_cust_opt.split("(ID: ")[1].split(")")[0])
                     else:
-                        st.warning(f"⚠️ 業務【{new_a_name}】名下目前沒有建立任何客戶資料，請先前往『新增資料』建立客戶。")
+                        st.warning(f"⚠️ 業務【{new_a_name}】名下沒有客戶。")
                         final_cust_id = None
 
-                    # 3. 變更方案與其他細節
                     plans_df = pd.read_sql("SELECT plan_id, plan_name, annual_rate, period_months FROM rate_plans", conn)
                     plans_df['display'] = plans_df['plan_name'] + " (" + plans_df['annual_rate'].astype(str) + "%)"
                     p_opts = plans_df['display'].tolist()
                     curr_p = f"{info['plan_name']} ({info['annual_rate']}%)"
                     new_p_label = st.selectbox("變更方案", p_opts, index=p_opts.index(curr_p) if curr_p in p_opts else 0, key=f"edit_plan_sel_{edit_id}")
-                    
                     p_info = plans_df[plans_df['display'] == new_p_label].iloc[0]
                     new_p_id, new_p_m = int(p_info['plan_id']), int(p_info['period_months'])
 
@@ -669,27 +669,63 @@ elif menu == "📋 合約總覽":
 
                     amt_c, type_c = st.columns(2)
                     with amt_c:
-                        new_amt = st.number_input("金額", value=float(info['amount']/10000), key=f"edit_amt_{edit_id}")
+                        new_amt = st.number_input("金額(萬)", value=float(info['amount']/10000), key=f"edit_amt_{edit_id}")
                     with type_c:
                         new_type = st.radio("性質", ["新約", "續約"], index=0 if info['contract_type'] == "新約" else 1, horizontal=True, key=f"edit_type_{edit_id}")
                     
+                    # 🎯 增設上次利率手動覆寫修正欄位
+                    # 🎯 增設上次利率手動覆寫修正欄位 (改用智慧選單防呆)
+                    st.markdown("##### 🔍 歷史利率人工覆寫校正")
+                    
+                    # 智慧提取：自動從資料庫現有的所有方案中撈取合理的利率數字，確保不會打錯字
+                    existing_rates = pd.read_sql("SELECT DISTINCT annual_rate FROM rate_plans ORDER BY annual_rate ASC", conn)['annual_rate'].tolist()
+                    # 強制加入 0.0 代表沒有歷史合約(新約單)
+                    if 0.0 not in existing_rates:
+                        existing_rates.insert(0, 0.0)
+                    
+                    # 格式化成選單文字，例如 "1.70 %"、"0.00 % (新約件)"
+                    rate_options_display = [f"{r:.2f} %" if r > 0 else "0.00 % (新約件)" for r in existing_rates]
+                    rate_mapping = dict(zip(rate_options_display, existing_rates))
+
+                    rate_c1, rate_c2 = st.columns(2)
+                    with rate_c1:
+                        st.caption("本次合約方案預設利率")
+                        st.subheader(f"✨ {p_info['annual_rate']}%")
+                    with rate_c2:
+                        # 取得當前這單的上次利率舊值
+                        current_db_prev_rate = float(info['prev_annual_rate']) if pd.notna(info['prev_annual_rate']) else 0.0
+                        
+                        # 自動幫使用者在選單中對齊預選目前的數值，找不到就預設留在一開始的 0.0
+                        def_rate_display_str = f"{current_db_prev_rate:.2f} %" if current_db_prev_rate > 0 else "0.00 % (新約件)"
+                        try:
+                            def_rate_select_idx = rate_options_display.index(def_rate_display_str)
+                        except ValueError:
+                            def_rate_select_idx = 0
+                            
+                        selected_rate_str = st.selectbox(
+                            "⏮️ 請選擇歷史上一期利率", 
+                            options=rate_options_display, 
+                            index=def_rate_select_idx,
+                            key=f"edit_prev_rate_selectbox_{edit_id}"
+                        )
+                        # 解析回實際的真實浮點數
+                        final_prev_rate_num = float(rate_mapping[selected_rate_str])
+
                     new_n = st.text_input("備註", value=str(info['note']) if info['note'] else "", key=f"edit_note_{edit_id}")
                     
-                    # 4. 執行儲存
                     if st.button("💾 儲存修正", use_container_width=True, type="primary", key=f"save_edit_btn_{edit_id}"):
                         if final_cust_id is None:
-                            st.error("❌ 無法儲存：必須選擇有效的客戶姓名。")
+                            st.error("❌ 無法儲存：必須選擇有效的客戶。")
                         else:
                             try:
-                                # 🎯 【核心修正：只更新這一單 invest_contracts 的 customer_id，不改動舊客戶名稱】
+                                # 將變數代入最後解析出的 final_prev_rate_num
                                 conn.execute("""
                                     UPDATE invest_contracts 
-                                    SET customer_id=?, plan_id=?, amount=?, start_date=?, end_date=?, note=?, contract_type=? 
+                                    SET customer_id=?, plan_id=?, amount=?, start_date=?, end_date=?, note=?, contract_type=?, prev_annual_rate=?
                                     WHERE contract_id=?
-                                """, (final_cust_id, new_p_id, new_amt*10000, new_s_dt.isoformat(), new_e_dt.isoformat(), new_n, new_type, edit_id))
-                                
+                                """, (final_cust_id, new_p_id, new_amt*10000, new_s_dt.isoformat(), new_e_dt.isoformat(), new_n, new_type, final_prev_rate_num, edit_id))
                                 conn.commit()
-                                st.success("🎉 本單據合約資料已成功修正！")
+                                st.success("🎉 本單據合約與歷史利率資料已成功修正！")
                                 time.sleep(1)
                                 st.rerun()
                             except Exception as e:
@@ -698,14 +734,12 @@ elif menu == "📋 合約總覽":
         with op_col2:
             st.markdown("##### ❌ 刪除合約紀錄")
             del_id = st.selectbox("1. 選擇要刪除的 ID", ["請選擇..."] + id_list, index=current_idx, key=f"del_ui_{auto_selected_id}")
-            
             if del_id != "請選擇...":
                 row = df_display[df_display['ID'] == del_id].iloc[0]
                 st.error(f"⚠️ 警告：即將刪除合約 ID {del_id}")
                 st.write(f"客戶：{row['客戶姓名']} | 金額：{row['金額']} 萬")
                 st.write("---")
                 is_confirmed = st.checkbox(f"我已確認要永久刪除此筆資料", key=f"confirm_del_{del_id}")
-                
                 if is_confirmed:
                     if st.button(f"🔥 確定刪除 ID:{del_id}", type="primary", use_container_width=True):
                         conn.execute("DELETE FROM invest_contracts WHERE contract_id=?", (del_id,))
@@ -1105,27 +1139,15 @@ elif menu == "➕ 新增資料":
     add_mode = st.radio("選擇合約錄入方式", ["單筆手動填寫", "批量 CSV 上傳"], horizontal=True)
 
     if add_mode == "單筆手動填寫":
-        st.info("💡 預設使用選單選擇舊客戶。若要建立新客戶，請勾選『手動輸入新客戶』。")
+        st.info("💡 說明：若合約性質為「續約」，請務必選擇「上次利率」，以供系統自動連結歷史軌跡並對帳利變加碼。")
         
-        # 🎯 【修正 1：承辦業務員】從資料庫抓取時，強制加入 ORDER BY sort_order ASC
         agent_df = pd.read_sql("SELECT agent_id, name FROM agents ORDER BY sort_order ASC, name ASC", conn)
-        
-        plan_df = pd.read_sql("""
-            SELECT 
-                plan_id, 
-                plan_name || ' (' || annual_rate || '%)' as 展示名稱,
-                period_months 
-            FROM rate_plans
-        """, conn)
+        plan_df = pd.read_sql("SELECT plan_id, plan_name || ' (' || annual_rate || '%)' as 展示名稱, period_months FROM rate_plans ORDER BY annual_rate ASC", conn)
 
-        # --- ⚡️ 第一層：選擇業務 (現在選單順序已完美套用權重排序) ---
-        sel_agent_name = st.selectbox(
-            "💼 承辦業務員", 
-            agent_df['name'] if not agent_df.empty else ["⚠️ 請先新增業務員"],
-            key="agent_select_main"
-        )
+        # 承辦業務員選單
+        sel_agent_name = st.selectbox("💼 承辦業務員", agent_df['name'] if not agent_df.empty else ["⚠️ 請先新增業務員"], key="agent_select_main")
 
-        # --- ⚡️ 第二層：客戶選擇邏輯 (選單與手動輸入切換) ---
+        # 客戶選擇邏輯
         col_c1, col_c2 = st.columns([1, 2])
         with col_c1:
             is_new_cust = st.checkbox("手動輸入新客戶", value=False)
@@ -1144,29 +1166,38 @@ elif menu == "➕ 新增資料":
         if 'default_amt' not in st.session_state:
             st.session_state.default_amt = None
 
-        # --- ⚡️ 第三層：合約細節表單 ---
+        # --- 手動填寫表單區 ---
         with st.form("single_contract_combined", clear_on_submit=True):
             col_amt, col_plan = st.columns(2)
             with col_amt:
-                amt_wan = st.number_input(
-                    "💰 投資金額", 
-                    min_value=0.0, 
-                    value=st.session_state.default_amt, 
-                    step=10.0,
-                    placeholder="請輸入金額...",
-                    key="amt_wan_input"
-                )
+                amt_wan = st.number_input("💰 投資金額 (萬)", min_value=0.0, value=st.session_state.default_amt, step=10.0, placeholder="請輸入金額...", key="amt_wan_input")
             with col_plan:
-                sel_plan_display = st.selectbox("📈 選擇方案 (利率)", plan_df['展示名稱'] if not plan_df.empty else ["⚠️ 請先設定方案"])
+                sel_plan_display = st.selectbox("📈 選擇方案 (本次利率)", plan_df['展示名稱'] if not plan_df.empty else ["⚠️ 請先設定方案"])
 
-            col_date, col_type = st.columns(2)
+            # 🎯 核心升級：日期、性質、以及歷史利率選單防呆
+            col_date, col_type, col_prev_rate = st.columns(3)
             with col_date:
                 start_dt = st.date_input("📅 生效日期", date.today())
             with col_type:
                 contract_type_val = st.radio("📄 合約性質", ["新約", "續約"], index=1, horizontal=True)
+            with col_prev_rate:
+                # 智慧提取系統內所有合法利率數字作為選單，避免打錯字
+                existing_rates = pd.read_sql("SELECT DISTINCT annual_rate FROM rate_plans ORDER BY annual_rate ASC", conn)['annual_rate'].tolist()
+                if 0.0 not in existing_rates:
+                    existing_rates.insert(0, 0.0)
+                
+                rate_options_display = [f"{r:.2f} %" if r > 0 else "0.00 % (新約件)" for r in existing_rates]
+                rate_mapping = dict(zip(rate_options_display, existing_rates))
+                
+                # 預設留在 0.0% 如果點選新約；留在非 0 數字如果點選續約（防呆提示）
+                def_idx = 0
+                if contract_type_val == "續約" and len(rate_options_display) > 1:
+                    def_idx = 1 # 預設選取第一個非零利率供參考
+                    
+                selected_prev_rate_str = st.selectbox("⏮️ 請選擇歷史上一期利率", options=rate_options_display, index=def_idx)
+                final_prev_rate_num = float(rate_mapping[selected_prev_rate_str])
             
             note_val = st.text_input("🗒️ 合約備註 (選填)")
-            
             submit_btn = st.form_submit_button("🚀 確認送出合約", use_container_width=True, type="primary")
 
             if submit_btn:
@@ -1182,15 +1213,11 @@ elif menu == "➕ 新增資料":
                         final_agent_id = int(agent_df[agent_df['name'] == sel_agent_name]['agent_id'].values[0])
                         cust_name_clean = target_cust_name.strip()
 
-                        cursor.execute("SELECT customer_id FROM customers WHERE name = ? AND agent_id = ?", 
-                                     (cust_name_clean, final_agent_id))
+                        cursor.execute("SELECT customer_id FROM customers WHERE name = ? AND agent_id = ?", (cust_name_clean, final_agent_id))
                         res = cursor.fetchone()
-                        
-                        if res:
-                            final_cust_id = res[0]
+                        if res: final_cust_id = res[0]
                         else:
-                            cursor.execute("INSERT INTO customers (name, agent_id) VALUES (?, ?)", 
-                                         (cust_name_clean, final_agent_id))
+                            cursor.execute("INSERT INTO customers (name, agent_id) VALUES (?, ?)", (cust_name_clean, final_agent_id))
                             final_cust_id = cursor.lastrowid
 
                         p_row = plan_df[plan_df['展示名稱'] == sel_plan_display]
@@ -1199,49 +1226,48 @@ elif menu == "➕ 新增資料":
                         real_amount = amt_wan * 10000
                         end_dt = start_dt + relativedelta(months=months)
                         
+                        # 儲存手動單，並寫入歷史利率數字
                         cursor.execute("""
                             INSERT INTO invest_contracts (
                                 customer_id, plan_id, amount, start_date, end_date, 
-                                status, note, contract_type, is_renewed
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
-                        """, (
-                            final_cust_id, p_id, real_amount, start_dt.isoformat(), 
-                            end_dt.isoformat(), "Active", note_val, contract_type_val
-                        ))
+                                status, note, contract_type, is_renewed, prev_annual_rate
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+                        """, (final_cust_id, p_id, real_amount, start_dt.isoformat(), end_dt.isoformat(), "Active", note_val, contract_type_val, final_prev_rate_num))
                         
                         conn.commit()
                         st.session_state.default_amt = None
                         st.balloons()
-                        st.success(f"🎉 成功！已為【{cust_name_clean}】建立合約。")
+                        st.success(f"🎉 成功！已為【{cust_name_clean}】手動建立合約並鏈結上一期利率為 {final_prev_rate_num}%。")
                         time.sleep(1)
                         st.rerun()
                     except Exception as e:
                         st.error(f"❌ 系統錯誤：{e}")
     else:
+        # --- 🚀 批量匯入投資合約 (CSV/Excel Input 擴充版) ---
         st.write("### 🚀 批量匯入投資合約")
-        
         st.markdown("#### 📥 第一步：下載範本")
         today = date.today()
         roc_year = today.year - 1911
         
+        # 🎯 核心升級：批量範本增加「上次歷史利率(%)」欄位說明
         template_df = pd.DataFrame({
-            "客戶姓名": ["王小明", "李大華"],
-            "歸屬業務姓名": ["張經理", "李襄理"],
-            "年利率(%)": [6.0, 8.5],
-            "週期(月)": [12, 24],
+            "客戶姓名": ["王ＸＸ", "徐ＸＸ"],
+            "歸屬業務姓名": ["張先生", "李小姐"],
+            "利率(%)": [1.2, 2.0],
+            "週期(月)": [6, 12],
             "金額": [100.0, 50.0],
             "生效年": [roc_year, roc_year],
             "生效月": [today.month, today.month],
             "生效日": [today.day, today.day],
             "合約性質": ["續約", "新約"],
-            "備註": ["續約件", "新件"]
+            "上次歷史利率(%)": [1.5, 0.0], # 🎯 新增利變對帳欄位
+            "備註": ["看自己想備註什麼", "看自己想備註什麼"]
         })
         
         csv_data = template_df.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下載批量匯入範本 (CSV)", csv_data, "合約匯入範本_v1.5.csv", "text/csv")
+        st.download_button("📥 下載批量匯入範本 (CSV)", csv_data, "合約匯入範本_v1.6.csv", "text/csv")
 
         st.divider()
-
         uploaded_file = st.file_uploader("選擇填寫好的 CSV 檔案", type="csv")
         
         if 'batch_errors' not in st.session_state:
@@ -1264,7 +1290,6 @@ elif menu == "➕ 新增資料":
                 df_upload['歸屬業務姓名'] = df_upload['歸屬業務姓名'].astype(str).str.strip()
                 df_upload['客戶姓名'] = df_upload['客戶姓名'].astype(str).str.strip()
 
-                # A. 業務員預檢
                 db_agents_df = pd.read_sql("SELECT agent_id, name FROM agents", conn)
                 db_agents_dict = dict(zip(db_agents_df['name'], db_agents_df['agent_id']))
                 csv_agents = set(df_upload['歸屬業務姓名'].unique())
@@ -1282,43 +1307,62 @@ elif menu == "➕ 新增資料":
                     cursor = conn.cursor()
                     success_count = 0
                     
+                    # 🎯 智慧防線：預先拉出系統所有合法的方案利率清單 (加上 0.0 新約錨點)
+                    db_valid_rates = pd.read_sql("SELECT DISTINCT annual_rate FROM rate_plans", conn)['annual_rate'].tolist()
+                    if 0.0 not in db_valid_rates:
+                        db_valid_rates.insert(0, 0.0)
+                    
                     for index, row in df_upload.iterrows():
                         row_idx = index + 2 
                         cust_name = str(row['客戶姓名']).strip()
                         agent_name = str(row['歸屬業務姓名']).strip()
-                        
                         target_agent_id = db_agents_dict[agent_name]
 
                         c_type = str(row.get('合約性質', '續約')).strip()
                         if not c_type or c_type == 'nan': c_type = "續約"
-                        if c_type not in ["新約", "續約"]: c_type = "續約"
 
+                        # 1. 🎯 【核心升級】解析並強制校正預檢「上次歷史利率」
+                        try:
+                            csv_prev_rate = float(row['上次歷史利率(%)']) if '上次歷史利率(%)' in row and pd.notna(row['上次歷史利率(%)']) else 0.0
+                            # 檢查上次利率是否為合法利率
+                            if csv_prev_rate not in db_valid_rates:
+                                current_errors.append(f"❌ 行號 {row_idx}：『上次歷史利率 ({csv_prev_rate}%)』並不存在於系統目前的利率方案設定中，請檢查是否輸入錯誤！")
+                                continue
+                        except Exception:
+                            current_errors.append(f"❌ 行號 {row_idx}：『上次歷史利率』格式錯誤 (請輸入純數字，如 1.5)")
+                            continue
+
+                        # 2. 解析並預檢「本次方案利率」與週期
                         try:
                             target_rate = float(row['年利率(%)'])
                             target_period = int(row['週期(月)'])
+                            
+                            # 加強防線：檢查本次利率是否合法
+                            if target_rate not in db_valid_rates:
+                                current_errors.append(f"❌ 行號 {row_idx}：『年利率 ({target_rate}%)』在系統中找不到對應的方案設定")
+                                continue
+                                
                             plan_res = pd.read_sql("SELECT plan_id FROM rate_plans WHERE annual_rate = ? AND period_months = ?", conn, params=(target_rate, target_period))
                             if plan_res.empty:
-                                current_errors.append(f"❌ 行號 {row_idx}：找不到利率 {target_rate}% / 週期 {target_period}月 的方案")
+                                current_errors.append(f"❌ 行號 {row_idx}：找不到利率 {target_rate}% / 週期 {target_period}月 的特定方案組合")
                                 continue
                             p_id = int(plan_res['plan_id'][0])
                         except Exception:
-                            current_errors.append(f"❌ 行號 {row_idx}：利率或週期格式錯誤")
+                            current_errors.append(f"❌ 行號 {row_idx}：年利率或週期格式錯誤")
                             continue
 
+                        # 3. 解析日期與金額
                         try:
                             y, m, d = int(row['生效年'])+1911, int(row['生效月']), int(row['生效日'])
                             s_dt = date(y, m, d)
                             e_dt = s_dt + relativedelta(months=target_period)
                             real_amt = float(row['金額']) * 10000
                         except Exception:
-                            current_errors.append(f"❌ 行號 {row_idx}：日期日期或金額格式錯誤")
+                            current_errors.append(f"❌ 行號 {row_idx}：生效日期或金額格式錯誤")
                             continue
 
-                        check_cust = pd.read_sql(
-                            "SELECT customer_id FROM customers WHERE name = ? AND agent_id = ?", 
-                            conn, params=(cust_name, target_agent_id)
-                        )
-                        
+                        # 4. 寫入客戶與合約
+                        check_cust = pd.read_sql("SELECT customer_id FROM customers WHERE name = ? AND agent_id = ?", conn, params=(cust_name, target_agent_id))
                         if check_cust.empty:
                             cursor.execute("INSERT INTO customers (name, agent_id) VALUES (?, ?)", (cust_name, target_agent_id))
                             conn.commit()
@@ -1326,10 +1370,11 @@ elif menu == "➕ 新增資料":
                         else:
                             cust_id = int(check_cust['customer_id'][0])
 
+                        # 雙重預檢過關後，安全寫入資料庫
                         cursor.execute("""
-                            INSERT INTO invest_contracts (customer_id, plan_id, amount, start_date, end_date, status, note, contract_type, is_renewed)
-                            VALUES (?, ?, ?, ?, ?, 'Active', ?, ?, 0)
-                        """, (cust_id, p_id, real_amt, s_dt.isoformat(), e_dt.isoformat(), str(row.get('備註', '')), c_type))
+                            INSERT INTO invest_contracts (customer_id, plan_id, amount, start_date, end_date, status, note, contract_type, is_renewed, prev_annual_rate)
+                            VALUES (?, ?, ?, ?, ?, 'Active', ?, ?, 0, ?)
+                        """, (cust_id, p_id, real_amt, s_dt.isoformat(), e_dt.isoformat(), str(row.get('備註', '')), c_type, csv_prev_rate))
                         success_count += 1
                     
                     conn.commit()
@@ -1337,11 +1382,11 @@ elif menu == "➕ 新增資料":
                     
                     if not current_errors:
                         st.balloons()
-                        st.success(f"🎉 批量匯入成功！共完成 {success_count} 筆。")
+                        st.success(f"🎉 批量智慧匯入成功！共完成 {success_count} 筆，資料百分之百正確。")
                         time.sleep(1)
                         st.rerun()
                     else:
-                        st.warning(f"⚠️ 匯入完成，但發現 {len(current_errors)} 處錯誤 (已跳過該行)。")
+                        st.warning(f"⚠️ 匯入完成，但因利率或格式不符，自動攔截並跳過了 {len(current_errors)} 處錯誤。")
 
         if st.session_state.batch_errors:
             st.divider()
@@ -1352,8 +1397,6 @@ elif menu == "➕ 新增資料":
             if st.button("🗑️ 清除錯誤訊息"):
                 st.session_state.batch_errors = []
                 st.rerun()
-
-    st.divider()
 
     # --- 第二部分：建立基礎對象 ---
     st.markdown("### 2. 建立基礎對象")
@@ -1472,7 +1515,7 @@ elif menu == "📅 到期續約管理":
         # --- 2. 核心 SQL 查詢 ---
         query = """
         SELECT ic.contract_id, c.name as 客戶姓名, a.name as 業務姓名,
-               ic.amount / 10000.0 as '金額', rp.plan_name, rp.annual_rate,
+               ic.amount / 10000.0 as '金額', rp.plan_name, rp.annual_rate as '當前利率',
                ic.end_date as 原結束日, ic.is_renewed
         FROM invest_contracts ic
         JOIN customers c ON ic.customer_id = c.customer_id
@@ -1485,17 +1528,14 @@ elif menu == "📅 到期續約管理":
         all_df = pd.read_sql(query, conn, params=(r_start.isoformat(), r_end.isoformat()))
 
         if not all_df.empty:
-            all_df['方案(利率)'] = all_df['plan_name'] + " (" + all_df['annual_rate'].astype(str) + "%)"
-            # all_df = all_df.sort_values(by=['業務姓名', '客戶姓名']).reset_index(drop=True)
+            all_df['方案(利率)'] = all_df['plan_name'] + " (" + all_df['當前利率'].astype(str) + "%)"
             
             # --- 3. 進階篩選面板 ---
             f_col1, f_col2 = st.columns(2)
             with f_col1:
-                # 🎯 【核心修正：按照 sort_order 排序篩選業務員名單】
                 agent_weight_df = pd.read_sql("SELECT name FROM agents ORDER BY sort_order ASC, name ASC", conn)
                 ordered_agent_list = agent_weight_df['name'].tolist()
                 
-                # 僅留下目前到期合約中有出現的業務員，並維持權重順序
                 current_agents = all_df['業務姓名'].unique().tolist()
                 sorted_sel_agents = [name for name in ordered_agent_list if name in current_agents]
                 
@@ -1519,7 +1559,6 @@ elif menu == "📅 到期續約管理":
             st.divider()
             m_col1, m_col2, m_col3 = st.columns(3)
             
-            # 計算目前畫面上看得到且已勾選的 ID
             current_viewing_ids = set(pending_df['contract_id'].tolist())
             viewing_selected_count = len(current_viewing_ids.intersection(st.session_state.renew_checked_ids))
             total_checked = len(st.session_state.renew_checked_ids)
@@ -1527,10 +1566,9 @@ elif menu == "📅 到期續約管理":
             with m_col1:
                 st.metric("📋 篩選後待處理件數", f"{len(pending_df)} 筆")
             with m_col2:
-                st.metric("💰 篩選後總金額", f"{pending_df['金額'].sum():,.2f}")
+                st.metric("💰 篩選後總金額", f"NT$ {pending_df['金額'].sum():,.2f} 萬")
             with m_col3:
-                # st.metric("✅ 勾選狀態", f"目前畫面 {viewing_selected_count} / 總勾選 {total_checked}")
-                st.metric("✅ 勾選狀態", f"總勾選 {total_checked}")
+                st.metric("✅ 勾選狀態", f"總勾選 {total_checked} 筆")
 
             # --- 5. 待處理續約編輯器 ---
             if not pending_df.empty:
@@ -1540,7 +1578,7 @@ elif menu == "📅 到期續約管理":
                     return d + relativedelta(days=days_until_wed)
                 pending_df['下週三生效'] = pending_df['原結束日'].apply(get_wed)
                 
-                # ✅ 智慧全選功能
+                # 智慧全選
                 is_all_selected = current_viewing_ids.issubset(st.session_state.renew_checked_ids) if current_viewing_ids else False
                 
                 def on_all_check_change():
@@ -1551,10 +1589,10 @@ elif menu == "📅 到期續約管理":
 
                 st.checkbox("全選目前篩選結果", value=is_all_selected, key="all_sel_trigger", on_change=on_all_check_change)
 
-                # 從背景 Set 恢復勾選狀態
+                # 從背景恢復勾選狀態
                 pending_df['確認續約'] = pending_df['contract_id'].apply(lambda x: x in st.session_state.renew_checked_ids)
 
-                # ✅ 核心同步函式 (解決手動取消沒反應的問題)
+                # 編輯器狀態同步
                 def sync_editor_to_state():
                     ed_key = f"renew_ed_{st.session_state.renew_sync_key}"
                     if ed_key in st.session_state:
@@ -1565,15 +1603,14 @@ elif menu == "📅 到期續約管理":
                                 if changes["確認續約"]: st.session_state.renew_checked_ids.add(cid)
                                 else: st.session_state.renew_checked_ids.discard(cid)
 
+                # 渲染待處理表格
                 st.data_editor(
-                    # 這裡絕對維持原始 df，不套用樣式
                     pending_df[['確認續約', '客戶姓名', '業務姓名', '金額', '方案(利率)', '原結束日', '下週三生效']], 
                     hide_index=True, 
                     use_container_width=True, 
                     key=f"renew_ed_{st.session_state.renew_sync_key}",
                     on_change=sync_editor_to_state,
-                    height=500,
-                    # 💡 透過配置讓欄位「看起來」有被設計過
+                    height=400,
                     column_config={
                         "確認續約": st.column_config.CheckboxColumn("確認續約", help="點擊方框執行續約"),
                         "金額": st.column_config.NumberColumn("金額 (萬)", format="%.2f"),
@@ -1581,34 +1618,122 @@ elif menu == "📅 到期續約管理":
                     }
                 )
 
-                # 執行按鈕區
-                col_btn1, col_btn2 = st.columns([4, 1])
-                with col_btn1:
-                    if st.button("🚀 執行批次續約 (針對所有勾選項目)", type="primary", use_container_width=True):
-                        if st.session_state.renew_checked_ids:
-                            try:
-                                cursor = conn.cursor()
-                                for oid in list(st.session_state.renew_checked_ids):
-                                    cursor.execute("SELECT customer_id, plan_id, amount, end_date FROM invest_contracts WHERE contract_id = ?", (oid,))
-                                    c_id, p_id, amt, old_end = cursor.fetchone()
-                                    cursor.execute("SELECT period_months FROM rate_plans WHERE plan_id = ?", (p_id,))
-                                    p_months = cursor.fetchone()[0]
+                # --- 🎯 6. 升級：雙按鈕智慧續約彈出對話視窗 ---
+                # --- 🎯 終極防錯優化：先選擇再放行，單一按鈕防誤觸版 ---
+                @st.dialog("🚀 批次續約處理確認", width="large")
+                def batch_renew_modal(target_ids):
+                    st.markdown(f"📋 您即將為選中的 **{len(target_ids)}** 筆合約辦理續約手續。")
+                    st.write("---")
+                    
+                    # 1. 第一步：強制使用者先做出「續約模式」的選擇
+                    renew_mode = st.radio(
+                        "📌 請先選擇續約模式：",
+                        ["🤝 模式 A：直接續約 (維持各單原方案利率)", "🚀 模式 B：加碼續約 (變更為全新方案利率)"],
+                        index=0,
+                        key="modal_renew_mode_radio"
+                    )
+                    
+                    st.write("")
+                    
+                    # 2. 第二步：根據模式，動態展現聯動介面與資料預備
+                    if "模式 A" in renew_mode:
+                        st.info("🤝 系統已鎖定：這批客戶將全面複製上一期的『原方案 ID 與原利率』直接延展，不作任何利變。")
+                        
+                    else:
+                        st.markdown("##### 📈 請挑選這批合約要改簽的【新利率方案】")
+                        plans_df = pd.read_sql("SELECT plan_id, plan_name, annual_rate, period_months FROM rate_plans ORDER BY annual_rate ASC", conn)
+                        plans_df['display'] = plans_df['plan_name'] + " (" + plans_df['annual_rate'].astype(str) + "%)"
+                        
+                        selected_new_plan_label = st.selectbox(
+                            "新利率方案：", 
+                            plans_df['display'].tolist(), 
+                            key="modal_new_plan_select"
+                        )
+                        chosen_plan_info = plans_df[plans_df['display'] == selected_new_plan_label].iloc[0]
+                        new_plan_id = int(chosen_plan_info['plan_id'])
+                        new_period_months = int(chosen_plan_info['period_months'])
+
+                    st.write("")
+                    st.divider()
+                    st.write("")
+                    
+                    # 3. 第三步：使用者看清楚所有選定條件後，才點擊最下方的核心確認按鈕
+                    st.warning("⚠️ 請注意：點擊下方按鈕後，將正式更新資料庫狀態，舊合約將變更為 Closed。")
+                    
+                    if st.button("🔥 確認執行批次換約送出", type="primary", use_container_width=True, key="modal_final_submit_btn"):
+                        try:
+                            cursor = conn.cursor()
+                            
+                            # ------------------【後台分流執行邏輯】------------------
+                            if "模式 A" in renew_mode:
+                                # 執行 模式 A：維持原方案
+                                for oid in list(target_ids):
+                                    cursor.execute("""
+                                        SELECT ic.customer_id, ic.plan_id, ic.amount, ic.end_date, rp.annual_rate, rp.period_months
+                                        FROM invest_contracts ic
+                                        JOIN rate_plans rp ON ic.plan_id = rp.plan_id
+                                        WHERE ic.contract_id = ?
+                                    """, (oid,))
+                                    c_id, old_plan_id, amt, old_end, old_rate, p_months = cursor.fetchone()
+                                    
                                     ns = get_wed(old_end)
                                     ne = ns + relativedelta(months=p_months)
                                     
                                     cursor.execute("""
-                                        INSERT INTO invest_contracts (customer_id, plan_id, amount, start_date, end_date, status, is_renewed, note, contract_type)
-                                        VALUES (?, ?, ?, ?, ?, 'Active', 0, ?, '續約')
-                                    """, (c_id, p_id, amt, ns.isoformat(), ne.isoformat(), f"由 ID:{oid} 續約轉入"))
+                                        INSERT INTO invest_contracts (
+                                            customer_id, plan_id, amount, start_date, end_date, 
+                                            status, is_renewed, contract_type, parent_contract_id, prev_annual_rate, note
+                                        ) VALUES (?, ?, ?, ?, ?, 'Active', 0, '續約', ?, ?, ?)
+                                    """, (c_id, old_plan_id, amt, ns.isoformat(), ne.isoformat(), oid, old_rate, f"由 ID:{oid} 原條件直接續約轉入"))
+                                    
                                     cursor.execute("UPDATE invest_contracts SET is_renewed = 1, status = 'Closed' WHERE contract_id = ?", (oid,))
+                                    
+                                st.success("🎉 批次常規續約成功！歷史利率已安全錨定。")
                                 
-                                conn.commit()
-                                st.session_state.renew_checked_ids.clear()
-                                st.session_state.renew_sync_key += 1
-                                st.success("✅ 已完成批次續約！")
-                                time.sleep(1); st.rerun()
-                            except Exception as e:
-                                conn.rollback(); st.error(f"❌ 續約失敗：{e}")
+                            else:
+                                # 執行 模式 B：改簽新方案
+                                for oid in list(target_ids):
+                                    cursor.execute("""
+                                        SELECT ic.customer_id, ic.amount, ic.end_date, rp.annual_rate 
+                                        FROM invest_contracts ic
+                                        JOIN rate_plans rp ON ic.plan_id = rp.plan_id
+                                        WHERE ic.contract_id = ?
+                                    """, (oid,))
+                                    c_id, amt, old_end, old_rate = cursor.fetchone()
+                                    
+                                    ns = get_wed(old_end)
+                                    ne = ns + relativedelta(months=new_period_months)
+                                    
+                                    cursor.execute("""
+                                        INSERT INTO invest_contracts (
+                                            customer_id, plan_id, amount, start_date, end_date, 
+                                            status, is_renewed, contract_type, parent_contract_id, prev_annual_rate, note
+                                        ) VALUES (?, ?, ?, ?, ?, 'Active', 0, '續約', ?, ?, ?)
+                                    """, (c_id, new_plan_id, amt, ns.isoformat(), ne.isoformat(), oid, old_rate, f"由 ID:{oid} 續約加碼轉入"))
+                                    
+                                    cursor.execute("UPDATE invest_contracts SET is_renewed = 1, status = 'Closed' WHERE contract_id = ?", (oid,))
+                                    
+                                st.success("續約加碼成功，若數字有更動請至合約總覽編輯")
+
+                            # ------------------【通用結尾與重整】------------------
+                            conn.commit()
+                            st.session_state.renew_checked_ids.clear()
+                            st.session_state.renew_sync_key += 1
+                            time.sleep(1)
+                            st.rerun()
+                            
+                        except Exception as e:
+                            conn.rollback()
+                            st.error(f"❌ 續約手續失敗，資料已安全回滾：{e}")
+
+                # --- 畫面上的主要觸發按鈕 ---
+                col_btn1, col_btn2 = st.columns([4, 1])
+                with col_btn1:
+                    if st.button("🚀 執行批次續約 (針對所有勾選項目)", type="primary", use_container_width=True):
+                        if st.session_state.renew_checked_ids:
+                            batch_renew_modal(st.session_state.renew_checked_ids)
+                        else:
+                            st.error("❌ 請先在上方表格中勾選準備要執行續約的合約單據！")
                 with col_btn2:
                     if st.button("🗑️ 清空勾選"):
                         st.session_state.renew_checked_ids.clear(); st.rerun()
@@ -1617,7 +1742,7 @@ elif menu == "📅 到期續約管理":
 
             st.divider()
 
-            # --- 🚀 6. 已處理完成清單 ---
+            # --- 7. 已處理完成清單 ---
             st.subheader(f"✅ 已處理完成清單 ({len(done_df)} 筆)")
             if not done_df.empty:
                 done_df = done_df.sort_values(by='原結束日', ascending=False)
@@ -1626,12 +1751,11 @@ elif menu == "📅 到期續約管理":
                 st.info("💡 目前區間內尚無已處理完成的續約。")
 
 elif menu == "💰 業務佣":
-    st.title("💰 C")
+    st.title("💰 業務佣金與動態獎勵結算")
 
     # --- 0. 預載組織快取 ---
     agent_query = """
-    SELECT a.agent_id, a.name, a.boss_id, r.commission_rate as rate, r.rank_name as rank,
-            a.sort_order
+    SELECT a.agent_id, a.name, a.boss_id, r.commission_rate as rate, r.rank_name as rank, a.sort_order
     FROM agents a JOIN ranks r ON a.rank_id = r.rank_id
     """
     agent_map = pd.read_sql(agent_query, conn).set_index('agent_id').to_dict('index')
@@ -1641,45 +1765,116 @@ elif menu == "💰 業務佣":
     if 'extra_rules' not in st.session_state:
         st.session_state.extra_rules = []
 
-    # --- 1. 動態獎勵規則管理區 ---
+    # --- 🎯 背景智慧快取掃描：找出當前區間內所有發生過的利變變動組合 ---
+    rate_change_opts = []
+    _, end_temp = st.session_state.comm_date_range if isinstance(st.session_state.get('comm_date_range'), tuple) and len(st.session_state.comm_date_range)==2 else (date.today(), date.today())
+    
+    pre_query = """
+        SELECT ic.prev_annual_rate, rp.annual_rate as current_rate
+        FROM invest_contracts ic
+        JOIN rate_plans rp ON ic.plan_id = rp.plan_id
+        WHERE ic.start_date <= ? AND ic.prev_annual_rate IS NOT NULL AND ic.prev_annual_rate > 0
+    """
+    pre_df = pd.read_sql(pre_query, conn, params=(end_temp.isoformat(),))
+    if not pre_df.empty:
+        for _, r in pre_df.iterrows():
+            if r['prev_annual_rate'] != r['current_rate']:
+                opt_str = f"{r['prev_annual_rate']}% ➔ {r['current_rate']}%"
+                if opt_str not in rate_change_opts:
+                    rate_change_opts.append(opt_str)
+    rate_change_opts = sorted(rate_change_opts)
+
+    # 撈取系統基礎方案清單
+    all_plans_info = pd.read_sql("SELECT plan_name, annual_rate FROM rate_plans ORDER BY annual_rate ASC", conn)
+    base_plan_opts = ["全部方案"] + (all_plans_info['plan_name'] + " (" + all_plans_info['annual_rate'].astype(str) + "%)").tolist()
+
+    # --- 🎯 2. 選擇日期範圍與最高控制開關 (上移至設定區上方) ---
+    if 'comm_date_range_value' not in st.session_state:
+        st.session_state.comm_date_range_value = (date.today().replace(day=1), date.today())
+
+    def save_date_range():
+        if st.session_state.comm_date_widget_key:
+            st.session_state.comm_date_range_value = st.session_state.comm_date_widget_key
+
+    date_range = st.date_input(
+        "請選擇對帳日期區間", 
+        value=st.session_state.comm_date_range_value,
+        key="comm_date_widget_key",
+        on_change=save_date_range
+    )
+    
+    if isinstance(date_range, tuple) and len(date_range) == 2:
+        st.session_state.comm_date_range = date_range
+
+    # 🌟 最高指導原則開關
+    isolate_rate_change = st.checkbox(
+        "獨立續約加碼單（通常是加碼後提高利率）", 
+        value=False,
+        key="matrix_c_isolate_toggle"
+    )
+
+    # --- 1. 額外活動獎勵管理區 (全新「連動防錯」決策介面) ---
     with st.expander("🎁 額外活動獎勵管理", expanded=False):
-        all_plans_info = pd.read_sql("SELECT plan_name, annual_rate, period_months FROM rate_plans", conn)
-        all_plans_info['display'] = all_plans_info['plan_name'] + " (" + all_plans_info['annual_rate'].astype(str) + "%)"
+        r_col1, r_col2, r_col3, r_col4 = st.columns([1.5, 1.5, 1, 1])
         
-        r_col1, r_col2, r_col3 = st.columns([2, 1, 1])
+        # 🎯 根據最高開關，動態決定第一層要給使用者看什麼選項
+        kind_options = ["常規件 - 全部 (新約+續約)", "常規件 - 限新約", "常規件 - 限續約"]
+        if isolate_rate_change:
+            kind_options.append("特規件 - 續約加碼") # 只有勾選獨立查看時，才允許設定利變加碼
+
         with r_col1:
-            sel_rule_plan = st.selectbox("選擇利率方案", all_plans_info['display'].tolist())
+            sel_rule_kind = st.selectbox("1. 選擇獎勵對象性質 (總開關)", kind_options)
+            
         with r_col2:
-            sel_rule_time = st.number_input("第幾次領取時獎勵", min_value=0, value=0, step=1)
+            if sel_rule_kind == "特規件 - 續約加碼":
+                if rate_change_opts:
+                    sel_target = st.selectbox("2. 選擇指定的利變升級組合", rate_change_opts)
+                else:
+                    sel_target = st.selectbox("2. 選擇指定的利變升級組合", ["當月暫無利變數據"], disabled=True)
+            else:
+                sel_target = st.selectbox("2. 選擇適用的常規利率方案", base_plan_opts)
+                
         with r_col3:
+            sel_rule_time = st.number_input("第幾次領取時獎勵", min_value=0, value=0, step=1)
+        with r_col4:
             sel_rule_bonus = st.number_input("加給 % 數", min_value=0.0, value=2.0, format="%.2f")
             
         if st.button("➕ 新增獎勵規則", use_container_width=True):
-            st.session_state.extra_rules.append({
-                "id": time.time(), "plan": sel_rule_plan, 
-                "time": sel_rule_time, "bonus_rate": sel_rule_bonus / 100
-            })
-            st.rerun()
+            if sel_target == "當月暫無利變數據":
+                st.error("❌ 無法建立：當前區間無任何利變資料可供設定。")
+            else:
+                st.session_state.extra_rules.append({
+                    "id": time.time(), 
+                    "kind": sel_rule_kind,      
+                    "target": sel_target,      
+                    "time": sel_rule_time, 
+                    "bonus_rate": sel_rule_bonus / 100
+                })
+                st.rerun()
         
         if st.session_state.extra_rules:
             st.divider()
             for idx, rule in enumerate(st.session_state.extra_rules):
                 rc1, rc2 = st.columns([4, 1])
-                with rc1: st.write(f"📍 {rule['plan']} - 第 {rule['time']} 次：+{rule['bonus_rate']*100:.2f}%")
+                with rc1: 
+                    # 💡 防呆醒目提示：如果使用者沒勾選，但列表裡有舊的特規規則，顯示灰色不可用標籤
+                    if "特規件" in rule['kind'] and not isolate_rate_change:
+                        st.write(f"⚪ ~~(已暫停) {rule['kind']} ➔ 【{rule['target']}】 (第 {rule['time']} 次)：+{rule['bonus_rate']*100:.2f}% (請勾選下方獨立查看以啟用)~~")
+                    else:
+                        st.write(f"📍 **{rule['kind']}** ➔ 【{rule['target']}】 (第 {rule['time']} 次)：+{rule['bonus_rate']*100:.2f}%")
                 with rc2:
                     if st.button("❌", key=f"del_{rule['id']}"):
                         st.session_state.extra_rules.pop(idx); st.rerun()
 
-    # --- 2. 選擇日期範圍 ---
-    date_range = st.date_input("請選擇對帳日期區間", key="comm_date_range")
-    if isinstance(date_range, tuple) and len(date_range) == 2:
-        start_f, end_f = date_range
+    # --- 3. 核心數據計算引擎 ---
+    if isinstance(st.session_state.comm_date_range, tuple) and len(st.session_state.comm_date_range) == 2:
+        start_f, end_f = st.session_state.comm_date_range
+        
         query = """
         SELECT ic.contract_id, c.name as 客戶姓名, a.name as 業務姓名, a.agent_id, a.boss_id, 
                r.rank_name as 職級, r.commission_rate as 個人比例, ic.amount / 10000.0 as '金額', 
-               rp.plan_name, rp.annual_rate as '利率', ic.start_date as 生效日, 
-               rp.period_months as 總期數, ic.contract_type,
-               a.sort_order as 業務權重
+               rp.plan_name, rp.annual_rate as '利率', ic.prev_annual_rate, ic.start_date as 生效日, 
+               rp.period_months as 總期數, ic.contract_type, a.sort_order as 業務權重
         FROM invest_contracts ic 
         JOIN customers c ON ic.customer_id = c.customer_id 
         JOIN agents a ON c.agent_id = a.agent_id 
@@ -1699,8 +1894,6 @@ elif menu == "💰 業務佣":
 
             for _, row in df_raw.iterrows():
                 amt, aid, plan = row['金額'], row['agent_id'], row['方案名稱(%)']
-                
-                # ✅ 判定性質 (新/續)
                 raw_type = row['contract_type'] if pd.notna(row['contract_type']) else "續約"
                 suffix = "新" if "新" in raw_type else "續"
                 detailed_plan_key = f"{plan}-{suffix}"
@@ -1713,37 +1906,68 @@ elif menu == "💰 業務佣":
                 if row['職級'] in ['高專', '累件中', '外圍'] and pd.notna(row['boss_id']):
                     target_aid = row['boss_id']
                 
-                # 過期或未開始則跳過
                 if diff_months < 0 or diff_months >= row['總期數']: continue
 
-                # this_log = {"客戶": row['客戶姓名'], "業務": row['業務姓名'], "金額": amt, "生效日": row['生效日'], "分配明細": []}
                 this_log = {"客戶": row['客戶姓名'], "業務": agent_map[target_aid]['name'], "金額": amt, "生效日": row['生效日'], "分配明細": []}
 
-                # ✅ (A) 獎勵計算
+                # ✅ (A) 活動獎勵匹配引擎 (融入 Checkbox 最高連動防線)
+                # ✅ (A) 升級：具備「互斥防護」的活動獎勵匹配引擎
                 for rule in st.session_state.extra_rules:
-                    if plan == rule['plan'] and diff_months == rule['time'] and is_in_date_range:
-                        rew_amt = round(amt * rule['bonus_rate'], 2)
-                        # payouts[aid]['獎勵'] += rew_amt
-                        # payouts[target_aid]['獎勵'] += rew_amt
-                        # this_log["分配明細"].append(f"🎁獎勵({row['業務姓名']}):+{rew_amt}")
-                        payouts[target_aid]['獎勵'] += rew_amt 
-                        this_log["分配明細"].append(f"🎁獎勵({agent_map[target_aid]['name']}):+{rew_amt}")
+                    if diff_months == rule['time'] and is_in_date_range:
+                        kind = rule['kind']
+                        target = rule['target']
+                        is_match = False
+                        
+                        # 先判定這筆合約「當下的真實身份」
+                        # 條件：必須有勾選隔離、且這單確實是利變單
+                        is_current_contract_a_rate_change_type = (
+                            isolate_rate_change and 
+                            pd.notna(row['prev_annual_rate']) and 
+                            row['prev_annual_rate'] > 0 and 
+                            row['prev_annual_rate'] != row['利率']
+                        )
+                        
+                        # ------------------【分流分支一：這條規則是 特規利變加碼】------------------
+                        if kind == "特規件 - 續約加碼":
+                            if is_current_contract_a_rate_change_type:
+                                curr_chg_str = f"{row['prev_annual_rate']}% ➔ {row['利率']}%"
+                                if curr_chg_str == target:
+                                    is_match = True
+                        
+                        # ------------------【分流分支二：這條規則是 常規件獎勵】------------------
+                        else:
+                            # 🎯 核心防線：如果這單此時已經是「特規利變件」，常規規則絕對不能碰它！直接跳過！
+                            if is_current_contract_a_rate_change_type:
+                                continue
+                                
+                            # 如果是一般常規件，才繼續往下核對常規條件
+                            if kind == "常規件 - 限新約" and suffix != "新": continue
+                            if kind == "常規件 - 限續約" and suffix != "續": continue
+                            if target == "全部方案" or plan == target:
+                                is_match = True
+                                
+                        if is_match:
+                            rew_amt = round(amt * rule['bonus_rate'], 2)
+                            payouts[target_aid]['獎勵'] += rew_amt
+                            this_log["分配明細"].append(f"🎁活動({target}):+{rew_amt}")
 
-                # ✅ (B) 核心分潤與業績歸帳 (僅計算選定區間內的新業績)
+                # ✅ (B) 核心業績歸帳判定：完全受到 Checkbox 控制
                 if is_in_date_range:
-                    # target_aid = aid
                     base_agent = agent_map.get(target_aid)
                     if not base_agent: continue
                     
-                    # 業績歸帳到對應的 [方案-新/續]
-                    payouts[target_aid]['業績'][detailed_plan_key] = payouts[target_aid]['業績'].get(detailed_plan_key, 0) + amt
+                    if isolate_rate_change and pd.notna(row['prev_annual_rate']) and row['prev_annual_rate'] > 0 and row['prev_annual_rate'] != row['利率']:
+                        chg_key = f"🚀利變 {row['prev_annual_rate']}% ➔ {row['利率']}%"
+                        payouts[target_aid]['業績'][chg_key] = payouts[target_aid]['業績'].get(chg_key, 0) + amt
+                    else:
+                        payouts[target_aid]['業績'][detailed_plan_key] = payouts[target_aid]['業績'].get(detailed_plan_key, 0) + amt
                     
                     base_rate = base_agent['rate']
                     self_comm = round(amt * base_rate, 2)
                     payouts[target_aid]['個人'] += self_comm
                     this_log["分配明細"].append(f"個人({base_agent['name']}):+{self_comm}")
 
-                    # 🚀 爬升引擎 (級差與平階)
+                    # 主管級差引擎
                     last_rate = base_rate
                     child_group_id = target_aid 
                     curr_id = base_agent['boss_id']
@@ -1771,7 +1995,7 @@ elif menu == "💰 業務佣":
                     this_log["分配明細"] = " | ".join(this_log["分配明細"])
                     contract_flow_logs.append(this_log)
 
-            # --- 第二階段：結算加給 ---
+            # --- 第二階段：結算主管加給 ---
             for m_id, v_data in volume_box.items():
                 m_info = agent_map[m_id]
                 for sub_id, total_amt in v_data['級差池'].items():
@@ -1795,9 +2019,9 @@ elif menu == "💰 業務佣":
                                 payouts[payer_id]['加給'] -= g_gain
                                 summary_payout_details.append({'受款人': m_info['name'], '項目': f"{gen_name}補償({agent_map[sub_id]['name']}單)", '總業績': round(group_amt, 2), '計算式': f"{g_rate*100:.2f}%", '金額': g_gain, '支出人': agent_map[payer_id]['name']})
 
-            # --- 3. 欄位排序與生成 (利率由小到大) ---
+            # --- 3. Matrix C 橫向欄位生成 ---
             raw_keys = set([k for d in payouts.values() for k in d['業績'].keys()])
-            base_plans = set([k.rsplit('-', 1)[0] for k in raw_keys])
+            base_plans = set([k.rsplit('-', 1)[0] for k in raw_keys if "🚀利變" not in k])
             
             def get_rate_val(p_str):
                 import re
@@ -1805,27 +2029,34 @@ elif menu == "💰 業務佣":
                 return float(match.group(1)) if match else 0.0
 
             sorted_base_plans = sorted(list(base_plans), key=get_rate_val)
-            all_detailed_cols = []
+            
+            display_cols = ['姓名']
             for bp in sorted_base_plans:
-                all_detailed_cols.append(f"{bp}-新")
-                all_detailed_cols.append(f"{bp}-續")
+                display_cols.append(f"{bp}-新")
+                display_cols.append(f"{bp}-續")
+            
+            if isolate_rate_change:
+                current_interval_changes = sorted([k for k in raw_keys if "🚀利變" in k])
+                for chg_col in current_interval_changes:
+                    display_cols.append(chg_col)
+                    
+            display_cols += ['總業績', '個人Ｃ', '差%加給', '活動獎勵', '應領總計']
 
             # --- 4. 生成 Matrix C 表格數據 ---
             summary_data = []
+            sorted_aids = sorted(payouts.keys(), key=lambda x: agent_map.get(x, {}).get('sort_order', 999))
 
-            sorted_aids = sorted(
-                payouts.keys(), 
-                key=lambda x: agent_map.get(x, {}).get('sort_order', 999)
-            )
-
-            # for aid, data in payouts.items():
             for aid in sorted_aids:
                 data = payouts[aid]
                 if any(v > 0 for v in data['業績'].values()) or data['加給'] != 0 or data['獎勵'] != 0:
                     r_data = {'姓名': agent_map[aid]['name']}
-                    r_data['_sort'] = agent_map[aid].get('sort_order', 999)
-                    for p_col in all_detailed_cols:
-                        r_data[p_col] = data['業績'].get(p_col, 0)
+                    
+                    for col_name in display_cols:
+                        if col_name != '姓名': r_data[col_name] = 0.0
+                        
+                    for raw_key, amt_value in data['業績'].items():
+                        if raw_key in display_cols:
+                            r_data[raw_key] = amt_value
 
                     r_data['總業績'] = sum(data['業績'].values())
                     r_data['個人Ｃ'] = data['個人']
@@ -1833,8 +2064,9 @@ elif menu == "💰 業務佣":
                     r_data['活動獎勵'] = data['獎勵']
                     r_data['應領總計'] = data['個人'] + data['加給'] + data['獎勵']
                     summary_data.append(r_data)
-            
-            # --- 5. 呈現表格 ---
+
+            # --- 5. 渲染 Matrix C 總體合計表 ---
+            st.write("### 🧩 Matrix C 業績看板")
             if summary_data:
                 df_final = pd.DataFrame(summary_data).fillna(0)
                 total_row = {'姓名': '⭐ 合計 (Total)'}
@@ -1842,39 +2074,32 @@ elif menu == "💰 業務佣":
                     if col != '姓名': total_row[col] = df_final[col].sum()
                 
                 df_with_total = pd.concat([pd.DataFrame([total_row]), df_final], ignore_index=True)
-                display_cols = ['姓名'] + all_detailed_cols + ['總業績', '個人Ｃ', '差%加給', '活動獎勵', '應領總計']
                 df_with_total = df_with_total[display_cols]
 
-                st.write("### 🧩 Matrix C")
                 st.dataframe(apply_zebra_style(df_with_total), use_container_width=True, hide_index=True)
                 
+                # --- 6. 渲染明細數據 ---
                 st.divider()
-                st.write("### 🔍 明細")
+                st.write("### 🔍 分配項目加給明細")
                 if summary_payout_details:
-                    # st.dataframe(apply_zebra_style(pd.DataFrame(summary_payout_details)), use_container_width=True, hide_index=True)
                     det_df = pd.DataFrame(summary_payout_details)
                     if not det_df.empty:
-                        # 1. 建立對照表，增加 .get() 的預設值 999 避免 NaN
                         name_to_order = {v['name']: v.get('sort_order', 999) for v in agent_map.values()}
-                        
-                        # 2. 映射排序權重，使用 .fillna(999) 防止有人的姓名不在 agent_map 中導致報錯
                         det_df['_sort'] = det_df['受款人'].map(name_to_order).fillna(999)
-                        
-                        # 3. 排序並過濾輔助欄位
-                        # 建議也把 '受款人' 放在前面排序，這樣同一人的明細會聚在一起
                         det_df = det_df.sort_values(by=['_sort', '受款人']).drop(columns=['_sort'])
-                        
-                        st.dataframe(
-                            apply_zebra_style(det_df), 
-                            use_container_width=True, 
-                            hide_index=True
-                        )
+                        st.dataframe(apply_zebra_style(det_df), use_container_width=True, hide_index=True)
                 
-                st.write("### 📄 明細紀錄")
+                st.write("### 📄 原始合約流水軌跡紀錄")
                 if contract_flow_logs:
                     st.dataframe(apply_zebra_style(pd.DataFrame(contract_flow_logs)), use_container_width=True, hide_index=True)
             else:
-                st.warning("🌙 此區間無數據。")
+                st.warning("🌙 所選區間內無任何符合結算之業績數據。")
+
+            csv = df_final.to_csv(index=False).encode('utf-8-sig') if summary_data else b""
+            if summary_data:
+                st.download_button("📥 下載月度佣金結算總表 (CSV)", csv, f"commission_matrix_{start_f}_{end_f}.csv", use_container_width=True)
+        else:
+            st.warning("🌙 此區間無數據。")
 
 elif menu == "🌳 團隊組織圖":
     st.title("🌳 團隊組織架構圖")
