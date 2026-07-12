@@ -10,7 +10,7 @@ import calendar
 # import graphviz
 
 
-CURRENT_VERSION = "1.5.3"
+CURRENT_VERSION = "1.5.4"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -867,13 +867,13 @@ elif menu == "⚙️ 基礎資料設定":
 
     # --- 3. 利率方案管理 (編輯+刪除) ---
     st.subheader("📈 利率方案設定")
-    plan_df = pd.read_sql("SELECT plan_id, plan_name as 方案, annual_rate as 年利率, period_months as 週期 FROM rate_plans", conn)
+    plan_df = pd.read_sql("SELECT plan_id, plan_name as 方案, annual_rate as 利率, period_months as 週期 FROM rate_plans", conn)
     
     col_p1, col_p2 = st.columns([1, 1.2])
     with col_p1:
         st.write("📌 **目前利率方案**")
         if not plan_df.empty:
-            st.dataframe(apply_zebra_style(plan_df[['方案', '年利率', '週期']]), hide_index=True)
+            st.dataframe(apply_zebra_style(plan_df[['方案', '利率', '週期']]), hide_index=True)
         else:
             st.info("尚未建立方案。")
 
@@ -888,7 +888,7 @@ elif menu == "⚙️ 基礎資料設定":
             # 💡 關鍵：在 key 裡面加入 target_p，切換選單時輸入框內容會跟著變
             with st.expander(f"修改 {target_p} 參數"):
                 new_p_name = st.text_input("修正方案名稱", value=p_info['方案'], key=f"p_name_{target_p}")
-                new_p_rate = st.number_input("修正年利率 (%)", value=float(p_info['年利率']), key=f"p_rate_{target_p}")
+                new_p_rate = st.number_input("修正利率 (%)", value=float(p_info['利率']), key=f"p_rate_{target_p}")
                 new_p_period = st.number_input("修正週期 (月)", value=int(p_info['週期']), key=f"p_period_{target_p}")
                 
                 if st.button("💾 儲存方案修改", use_container_width=True, key=f"save_btn_{target_p}"):
@@ -1339,13 +1339,13 @@ elif menu == "➕ 新增資料":
 
                         # 2. 🎯 解析並強制四捨五入校正「本次方案利率」與週期
                         try:
-                            target_rate = float(row['年利率(%)'])
+                            target_rate = float(row['利率(%)'])
                             target_rate = round(target_rate, 2) # 💡 自動把整數 2 轉成 2.0 對齊
                             target_period = int(row['週期(月)'])
                             
                             # 檢查本次利率是否合法
                             if target_rate not in db_valid_rates:
-                                current_errors.append(f"❌ 行號 {row_idx}：『年利率 ({target_rate}%)』在系統中找不到對應的方案設定")
+                                current_errors.append(f"❌ 行號 {row_idx}：『利率 ({target_rate}%)』在系統中找不到對應的方案設定")
                                 continue
                                 
                             plan_res = pd.read_sql("SELECT plan_id FROM rate_plans WHERE annual_rate = ? AND period_months = ?", conn, params=(target_rate, target_period))
@@ -1354,7 +1354,7 @@ elif menu == "➕ 新增資料":
                                 continue
                             p_id = int(plan_res['plan_id'][0])
                         except Exception:
-                            current_errors.append(f"❌ 行號 {row_idx}：年利率或週期格式錯誤")
+                            current_errors.append(f"❌ 行號 {row_idx}：利率或週期格式錯誤")
                             continue
 
                         # 3. 解析日期與金額
@@ -1526,7 +1526,7 @@ elif menu == "➕ 新增資料":
         with st.form("form_rate_plan"):
             st.write("#### 設定投資方案 parameters")
             p_name = st.text_input("方案名稱 (如：半年期穩健方案、一年期高利方案)")
-            p_rate = st.number_input("年利率 (%)", min_value=0.0, max_value=100.0, value=6.0, step=0.1)
+            p_rate = st.number_input("利率 (%)", min_value=0.0, max_value=100.0, value=6.0, step=0.1)
             p_period = st.number_input("合約週期 (月)", min_value=1, max_value=120, value=12)
             
             if st.form_submit_button("確認建立方案"):
