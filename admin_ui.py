@@ -10,7 +10,7 @@ import calendar
 # import graphviz
 
 
-CURRENT_VERSION = "1.5.4"
+CURRENT_VERSION = "1.5.5"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -483,7 +483,7 @@ elif menu == "💰 收益發放試算":
 elif menu == "📋 合約總覽":
     st.title("📋 合約總覽")
     
-    # --- 1. 基礎資料與環境設定 (補上撈取 prev_annual_rate) ---
+    # --- 1. 基礎資料與環境設定 ---
     all_agents_df = pd.read_sql("SELECT agent_id, name, sort_order FROM agents ORDER BY sort_order ASC, name ASC", conn)
     
     query = """
@@ -512,6 +512,9 @@ elif menu == "📋 合約總覽":
         df_raw['開始日'] = pd.to_datetime(df_raw['開始日']).dt.date
         df_raw['結束日'] = pd.to_datetime(df_raw['結束日']).dt.date
         
+        # 處理上次利率展示格式 (把 NaN 或 0 轉成更易讀的標籤)
+        df_raw['上次利率展示'] = df_raw['上次利率'].apply(lambda x: f"{x:.2f}%" if pd.notna(x) and x > 0 else "0.00% (新約件)")
+        
         this_m = date.today().replace(day=1)
         def get_status_label(d):
             if d.replace(day=1) < this_m: return "🔴 已過期"
@@ -539,6 +542,16 @@ elif menu == "📋 合約總覽":
         with col_f2:
             all_plan_rate_list = sorted(df_raw['方案(利率)'].unique().tolist()) if not df_raw.empty else []
             sel_plans_rates = st.multiselect("📈 篩選方案 (利率)", options=all_plan_rate_list)
+            
+            # 🎯 智慧新增：上次歷史利率的多選篩選器
+            if not df_raw.empty:
+                # 排序基礎：依照真實數字大小排序展示用標籤
+                sorted_prev_rates_df = df_raw.sort_values(by='上次利率')[['上次利率展示', '上次利率']].drop_duplicates()
+                all_prev_rate_opts = sorted_prev_rates_df['上次利率展示'].tolist()
+            else:
+                all_prev_rate_opts = []
+                
+            sel_prev_rates = st.multiselect("⏮️ 篩選上次歷史利率", options=all_prev_rate_opts)
             
             if not df_raw.empty:
                 date_range = st.date_input("📅 篩選生效日範圍", value=(df_raw['開始日'].min(), df_raw['開始日'].max()))
@@ -570,6 +583,9 @@ elif menu == "📋 合約總覽":
         if sel_agents: df_display = df_display[df_display['業務員'].isin(sel_agents)]
         if sel_customers: df_display = df_display[df_display['客戶姓名'].isin(sel_customers)]
         if sel_plans_rates: df_display = df_display[df_display['方案(利率)'].isin(sel_plans_rates)]
+        # 🎯 核心過濾：上次歷史利率條件篩選
+        if sel_prev_rates: df_display = df_display[df_display['上次利率展示'].isin(sel_prev_rates)]
+        
         if isinstance(date_range, tuple) and len(date_range) == 2:
             df_display = df_display[(df_display['開始日'] >= date_range[0]) & (df_display['開始日'] <= date_range[1])]
         if filter_type != "全部": df_display = df_display[df_display['類型'] == filter_type]
@@ -595,8 +611,8 @@ elif menu == "📋 合約總覽":
             hide_index=True,
             column_config={
                 "ID": st.column_config.NumberColumn("ID", width=60, format="%d"),
-                "利率": st.column_config.NumberColumn("本次利率", format="%.1f%%"),
-                "上次利率": st.column_config.NumberColumn("上次利率", format="%.1f%%")
+                "利率": st.column_config.NumberColumn("本次利率", format="%.2f%%"),
+                "上次利率": st.column_config.NumberColumn("上次利率", format="%.2f%%")
             },
             on_select="rerun",
             selection_mode="single-row",
@@ -611,7 +627,7 @@ elif menu == "📋 合約總覽":
         except:
             pass
 
-        # --- 4. 🛠️ 快速維護區 (升級支援本次/上次利率修正) ---
+        # --- 4. 🛠️ 快速維護區 ---
         st.subheader("🛠️ 合約快速維護區")
         op_col1, op_col2 = st.columns(2)
         id_list = df_display['ID'].tolist()
@@ -673,17 +689,12 @@ elif menu == "📋 合約總覽":
                     with type_c:
                         new_type = st.radio("性質", ["新約", "續約"], index=0 if info['contract_type'] == "新約" else 1, horizontal=True, key=f"edit_type_{edit_id}")
                     
-                    # 🎯 增設上次利率手動覆寫修正欄位
-                    # 🎯 增設上次利率手動覆寫修正欄位 (改用智慧選單防呆)
                     st.markdown("##### 🔍 歷史利率人工覆寫校正")
                     
-                    # 智慧提取：自動從資料庫現有的所有方案中撈取合理的利率數字，確保不會打錯字
                     existing_rates = pd.read_sql("SELECT DISTINCT annual_rate FROM rate_plans ORDER BY annual_rate ASC", conn)['annual_rate'].tolist()
-                    # 強制加入 0.0 代表沒有歷史合約(新約單)
                     if 0.0 not in existing_rates:
                         existing_rates.insert(0, 0.0)
                     
-                    # 格式化成選單文字，例如 "1.70 %"、"0.00 % (新約件)"
                     rate_options_display = [f"{r:.2f} %" if r > 0 else "0.00 % (新約件)" for r in existing_rates]
                     rate_mapping = dict(zip(rate_options_display, existing_rates))
 
@@ -692,10 +703,7 @@ elif menu == "📋 合約總覽":
                         st.caption("本次合約方案預設利率")
                         st.subheader(f"✨ {p_info['annual_rate']}%")
                     with rate_c2:
-                        # 取得當前這單的上次利率舊值
                         current_db_prev_rate = float(info['prev_annual_rate']) if pd.notna(info['prev_annual_rate']) else 0.0
-                        
-                        # 自動幫使用者在選單中對齊預選目前的數值，找不到就預設留在一開始的 0.0
                         def_rate_display_str = f"{current_db_prev_rate:.2f} %" if current_db_prev_rate > 0 else "0.00 % (新約件)"
                         try:
                             def_rate_select_idx = rate_options_display.index(def_rate_display_str)
@@ -708,7 +716,6 @@ elif menu == "📋 合約總覽":
                             index=def_rate_select_idx,
                             key=f"edit_prev_rate_selectbox_{edit_id}"
                         )
-                        # 解析回實際的真實浮點數
                         final_prev_rate_num = float(rate_mapping[selected_rate_str])
 
                     new_n = st.text_input("備註", value=str(info['note']) if info['note'] else "", key=f"edit_note_{edit_id}")
@@ -718,7 +725,6 @@ elif menu == "📋 合約總覽":
                             st.error("❌ 無法儲存：必須選擇有效的客戶。")
                         else:
                             try:
-                                # 將變數代入最後解析出的 final_prev_rate_num
                                 conn.execute("""
                                     UPDATE invest_contracts 
                                     SET customer_id=?, plan_id=?, amount=?, start_date=?, end_date=?, note=?, contract_type=?, prev_annual_rate=?
