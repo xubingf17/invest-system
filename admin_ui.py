@@ -10,7 +10,7 @@ import calendar
 # import graphviz
 
 
-CURRENT_VERSION = "1.6.1"
+CURRENT_VERSION = "1.6.2"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -70,6 +70,32 @@ st.markdown("""
             align-items: center;
         }
 
+        /* 金額過長時自動縮小，避免四欄指標文字重疊 */
+        [data-testid="stMetric"] {
+            min-width: 0 !important;
+            overflow: hidden !important;
+        }
+        [data-testid="stMetricLabel"] {
+            max-width: 100% !important;
+        }
+        [data-testid="stMetricLabel"] p {
+            font-size: clamp(0.72rem, 1.05vw, 0.95rem) !important;
+            line-height: 1.25 !important;
+            white-space: normal !important;
+            word-break: break-word !important;
+        }
+        [data-testid="stMetricValue"] {
+            font-size: clamp(0.95rem, 1.8vw, 1.75rem) !important;
+            line-height: 1.2 !important;
+            max-width: 100% !important;
+            overflow-wrap: anywhere !important;
+            word-break: break-word !important;
+            white-space: normal !important;
+        }
+        [data-testid="stMetricDelta"] {
+            font-size: clamp(0.7rem, 1vw, 0.85rem) !important;
+        }
+
         /* 針對傳統 st.table 置中與條紋 */
         .stTable td, .stTable th {
             text-align: center !important;
@@ -107,6 +133,38 @@ def apply_zebra_style(df, format_cols=None):
 
     styler = display_df.style.apply(zebra_logic, axis=None)
     return styler
+
+
+def render_adaptive_metrics(items):
+    """依文字長度自動縮小字級，避免金額過長重疊。"""
+    cards = []
+    for label, value in items:
+        text = str(value)
+        n = len(text)
+        if n >= 22:
+            size = "0.95rem"
+        elif n >= 18:
+            size = "1.15rem"
+        elif n >= 14:
+            size = "1.35rem"
+        else:
+            size = "1.6rem"
+        cards.append(f"""
+        <div style="
+            flex:1; min-width:0; padding:12px 10px; text-align:center;
+            background:#f8f9fb; border:1px solid #e6e9ef; border-radius:10px;
+            box-sizing:border-box;
+        ">
+            <div style="font-size:0.85rem; color:#555; margin-bottom:8px; line-height:1.3;">{label}</div>
+            <div style="font-size:{size}; font-weight:700; color:#111; line-height:1.25; word-break:break-word;">{text}</div>
+        </div>
+        """)
+    html = f"""
+    <div style="display:flex; gap:12px; width:100%; align-items:stretch;">
+        {''.join(cards)}
+    </div>
+    """
+    st.components.v1.html(html, height=100)
 
 
 # --- 資料庫連線 (使用 check_same_thread=False 確保 Streamlit 運行穩定) ---
@@ -172,6 +230,31 @@ def force_add_columns(conn):
     if 'prev_annual_rate' not in contract_cols:
         conn.execute("ALTER TABLE invest_contracts ADD COLUMN prev_annual_rate REAL;")
         conn.commit()
+
+    # 歷史已領補登表（系統上線前舊約已領金額）
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS historical_payouts (
+            payout_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER NOT NULL,
+            amount REAL NOT NULL,
+            start_date TEXT,
+            end_date TEXT,
+            note TEXT,
+            record_date TEXT,
+            created_at TEXT,
+            FOREIGN KEY (customer_id) REFERENCES customers(customer_id)
+        )
+    """)
+    conn.commit()
+
+    cursor.execute("PRAGMA table_info(historical_payouts)")
+    hp_cols = [row[1] for row in cursor.fetchall()]
+    if 'start_date' not in hp_cols:
+        conn.execute("ALTER TABLE historical_payouts ADD COLUMN start_date TEXT;")
+        conn.commit()
+    if 'end_date' not in hp_cols:
+        conn.execute("ALTER TABLE historical_payouts ADD COLUMN end_date TEXT;")
+        conn.commit()
     
     # st.toast("資料庫結構檢查完成", icon="🔍")
 
@@ -183,7 +266,7 @@ with st.sidebar:
     st.title("📂 系統總覽")
     menu = st.sidebar.radio(
         "請選擇功能模組：",
-        ["📋 合約總覽","📅 到期續約管理" , "💰 收益發放試算","💰 業務佣", "👤 客戶資料管理", "🌳 團隊組織圖","➕ 新增資料", "⚙️ 基礎資料設定", "⚙️ 業務排序設定"],
+        ["📋 合約總覽","📅 到期續約管理" , "💰 收益發放試算","📖 歷史收益查詢","💰 業務佣", "👤 客戶資料管理", "🌳 團隊組織圖","➕ 新增資料", "⚙️ 基礎資料設定", "⚙️ 業務排序設定"],
         index=0,
         label_visibility="collapsed"
     )
@@ -479,6 +562,312 @@ elif menu == "💰 收益發放試算":
             st.warning("⚠️ 目前篩選條件下無符合資料。")
     else:
         st.warning(f"🔔 此日期區間內無任何應發放收益之合約。")
+
+elif menu == "📖 歷史收益查詢":
+    st.title("📖 歷史收益查詢")
+    # st.info("💡 系統合約依生效日每月發息（生效當月不發）。「目前已領」含系統試算＋歷史補登；補登請至「➕ 新增資料」頁維護，登錄一次後會自動帶入。")
+
+    def count_payouts_received(start_date, end_date, as_of):
+        """計算截至 as_of 已發放幾次利息（排除生效當月）。"""
+        if as_of < start_date:
+            return 0, []
+        payout_dates = []
+        target_day = start_date.day
+        y, m = start_date.year, start_date.month
+        # 從生效次月開始
+        if m == 12:
+            y, m = y + 1, 1
+        else:
+            m += 1
+
+        while True:
+            _, last_day = calendar.monthrange(y, m)
+            payout_date = date(y, m, min(target_day, last_day))
+            if payout_date > as_of or payout_date > end_date:
+                break
+            payout_dates.append(payout_date)
+            if m == 12:
+                y, m = y + 1, 1
+            else:
+                m += 1
+        return len(payout_dates), payout_dates
+
+    def map_status(raw):
+        s = str(raw).strip().lower() if pd.notna(raw) else ""
+        if s == "active":
+            return "進行中"
+        if s in ("closed", "completed"):
+            return "到期"
+        return str(raw) if pd.notna(raw) else ""
+
+    # --- 選業務 / 客戶（支援多選，方便查一家人）---
+    agents_df = pd.read_sql(
+        "SELECT agent_id, name FROM agents ORDER BY sort_order ASC, name ASC",
+        conn,
+    )
+    if agents_df.empty:
+        st.warning("目前尚無業務員資料。")
+    else:
+        col_a, col_d = st.columns([2, 1])
+        with col_a:
+            sel_agent = st.selectbox("💼 選擇業務員", agents_df["name"].tolist(), key="cum_agent")
+        agent_id = int(agents_df[agents_df["name"] == sel_agent]["agent_id"].values[0])
+
+        cust_df = pd.read_sql(
+            "SELECT customer_id, name FROM customers WHERE agent_id = ? ORDER BY name ASC",
+            conn,
+            params=(agent_id,),
+        )
+        with col_d:
+            as_of = st.date_input("📅 累計截止日期", value=date.today(), key="cum_as_of")
+
+        if cust_df.empty:
+            st.warning("此業務名下無客戶。")
+            sel_custs = []
+        else:
+            sel_custs = st.multiselect(
+                "👤 選擇客戶（可多選）",
+                options=cust_df["name"].tolist(),
+                key="cum_custs",
+                help="可一次勾選多位客戶，合計顯示目前已領與全部領完可領。",
+            )
+
+        if sel_custs:
+            selected_ids = cust_df[cust_df["name"].isin(sel_custs)]["customer_id"].astype(int).tolist()
+            placeholders = ",".join(["?"] * len(selected_ids))
+            contracts = pd.read_sql(
+                f"""
+                SELECT
+                    c.name as 客戶姓名,
+                    ic.contract_id as 合約ID,
+                    ic.start_date as 生效日,
+                    ic.end_date as 結束日,
+                    ic.amount / 10000.0 as 本金萬,
+                    rp.plan_name as 方案,
+                    rp.annual_rate as 利率,
+                    rp.period_months as 期數月,
+                    ic.contract_type as 性質,
+                    ic.status as 狀態
+                FROM invest_contracts ic
+                JOIN customers c ON ic.customer_id = c.customer_id
+                JOIN rate_plans rp ON ic.plan_id = rp.plan_id
+                WHERE ic.customer_id IN ({placeholders})
+                ORDER BY c.name ASC, ic.start_date ASC
+                """,
+                conn,
+                params=tuple(selected_ids),
+            )
+
+            rows = []
+            for _, row in contracts.iterrows():
+                start_d = pd.to_datetime(row["生效日"]).date()
+                end_d = pd.to_datetime(row["結束日"]).date()
+                monthly = round(float(row["本金萬"]) * (float(row["利率"]) / 100.0), 2)
+                times_now, payout_dates = count_payouts_received(start_d, end_d, as_of)
+                times_full, _ = count_payouts_received(start_d, end_d, end_d)
+                got_now = round(monthly * times_now, 2)
+                got_full = round(monthly * times_full, 2)
+                status_label = map_status(row["狀態"])
+                rows.append({
+                    "客戶姓名": row["客戶姓名"],
+                    "合約ID": int(row["合約ID"]),
+                    "生效日": start_d.isoformat(),
+                    "結束日": end_d.isoformat(),
+                    "性質": row["性質"] if pd.notna(row["性質"]) else "",
+                    "方案": row["方案"],
+                    "利率(%)": float(row["利率"]),
+                    "本金(萬)": float(row["本金萬"]),
+                    "期數(月)": int(row["期數月"]),
+                    "每期利息(萬)": monthly,
+                    "已領次數": int(times_now),
+                    "目前已領(萬)": got_now,
+                    "全部領完可領(萬)": got_full,
+                    "最近一筆發放日": payout_dates[-1].isoformat() if payout_dates else "-",
+                    "狀態": status_label,
+                })
+
+            result_df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=[
+                "客戶姓名", "合約ID", "生效日", "結束日", "性質", "方案", "利率(%)",
+                "本金(萬)", "期數(月)", "每期利息(萬)", "已領次數", "目前已領(萬)",
+                "全部領完可領(萬)", "最近一筆發放日", "狀態",
+            ])
+
+            # 歷史補登（系統上線前已領，存於資料庫）
+            hist_df = pd.read_sql(
+                f"""
+                SELECT hp.payout_id as 補登ID, c.name as 客戶姓名,
+                       hp.start_date as 生效日, hp.end_date as 結束日,
+                       hp.amount as 總金額萬, hp.note as 備註, hp.created_at as 建立時間
+                FROM historical_payouts hp
+                JOIN customers c ON hp.customer_id = c.customer_id
+                WHERE hp.customer_id IN ({placeholders})
+                ORDER BY c.name ASC, hp.start_date ASC, hp.payout_id ASC
+                """,
+                conn,
+                params=tuple(selected_ids),
+            )
+            hist_total = float(hist_df["總金額萬"].sum()) if not hist_df.empty else 0.0
+            hist_by_cust = (
+                hist_df.groupby("客戶姓名")["總金額萬"].sum().to_dict()
+                if not hist_df.empty else {}
+            )
+            hist_count_by_cust = (
+                hist_df.groupby("客戶姓名").size().to_dict()
+                if not hist_df.empty else {}
+            )
+
+            contract_now = float(result_df["目前已領(萬)"].sum()) if not result_df.empty else 0.0
+            total_now = contract_now + hist_total
+            active_mask = result_df["狀態"] == "進行中" if not result_df.empty else pd.Series(dtype=bool)
+            active_full = float(result_df.loc[active_mask, "全部領完可領(萬)"].sum()) if active_mask.any() else 0.0
+            active_full_with_hist = active_full + hist_total
+            all_full = (float(result_df["全部領完可領(萬)"].sum()) if not result_df.empty else 0.0) + hist_total
+            total_contract_count = len(result_df) + (len(hist_df) if not hist_df.empty else 0)
+
+            cust_label = "、".join(sel_custs)
+            st.divider()
+            st.subheader(f"📊 {sel_agent} ／ {cust_label}　截至 {as_of}")
+            render_adaptive_metrics([
+                ("客戶人數", f"{len(sel_custs)} 人"),
+                ("合約筆數", f"{total_contract_count} 筆"),
+                ("目前已領", f"NT$ {total_now:,.2f} 萬"),
+                ("進行中合約全部領完", f"NT$ {active_full_with_hist:,.2f} 萬"),
+            ])
+            # st.caption(
+            #     f"系統合約目前已領 NT$ {contract_now:,.2f} 萬 ＋ 歷史補登 NT$ {hist_total:,.2f} 萬；"
+            #     f"進行中系統合約全部領完 NT$ {active_full:,.2f} 萬 ＋ 歷史補登 NT$ {hist_total:,.2f} 萬；"
+            #     f"含已到期後的全部領完總額：NT$ {all_full:,.2f} 萬"
+            # )
+
+            if result_df.empty and hist_df.empty:
+                st.warning("所選客戶目前尚無合約，也尚無歷史補登資料。")
+            else:
+                # 合併系統合約 + 歷史補登，方便對帳（隱藏合約ID）
+                aligned_parts = []
+                if not result_df.empty:
+                    sys_part = result_df[[
+                        "客戶姓名", "生效日", "結束日", "性質",
+                        "目前已領(萬)", "全部領完可領(萬)", "狀態"
+                    ]].copy()
+                    sys_part["資料來源"] = "系統合約"
+                    aligned_parts.append(sys_part)
+                if not hist_df.empty:
+                    hist_part = pd.DataFrame({
+                        "客戶姓名": hist_df["客戶姓名"],
+                        "生效日": hist_df["生效日"].fillna("-"),
+                        "結束日": hist_df["結束日"].fillna("-"),
+                        "性質": "歷史補登",
+                        "目前已領(萬)": hist_df["總金額萬"],
+                        "全部領完可領(萬)": hist_df["總金額萬"],
+                        "狀態": "到期",
+                        "資料來源": "歷史補登",
+                    })
+                    aligned_parts.append(hist_part)
+
+                aligned_df = pd.concat(aligned_parts, ignore_index=True)
+                aligned_df = aligned_df.sort_values(by=["客戶姓名", "生效日"], ascending=[True, True])
+
+                st.markdown("##### 📋 已領對帳明細（系統合約 + 歷史補登）")
+                st.dataframe(
+                    apply_zebra_style(aligned_df),
+                    use_container_width=True,
+                    hide_index=True,
+                    height=420,
+                )
+
+                if not hist_df.empty:
+                    with st.expander(f"📝 歷史補登原始明細（{len(hist_df)} 筆）", expanded=False):
+                        show_hist = hist_df[[
+                            "客戶姓名", "生效日", "結束日", "總金額萬", "備註", "建立時間"
+                        ]].copy()
+                        st.dataframe(apply_zebra_style(show_hist), use_container_width=True, hide_index=True)
+
+                if len(sel_custs) > 1:
+                    with st.expander("👥 依客戶小計", expanded=True):
+                        if not result_df.empty:
+                            sub = (
+                                result_df.groupby("客戶姓名", as_index=False)
+                                .agg(
+                                    系統合約筆數=("合約ID", "count"),
+                                    系統目前已領=("目前已領(萬)", "sum"),
+                                    系統全部領完可領=("全部領完可領(萬)", "sum"),
+                                )
+                            )
+                        else:
+                            sub = pd.DataFrame({
+                                "客戶姓名": sel_custs,
+                                "系統合約筆數": 0,
+                                "系統目前已領": 0.0,
+                                "系統全部領完可領": 0.0,
+                            })
+                        for name in sel_custs:
+                            if name not in sub["客戶姓名"].values:
+                                sub = pd.concat([sub, pd.DataFrame([{
+                                    "客戶姓名": name, "系統合約筆數": 0,
+                                    "系統目前已領": 0.0, "系統全部領完可領": 0.0,
+                                }])], ignore_index=True)
+                        sub["歷史補登筆數"] = sub["客戶姓名"].map(lambda n: int(hist_count_by_cust.get(n, 0)))
+                        sub["合約筆數"] = sub["系統合約筆數"].astype(int) + sub["歷史補登筆數"]
+                        sub["歷史補登"] = sub["客戶姓名"].map(lambda n: float(hist_by_cust.get(n, 0.0)))
+                        sub["目前已領合計"] = sub["系統目前已領"] + sub["歷史補登"]
+                        sub["全部領完合計"] = sub["系統全部領完可領"] + sub["歷史補登"]
+                        for col in ["系統合約筆數", "歷史補登筆數", "合約筆數"]:
+                            sub[col] = sub[col].astype(int).astype(str)
+                        st.dataframe(apply_zebra_style(sub), use_container_width=True, hide_index=True)
+
+            export_df = result_df.copy() if not result_df.empty else pd.DataFrame()
+            if not export_df.empty:
+                export_df = export_df.drop(columns=["合約ID"], errors="ignore")
+                if "期數(月)" in export_df.columns:
+                    export_df["期數(月)"] = export_df["期數(月)"].astype(int)
+                if "已領次數" in export_df.columns:
+                    export_df["已領次數"] = export_df["已領次數"].astype(int)
+                export_df.insert(0, "業務員", sel_agent)
+                export_df.insert(1, "累計截止日期", as_of.isoformat())
+                export_df["資料來源"] = "系統合約"
+
+            hist_export = pd.DataFrame()
+            if not hist_df.empty:
+                hist_export = pd.DataFrame({
+                    "業務員": sel_agent,
+                    "累計截止日期": as_of.isoformat(),
+                    "客戶姓名": hist_df["客戶姓名"],
+                    "生效日": hist_df["生效日"].fillna(""),
+                    "結束日": hist_df["結束日"].fillna(""),
+                    "性質": "歷史補登",
+                    "方案": "",
+                    "利率(%)": "",
+                    "本金(萬)": "",
+                    "期數(月)": "",
+                    "每期利息(萬)": "",
+                    "已領次數": "",
+                    "目前已領(萬)": hist_df["總金額萬"],
+                    "全部領完可領(萬)": hist_df["總金額萬"],
+                    "最近一筆發放日": hist_df["結束日"].fillna(""),
+                    "狀態": "到期",
+                    "資料來源": "歷史補登",
+                    "備註": hist_df["備註"],
+                })
+
+            if not export_df.empty and not hist_export.empty:
+                combined = pd.concat([export_df, hist_export], ignore_index=True)
+            elif not hist_export.empty:
+                combined = hist_export
+            else:
+                combined = export_df
+
+            if not combined.empty:
+                csv = combined.to_csv(index=False).encode("utf-8-sig")
+                safe_names = "_".join(sel_custs)[:40]
+                st.download_button(
+                    "📥 下載累計已領明細 (CSV)",
+                    csv,
+                    f"customer_payout_{sel_agent}_{safe_names}_{as_of}.csv",
+                    "text/csv",
+                    use_container_width=True,
+                )
+        elif not cust_df.empty:
+            st.info("請至少選擇一位客戶。")
 
 elif menu == "📋 合約總覽":
     st.title("📋 合約總覽")
@@ -1187,87 +1576,149 @@ elif menu == "➕ 新增資料":
 
     # --- 第一部分：建立投資合約 ---
     st.markdown("### 1. 建立投資合約")
-    add_mode = st.radio("選擇合約錄入方式", ["單筆手動填寫", "批量 CSV 上傳"], horizontal=True)
+    add_mode = st.radio(
+        "錄入方式",
+        ["單筆手動填寫", "批量 CSV 上傳"],
+        horizontal=True,
+        key="add_contract_mode",
+    )
 
     if add_mode == "單筆手動填寫":
-        st.info("💡 說明：若合約性質為「續約」，請務必選擇「上次利率」，以供系統自動連結歷史軌跡並對帳利變加碼。")
-        
         agent_df = pd.read_sql("SELECT agent_id, name FROM agents ORDER BY sort_order ASC, name ASC", conn)
-        plan_df = pd.read_sql("SELECT plan_id, plan_name || ' (' || annual_rate || '%)' as 展示名稱, period_months FROM rate_plans ORDER BY annual_rate ASC", conn)
+        plan_df = pd.read_sql(
+            "SELECT plan_id, plan_name || ' (' || annual_rate || '%)' as 展示名稱, period_months, annual_rate "
+            "FROM rate_plans ORDER BY annual_rate ASC",
+            conn,
+        )
 
-        # 承辦業務員選單
-        sel_agent_name = st.selectbox("💼 承辦業務員", agent_df['name'] if not agent_df.empty else ["⚠️ 請先新增業務員"], key="agent_select_main")
-
-        # 客戶選擇邏輯
-        col_c1, col_c2 = st.columns([1, 2])
-        with col_c1:
-            is_new_cust = st.checkbox("手動輸入新客戶", value=False)
-        
-        with col_c2:
-            if is_new_cust:
-                target_cust_name = st.text_input("👤 請輸入新客戶姓名", placeholder="例如：王大明")
-            else:
-                if not agent_df.empty and sel_agent_name != "⚠️ 請先新增業務員":
-                    t_agent_id = int(agent_df[agent_df['name'] == sel_agent_name]['agent_id'].values[0])
-                    cust_df = pd.read_sql("SELECT name FROM customers WHERE agent_id = ? ORDER BY name", conn, params=(t_agent_id,))
-                    target_cust_name = st.selectbox("👤 選擇現有客戶", cust_df['name'] if not cust_df.empty else ["⚠️ 該業務名下尚無客戶"])
-                else:
-                    target_cust_name = st.selectbox("👤 選擇現有客戶", ["請先選擇業務員"])
-        
         if 'default_amt' not in st.session_state:
             st.session_state.default_amt = None
 
-        # --- 手動填寫表單區（不使用 st.form，避免按 Enter 誤送出）---
-        col_amt, col_plan = st.columns(2)
-        with col_amt:
-            amt_wan = st.number_input("💰 投資金額 (萬)", min_value=0.0, value=st.session_state.default_amt, step=10.0, placeholder="請輸入金額...", key="amt_wan_input")
-        with col_plan:
-            sel_plan_display = st.selectbox("📈 選擇方案 (本次利率)", plan_df['展示名稱'] if not plan_df.empty else ["⚠️ 請先設定方案"], key="manual_plan_select")
+        existing_rates = pd.read_sql(
+            "SELECT DISTINCT annual_rate FROM rate_plans ORDER BY annual_rate ASC",
+            conn,
+        )['annual_rate'].tolist()
+        if 0.0 not in existing_rates:
+            existing_rates.insert(0, 0.0)
+        rate_options_display = [f"{r:.2f} %" if r > 0 else "0.00 % (新約件)" for r in existing_rates]
+        rate_mapping = dict(zip(rate_options_display, existing_rates))
 
-        # 🎯 核心升級：日期、性質、以及歷史利率選單防呆
-        col_date, col_type, col_prev_rate = st.columns(3)
-        with col_date:
-            start_dt = st.date_input("📅 生效日期", date.today(), key="manual_start_date")
-        with col_type:
-            contract_type_val = st.radio("📄 合約性質", ["新約", "續約"], index=1, horizontal=True, key="manual_contract_type")
-        with col_prev_rate:
-            # 智慧提取系統內所有合法利率數字作為選單，避免打錯字
-            existing_rates = pd.read_sql("SELECT DISTINCT annual_rate FROM rate_plans ORDER BY annual_rate ASC", conn)['annual_rate'].tolist()
-            if 0.0 not in existing_rates:
-                existing_rates.insert(0, 0.0)
-            
-            rate_options_display = [f"{r:.2f} %" if r > 0 else "0.00 % (新約件)" for r in existing_rates]
-            rate_mapping = dict(zip(rate_options_display, existing_rates))
-            
-            # 預設留在 0.0% 如果點選新約；留在非 0 數字如果點選續約（防呆提示）
-            def_idx = 0
-            if contract_type_val == "續約" and len(rate_options_display) > 1:
-                def_idx = 1 # 預設選取第一個非零利率供參考
-                
-            selected_prev_rate_str = st.selectbox("⏮️ 請選擇歷史上一期利率", options=rate_options_display, index=def_idx, key="manual_prev_rate")
+        # 緊湊一屏：對象 + 內容 + 期間 + 利率
+        st.caption("① 對象　② 內容　③ 期間／利率　④ 送出")
+
+        r1a, r1b, r1c = st.columns([1.2, 1.4, 1])
+        with r1a:
+            sel_agent_name = st.selectbox(
+                "承辦業務員",
+                agent_df['name'] if not agent_df.empty else ["⚠️ 請先新增業務員"],
+                key="agent_select_main",
+            )
+        with r1b:
+            is_new_cust = st.toggle("手動輸入新客戶", value=False, key="manual_new_cust_toggle")
+            if is_new_cust:
+                target_cust_name = st.text_input("新客戶姓名", placeholder="例如：王大明", key="manual_new_cust_name")
+            else:
+                if not agent_df.empty and sel_agent_name != "⚠️ 請先新增業務員":
+                    t_agent_id = int(agent_df[agent_df['name'] == sel_agent_name]['agent_id'].values[0])
+                    cust_df = pd.read_sql(
+                        "SELECT name FROM customers WHERE agent_id = ? ORDER BY name",
+                        conn,
+                        params=(t_agent_id,),
+                    )
+                    target_cust_name = st.selectbox(
+                        "現有客戶",
+                        cust_df['name'] if not cust_df.empty else ["⚠️ 該業務名下尚無客戶"],
+                        key="manual_existing_cust",
+                    )
+                else:
+                    target_cust_name = st.selectbox("現有客戶", ["請先選擇業務員"], key="manual_existing_cust_empty")
+        with r1c:
+            contract_type_val = st.radio("合約性質", ["新約", "續約"], index=1, horizontal=True, key="manual_contract_type")
+
+        r2a, r2b, r2c, r2d = st.columns([1, 1.3, 1, 1])
+        with r2a:
+            amt_wan = st.number_input(
+                "金額（萬）",
+                min_value=0.0,
+                value=st.session_state.default_amt,
+                step=10.0,
+                placeholder="金額",
+                key="amt_wan_input",
+            )
+        with r2b:
+            sel_plan_display = st.selectbox(
+                "利率方案",
+                plan_df['展示名稱'] if not plan_df.empty else ["⚠️ 請先設定方案"],
+                key="manual_plan_select",
+            )
+        with r2c:
+            start_dt = st.date_input("生效日", date.today(), key="manual_start_date")
+        with r2d:
+            end_preview = None
+            if not plan_df.empty and sel_plan_display in plan_df['展示名稱'].tolist():
+                months_preview = int(plan_df[plan_df['展示名稱'] == sel_plan_display]['period_months'].values[0])
+                end_preview = start_dt + relativedelta(months=months_preview)
+                st.text_input("結束日", value=end_preview.isoformat(), disabled=True, key="manual_end_preview")
+            else:
+                st.text_input("結束日", value="—", disabled=True, key="manual_end_preview_empty")
+
+        def_idx = 1 if contract_type_val == "續約" and len(rate_options_display) > 1 else 0
+        r3a, r3b = st.columns([1, 2])
+        with r3a:
+            selected_prev_rate_str = st.selectbox(
+                "上次歷史利率",
+                options=rate_options_display,
+                index=def_idx,
+                key="manual_prev_rate",
+                help="續約請選上一期利率；新約通常選 0.00%。",
+            )
             final_prev_rate_num = float(rate_mapping[selected_prev_rate_str])
-        
-        note_val = st.text_input("🗒️ 合約備註 (選填)", key="manual_contract_note")
-        submit_btn = st.button("🚀 確認送出合約", use_container_width=True, type="primary", key="btn_submit_manual_contract")
+        with r3b:
+            note_val = st.text_input("備註（選填）", key="manual_contract_note")
+
+        preview_agent = sel_agent_name if sel_agent_name else "—"
+        preview_cust = (target_cust_name or "—").strip() if target_cust_name else "—"
+        preview_amt = f"{amt_wan:,.2f} 萬" if amt_wan is not None else "—"
+        preview_end = end_preview.isoformat() if end_preview else "—"
+        st.caption(
+            f"預覽：{preview_agent}／{preview_cust}｜{contract_type_val}｜{preview_amt}｜"
+            f"{sel_plan_display}｜{start_dt}→{preview_end}｜上次 {final_prev_rate_num:.2f}%"
+        )
+
+        submit_btn = st.button(
+            "🚀 確認送出合約",
+            use_container_width=True,
+            type="primary",
+            key="btn_submit_manual_contract",
+        )
 
         if submit_btn:
             if not sel_agent_name or sel_agent_name == "⚠️ 請先新增業務員":
                 st.error("❌ 請先選擇業務員。")
-            elif not target_cust_name or "⚠️" in target_cust_name or target_cust_name == "請先選擇業務員":
+            elif not target_cust_name or "⚠️" in str(target_cust_name) or target_cust_name == "請先選擇業務員":
                 st.error("❌ 請選擇或輸入正確的客戶姓名。")
             elif amt_wan is None or amt_wan <= 0:
                 st.error("❌ 請輸入有效的投資金額！")
+            elif plan_df.empty or sel_plan_display not in plan_df['展示名稱'].tolist():
+                st.error("❌ 請先設定並選擇利率方案。")
             else:
                 try:
                     cursor = conn.cursor()
                     final_agent_id = int(agent_df[agent_df['name'] == sel_agent_name]['agent_id'].values[0])
                     cust_name_clean = target_cust_name.strip()
 
-                    cursor.execute("SELECT customer_id FROM customers WHERE name = ? AND agent_id = ?", (cust_name_clean, final_agent_id))
+                    cursor.execute(
+                        "SELECT customer_id FROM customers WHERE name = ? AND agent_id = ?",
+                        (cust_name_clean, final_agent_id),
+                    )
                     res = cursor.fetchone()
-                    if res: final_cust_id = res[0]
+                    if res:
+                        final_cust_id = res[0]
                     else:
-                        cursor.execute("INSERT INTO customers (name, agent_id) VALUES (?, ?)", (cust_name_clean, final_agent_id))
+                        cursor.execute(
+                            "INSERT INTO customers (name, agent_id) VALUES (?, ?)",
+                            (cust_name_clean, final_agent_id),
+                        )
                         final_cust_id = cursor.lastrowid
 
                     p_row = plan_df[plan_df['展示名稱'] == sel_plan_display]
@@ -1275,19 +1726,25 @@ elif menu == "➕ 新增資料":
                     months = int(p_row['period_months'].values[0])
                     real_amount = amt_wan * 10000
                     end_dt = start_dt + relativedelta(months=months)
-                    
-                    # 儲存手動單，並寫入歷史利率數字
+
                     cursor.execute("""
                         INSERT INTO invest_contracts (
-                            customer_id, plan_id, amount, start_date, end_date, 
+                            customer_id, plan_id, amount, start_date, end_date,
                             status, note, contract_type, is_renewed, prev_annual_rate
                         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
-                    """, (final_cust_id, p_id, real_amount, start_dt.isoformat(), end_dt.isoformat(), "Active", note_val, contract_type_val, final_prev_rate_num))
-                    
+                    """, (
+                        final_cust_id, p_id, real_amount,
+                        start_dt.isoformat(), end_dt.isoformat(),
+                        "Active", note_val, contract_type_val, final_prev_rate_num,
+                    ))
+
                     conn.commit()
                     st.session_state.default_amt = None
                     st.balloons()
-                    st.success(f"🎉 成功！已為【{cust_name_clean}】手動建立合約並鏈結上一期利率為 {final_prev_rate_num}%。")
+                    st.success(
+                        f"🎉 成功！已為【{cust_name_clean}】建立合約"
+                        f"（{start_dt} → {end_dt}，上次利率 {final_prev_rate_num:.2f}%）。"
+                    )
                     time.sleep(2)
                     st.rerun()
                 except Exception as e:
@@ -1595,6 +2052,220 @@ elif menu == "➕ 新增資料":
                     st.error(f"建立失敗：{e}")
             else:
                 st.error("請輸入方案名稱")
+
+    # --- 第三部分：歷史已領補登 ---
+    st.divider()
+    st.markdown("### 3. 歷史已領補登")
+    st.info("💡 補登系統上線前舊約：請填寫生效日、結束日、總金額（萬），之後在「歷史收益查詢」會與系統合約明細對齊顯示並自動加總。")
+
+    hp_agents_df = pd.read_sql(
+        "SELECT agent_id, name FROM agents ORDER BY sort_order ASC, name ASC",
+        conn,
+    )
+    if hp_agents_df.empty:
+        st.warning("目前尚無業務員資料，請先建立業務與客戶。")
+    else:
+        st.write("#### ➕ 新增補登")
+        na1, na2 = st.columns(2)
+        with na1:
+            add_agent = st.selectbox("💼 業務員", hp_agents_df["name"].tolist(), key="hp_add_agent")
+        add_agent_id = int(hp_agents_df[hp_agents_df["name"] == add_agent]["agent_id"].values[0])
+        add_cust_df = pd.read_sql(
+            "SELECT customer_id, name FROM customers WHERE agent_id = ? ORDER BY name ASC",
+            conn,
+            params=(add_agent_id,),
+        )
+        with na2:
+            if add_cust_df.empty:
+                st.selectbox("👤 客戶", ["（無客戶）"], disabled=True, key="hp_add_cust_empty")
+                add_cust = None
+            else:
+                add_cust = st.selectbox("👤 客戶", add_cust_df["name"].tolist(), key="hp_add_cust")
+
+        na3, na4, na5 = st.columns(3)
+        with na3:
+            add_start = st.date_input("📅 生效日", value=date.today(), key="hp_add_start")
+        with na4:
+            add_end = st.date_input("📅 結束日", value=date.today(), key="hp_add_end")
+        with na5:
+            add_amount = st.number_input("總金額（萬）", min_value=0.0, step=1.0, format="%.2f", key="hp_add_amt")
+        add_note = st.text_input("備註", placeholder="例如：2022-2023 舊約已領", key="hp_add_note")
+
+        if st.button("💾 新增補登", type="primary", use_container_width=True, key="hp_add_btn"):
+            if not add_cust:
+                st.error("請先選擇客戶。")
+            elif add_amount <= 0:
+                st.error("總金額必須大於 0。")
+            elif add_end < add_start:
+                st.error("結束日不可早於生效日。")
+            else:
+                try:
+                    cust_id = int(add_cust_df[add_cust_df["name"] == add_cust]["customer_id"].values[0])
+                    conn.execute(
+                        """
+                        INSERT INTO historical_payouts (customer_id, amount, start_date, end_date, note, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            cust_id,
+                            float(add_amount),
+                            add_start.isoformat(),
+                            add_end.isoformat(),
+                            add_note.strip(),
+                            datetime.now().isoformat(timespec="seconds"),
+                        ),
+                    )
+                    conn.commit()
+                    st.success(f"✅ 已為【{add_cust}】新增歷史補登 {add_amount:,.2f} 萬（{add_start} ~ {add_end}）")
+                    time.sleep(2)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ 新增失敗：{e}")
+
+        st.write("#### 📋 補登清單／編輯／刪除")
+        list_df = pd.read_sql(
+            """
+            SELECT hp.payout_id as ID, a.name as 業務員, c.name as 客戶姓名,
+                   hp.start_date as 生效日, hp.end_date as 結束日,
+                   hp.amount as 總金額萬, hp.note as 備註, hp.created_at as 建立時間,
+                   hp.customer_id, c.agent_id
+            FROM historical_payouts hp
+            JOIN customers c ON hp.customer_id = c.customer_id
+            JOIN agents a ON c.agent_id = a.agent_id
+            ORDER BY a.sort_order ASC, c.name ASC, hp.start_date DESC, hp.payout_id DESC
+            """,
+            conn,
+        )
+
+        if list_df.empty:
+            st.info("目前尚無任何歷史補登資料。")
+        else:
+            f1, f2 = st.columns(2)
+            with f1:
+                f_agents = ["全部"] + sorted(list_df["業務員"].unique().tolist())
+                f_agent = st.selectbox("篩選業務員", f_agents, key="hp_filter_agent")
+            view_df = list_df if f_agent == "全部" else list_df[list_df["業務員"] == f_agent]
+            with f2:
+                f_custs = ["全部"] + sorted(view_df["客戶姓名"].unique().tolist())
+                f_cust = st.selectbox("篩選客戶", f_custs, key="hp_filter_cust")
+            if f_cust != "全部":
+                view_df = view_df[view_df["客戶姓名"] == f_cust]
+
+            show_list = view_df[["ID", "業務員", "客戶姓名", "生效日", "結束日", "總金額萬", "備註", "建立時間"]].copy()
+            show_list["ID"] = show_list["ID"].astype(int).astype(str)
+            st.dataframe(apply_zebra_style(show_list), use_container_width=True, hide_index=True, height=320)
+            st.caption(f"目前清單合計：NT$ {view_df['總金額萬'].sum():,.2f} 萬（{len(view_df)} 筆）")
+
+            id_opts = view_df["ID"].astype(int).tolist()
+            target_id = st.selectbox(
+                "選擇要維護的補登 ID",
+                id_opts,
+                format_func=lambda i: f"ID {i}｜{view_df.loc[view_df['ID']==i, '客戶姓名'].values[0]}｜{view_df.loc[view_df['ID']==i, '總金額萬'].values[0]:.2f} 萬｜{view_df.loc[view_df['ID']==i, '生效日'].values[0]}~{view_df.loc[view_df['ID']==i, '結束日'].values[0]}",
+                key="hp_target_id",
+            )
+            row = view_df[view_df["ID"] == target_id].iloc[0]
+
+            def _parse_hp_date(val, fallback=None):
+                fallback = fallback or date.today()
+                try:
+                    if pd.notna(val) and str(val).strip():
+                        return pd.to_datetime(val).date()
+                except Exception:
+                    pass
+                return fallback
+
+            tab_edit, tab_del = st.tabs(["✏️ 編輯", "🗑️ 刪除"])
+            with tab_edit:
+                edit_agent = st.selectbox(
+                    "業務員",
+                    hp_agents_df["name"].tolist(),
+                    index=hp_agents_df["name"].tolist().index(row["業務員"]) if row["業務員"] in hp_agents_df["name"].tolist() else 0,
+                    key=f"hp_edit_agent_{target_id}",
+                )
+                edit_agent_id = int(hp_agents_df[hp_agents_df["name"] == edit_agent]["agent_id"].values[0])
+                edit_cust_df = pd.read_sql(
+                    "SELECT customer_id, name FROM customers WHERE agent_id = ? ORDER BY name ASC",
+                    conn,
+                    params=(edit_agent_id,),
+                )
+                edit_cust_names = edit_cust_df["name"].tolist()
+                default_cust_idx = edit_cust_names.index(row["客戶姓名"]) if row["客戶姓名"] in edit_cust_names else 0
+                if edit_cust_df.empty:
+                    st.error("此業務名下無客戶，無法儲存。")
+                else:
+                    edit_cust = st.selectbox("客戶", edit_cust_names, index=default_cust_idx, key=f"hp_edit_cust_{target_id}")
+                    e1, e2, e3 = st.columns(3)
+                    with e1:
+                        edit_start = st.date_input(
+                            "生效日",
+                            value=_parse_hp_date(row["生效日"]),
+                            key=f"hp_edit_start_{target_id}",
+                        )
+                    with e2:
+                        edit_end = st.date_input(
+                            "結束日",
+                            value=_parse_hp_date(row["結束日"]),
+                            key=f"hp_edit_end_{target_id}",
+                        )
+                    with e3:
+                        edit_amount = st.number_input(
+                            "總金額（萬）",
+                            min_value=0.0,
+                            value=float(row["總金額萬"]),
+                            step=1.0,
+                            format="%.2f",
+                            key=f"hp_edit_amt_{target_id}",
+                        )
+                    edit_note = st.text_input(
+                        "備註",
+                        value=str(row["備註"]) if pd.notna(row["備註"]) else "",
+                        key=f"hp_edit_note_{target_id}",
+                    )
+                    if st.button("💾 儲存修改", type="primary", use_container_width=True, key=f"hp_save_{target_id}"):
+                        if edit_amount <= 0:
+                            st.error("總金額必須大於 0。")
+                        elif edit_end < edit_start:
+                            st.error("結束日不可早於生效日。")
+                        else:
+                            try:
+                                new_cust_id = int(edit_cust_df[edit_cust_df["name"] == edit_cust]["customer_id"].values[0])
+                                conn.execute(
+                                    """
+                                    UPDATE historical_payouts
+                                    SET customer_id = ?, amount = ?, start_date = ?, end_date = ?, note = ?
+                                    WHERE payout_id = ?
+                                    """,
+                                    (
+                                        new_cust_id,
+                                        float(edit_amount),
+                                        edit_start.isoformat(),
+                                        edit_end.isoformat(),
+                                        edit_note.strip(),
+                                        int(target_id),
+                                    ),
+                                )
+                                conn.commit()
+                                st.success("✅ 補登資料已更新")
+                                time.sleep(2)
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"❌ 更新失敗：{e}")
+
+            with tab_del:
+                st.error(
+                    f"⚠️ 即將刪除補登 ID {int(target_id)}：{row['客戶姓名']}／"
+                    f"{float(row['總金額萬']):.2f} 萬／{row['生效日']} ~ {row['結束日']}"
+                )
+                confirm = st.checkbox("我確認要永久刪除此筆補登", key=f"hp_del_confirm_{target_id}")
+                if confirm and st.button("🔥 確定刪除", type="primary", use_container_width=True, key=f"hp_del_btn_{target_id}"):
+                    try:
+                        conn.execute("DELETE FROM historical_payouts WHERE payout_id = ?", (int(target_id),))
+                        conn.commit()
+                        st.success(f"✅ 已刪除補登 ID {int(target_id)}")
+                        time.sleep(2)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"❌ 刪除失敗：{e}")
 
 elif menu == "📅 到期續約管理":
     st.title("📅 到期續約管理")
