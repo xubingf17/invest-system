@@ -10,7 +10,7 @@ import calendar
 # import graphviz
 
 
-CURRENT_VERSION = "1.6.0"
+CURRENT_VERSION = "1.6.1"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -2283,69 +2283,107 @@ elif menu == "🌳 團隊組織圖":
         with col1:
             main_zoom = st.slider("🔍 主網頁預覽縮放", 0.05, 1.0, 0.25, 0.05)
         with col2:
-            st.write("") 
+            st.write("")
+            # 全螢幕 / 列印用完整 HTML（含列印樣式）
+            full_html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>團隊組織架構圖</title>
+    <style>
+        body {{ margin:0; font-family:"Microsoft JhengHei", "PingFang TC", Arial, sans-serif; background:#fdfdfd; }}
+        #vp {{ width:100vw; height:100vh; overflow: auto; display: block; }}
+        #sf {{
+            display: inline-block;
+            padding: 60px;
+            transform-origin: 0 0;
+            transform: scale(0.7);
+            white-space: nowrap;
+            transition: transform 0.1s ease;
+        }}
+        .tree-hor ul {{ padding-left: 60px; position: relative; list-style-type: none; margin: 0; }}
+        .tree-hor li {{ position: relative; padding: 10px 0 10px 60px; display: flex; align-items: center; }}
+        .tree-hor li::after {{
+            content: ''; position: absolute; top: 0; left: 0;
+            border-left: 3px solid #444; height: 100%; width: 0;
+        }}
+        .tree-hor li:first-child::after {{ height: 50%; top: 50%; }}
+        .tree-hor li:last-child::after {{ height: 50%; }}
+        .tree-hor li:only-child::after {{ display: none; }}
+        .tree-hor li::before {{
+            content: ''; position: absolute; top: 50%; left: 0;
+            border-top: 3px solid #444; width: 60px; height: 0;
+        }}
+        .tree-hor > ul > li::before, .tree-hor > ul > li::after {{ display: none; }}
+        .tree-hor > ul > li {{ padding-left: 0; }}
+        .node-card {{ border: 3px solid #fff; padding: 12px 25px; min-width: 160px; text-align: center; border-radius: 10px; box-shadow: 4px 4px 10px rgba(0,0,0,0.15); z-index: 10; position: relative; }}
+        .node-card .name {{ font-size: 28px; font-weight: bold; }}
+        .node-card .rank {{ font-size: 16px; border-top: 1px solid rgba(255,255,255,0.3); margin-top: 5px; }}
+        .controls {{ position:fixed; top:20px; left:20px; z-index:9999; display:flex; gap:10px; background:white; padding:10px; border-radius:10px; box-shadow:0 4px 15px rgba(0,0,0,0.1); }}
+        .btn {{ padding:8px 15px; border:none; border-radius:5px; cursor:pointer; font-weight:bold; background:#f0f2f6; }}
+        @media print {{
+            .controls {{ display:none !important; }}
+            body, #vp {{ overflow: visible !important; height: auto !important; width: auto !important; }}
+            #sf {{ transform: scale(0.6) !important; position: relative !important; padding: 20px !important; top: 0 !important; left: 0 !important; }}
+        }}
+    </style>
+</head>
+<body>
+    <div class="controls">
+        <button class="btn" onclick="z(0.1)">➕ 放大</button>
+        <button class="btn" onclick="z(-0.1)">➖ 縮小</button>
+        <button class="btn" onclick="window.print()" style="background:#FF4B4B; color:white;">🖨️ 列印 / 另存 PDF</button>
+    </div>
+    <div id="vp"><div id="sf"><div class="tree-hor"><ul>{tree_content}</ul></div></div></div>
+    <script>
+        let s = 0.7;
+        const f = document.getElementById('sf');
+        function z(d) {{
+            s = Math.min(Math.max(0.1, s + d), 3);
+            f.style.transform = 'scale(' + s + ')';
+        }}
+    </script>
+</body>
+</html>"""
             import base64
-            # 🚀 全螢幕版本 HTML：重點在於 @media print 的修正
-            full_html = f"""
-            <html>
-            <head>
-                <meta charset='utf-8'>
-                <style>
-                    body {{ margin:0; font-family:"Microsoft JhengHei", Arial; background:#fdfdfd; }}
-                    #vp {{ width:100vw; height:100vh; overflow: auto; display: block; }}
-                    #sf {{ 
-                        display: inline-block;
-                        padding: 60px; 
-                        transform-origin: 0 0; 
-                        transform: scale(0.7); 
-                        white-space: nowrap; 
-                        transition: transform 0.1s ease;
+            b64 = base64.b64encode(full_html.encode("utf-8")).decode("ascii")
+            # 改用 Blob 開新分頁（Chrome 會擋 data: 連結，導致空白頁）
+            open_btn_html = f"""
+            <button id="openOrgBtn" style="
+                width:100%; background:#29B6F6; color:white; border:none; padding:12px 10px;
+                border-radius:8px; font-weight:bold; font-size:15px; cursor:pointer;
+            ">🖥️ 全螢幕瀏覽 / 列印</button>
+            <div id="msg" style="font-size:12px; color:#666; margin-top:6px;"></div>
+            <script>
+            document.getElementById('openOrgBtn').addEventListener('click', function() {{
+                try {{
+                    const bytes = Uint8Array.from(atob("{b64}"), c => c.charCodeAt(0));
+                    const html = new TextDecoder('utf-8').decode(bytes);
+                    const blob = new Blob([html], {{ type: 'text/html;charset=utf-8' }});
+                    const url = URL.createObjectURL(blob);
+                    const w = window.open(url, '_blank');
+                    if (!w) {{
+                        document.getElementById('msg').textContent = '瀏覽器擋下彈出視窗，請改用下方「下載 HTML」後開啟。';
+                    }} else {{
+                        setTimeout(function() {{ URL.revokeObjectURL(url); }}, 60000);
                     }}
-                    .tree-hor ul {{ padding-left: 60px; position: relative; list-style-type: none; margin: 0; }}
-                    .tree-hor li {{ position: relative; padding: 10px 0 10px 60px; display: flex; align-items: center; }}
-                    .tree-hor li::after {{
-                        content: ''; position: absolute; top: 0; left: 0;
-                        border-left: 3px solid #444; height: 100%; width: 0;
-                    }}
-                    .tree-hor li:first-child::after {{ height: 50%; top: 50%; }}
-                    .tree-hor li:last-child::after {{ height: 50%; }}
-                    .tree-hor li:only-child::after {{ display: none; }}
-                    .tree-hor li::before {{
-                        content: ''; position: absolute; top: 50%; left: 0;
-                        border-top: 3px solid #444; width: 60px; height: 0;
-                    }}
-                    .tree-hor > ul > li::before, .tree-hor > ul > li::after {{ display: none; }}
-                    .tree-hor > ul > li {{ padding-left: 0; }}
-                    .node-card {{ border: 3px solid #fff; padding: 12px 25px; min-width: 160px; text-align: center; border-radius: 10px; box-shadow: 4px 4px 10px rgba(0,0,0,0.15); z-index: 10; position: relative; }}
-                    .node-card .name {{ font-size: 28px; font-weight: bold; }}
-                    .node-card .rank {{ font-size: 16px; border-top: 1px solid rgba(255,255,255,0.3); margin-top: 5px; }}
-                    .controls {{ position:fixed; top:20px; left:20px; z-index:9999; display:flex; gap:10px; background:white; padding:10px; border-radius:10px; box-shadow:0 4px 15px rgba(0,0,0,0.1); }}
-                    .btn {{ padding:8px 15px; border:none; border-radius:5px; cursor:pointer; font-weight:bold; background:#f0f2f6; }}
-
-                    /* 🎯 關鍵列印優化：確保印出完整表格而非只有視窗內的部分 */
-                    @media print {{
-                        .controls {{ display:none; }}
-                        body, #vp {{ overflow: visible !important; height: auto !important; width: auto !important; }}
-                        #sf {{ transform: scale(0.6) !important; position: relative !important; padding: 0 !important; top: 0 !important; left: 0 !important; }}
-                    }}
-                </style>
-            </head>
-            <body>
-                <div class="controls">
-                    <button class="btn" onclick="z(0.1)">➕ 放大</button>
-                    <button class="btn" onclick="z(-0.1)">➖ 縮小</button>
-                    <button class="btn" onclick="window.print()" style="background:#FF4B4B; color:white;">🖨️ 列印完整 PDF</button>
-                </div>
-                <div id='vp'><div id='sf'><div class='tree-hor'><ul>{tree_content}</ul></div></div></div>
-                <script>
-                    let s=0.7; const f=document.getElementById('sf');
-                    function z(d){{ s=Math.min(Math.max(0.1,s+d),3); f.style.transform=`scale(${{s}})`; }}
-                </script>
-            </body>
-            </html>
+                }} catch (e) {{
+                    document.getElementById('msg').textContent = '開啟失敗，請改用下方下載 HTML。';
+                }}
+            }});
+            </script>
             """
-            b64 = base64.b64encode(full_html.encode('utf-8')).decode('utf-8')
-            st.markdown(f'<a href="data:text/html;base64,{b64}" target="_blank" style="text-decoration:none;"><div style="background:#81D4FA;color:white;padding:10px;border-radius:8px;text-align:center;font-weight:bold;cursor:pointer;">全螢幕瀏覽</div></a>', unsafe_allow_html=True)
+            st.components.v1.html(open_btn_html, height=70)
+
+        st.download_button(
+            "📥 下載組織圖 HTML（開啟後可列印 / 另存 PDF）",
+            data=full_html.encode("utf-8"),
+            file_name=f"團隊組織架構圖_{date.today()}.html",
+            mime="text/html",
+            use_container_width=True,
+            help="若全螢幕瀏覽出現空白頁，請改下載此檔，用瀏覽器開啟後再按列印並選擇「儲存為 PDF」。",
+        )
+        st.caption("💡 列印方式：全螢幕開啟或下載 HTML → 按「列印 / 另存 PDF」→ 目的地選「儲存為 PDF」。若點全螢幕是空白，多半是瀏覽器擋 data 連結，請改用下載。")
 
         # 4. 主頁面預覽
         preview_html = f"""
