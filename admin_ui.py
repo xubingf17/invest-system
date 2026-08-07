@@ -10,7 +10,7 @@ import calendar
 # import graphviz
 
 
-CURRENT_VERSION = "1.6.2"
+CURRENT_VERSION = "1.6.3"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -1604,7 +1604,7 @@ elif menu == "➕ 新增資料":
         rate_mapping = dict(zip(rate_options_display, existing_rates))
 
         # 緊湊一屏：對象 + 內容 + 期間 + 利率
-        st.caption("① 對象　② 內容　③ 期間／利率　④ 送出")
+        # st.caption("① 對象　② 內容　③ 期間／利率　④ 送出")
 
         r1a, r1b, r1c = st.columns([1.2, 1.4, 1])
         with r1a:
