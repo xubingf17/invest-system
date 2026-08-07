@@ -10,7 +10,7 @@ import calendar
 # import graphviz
 
 
-CURRENT_VERSION = "1.6.3"
+CURRENT_VERSION = "1.6.4"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
@@ -3171,3 +3171,4 @@ elif menu == "⚙️ 業務排序設定":
 st.markdown("---")
 st.caption(f"© 2026 Bing Xu. All Rights Reserved. | 投資管理系統 v{CURRENT_VERSION}")
 st.caption("本軟體僅供授權用戶使用，嚴禁任何形式之未經授權重製、散佈或商業用途。")
+st.caption("與我聯絡： xubingf17@gmail.com")
