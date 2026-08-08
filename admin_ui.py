@@ -10,12 +10,10 @@ import calendar
 # import graphviz
 
 
-CURRENT_VERSION = "1.6.6"
+CURRENT_VERSION = "1.6.7"
 
-# --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
 
-# --- 授權檢查（30 天離線寬限；有網路則重驗 Sheet 可使用並刷新）---
 from license import ensure_license_streamlit
 
 ensure_license_streamlit()
@@ -1189,7 +1187,7 @@ elif menu == "📋 合約總覽":
                                 """, (final_cust_id, new_p_id, new_amt*10000, new_s_dt.isoformat(), new_e_dt.isoformat(), new_n, new_type, final_prev_rate_num, edit_id))
                                 conn.commit()
                                 st.success("🎉 本單據合約與歷史利率資料已成功修正！")
-                                time.sleep(2)
+                                time.sleep(10)
                                 st.rerun()
                             except Exception as e:
                                 st.error(f"❌ 修正失敗：{e}")
@@ -1207,7 +1205,7 @@ elif menu == "📋 合約總覽":
                     if st.button(f"🔥 確定刪除 ID:{del_id}", type="primary", use_container_width=True):
                         conn.execute("DELETE FROM invest_contracts WHERE contract_id=?", (del_id,))
                         conn.commit()
-                        st.success(f"🗑️ 已移除資料"); time.sleep(2); st.rerun()
+                        st.success(f"🗑️ 已移除資料"); time.sleep(10); st.rerun()
     else:
         st.info("⚠️ 目前資料庫中無任何合約。")
         
@@ -1273,7 +1271,7 @@ elif menu == "⚙️ 基礎資料設定":
                         
                         conn.commit()
                         st.success(f"✅ 更新成功！已將資料同步至系統。")
-                        time.sleep(2)
+                        time.sleep(10)
                         st.rerun()
                     except Exception as e:
                         st.error(f"變更失敗：{e}")
@@ -1310,7 +1308,7 @@ elif menu == "⚙️ 基礎資料設定":
                             conn.execute("DELETE FROM agents WHERE agent_id = ?", (t_id,))
                             conn.commit()
                             st.success(f"✅ 已成功移除業務員：{old_name}")
-                            time.sleep(2)
+                            time.sleep(10)
                             st.rerun()
                     except Exception as e:
                         st.error(f"❌ 刪除失敗：{e}")
@@ -1349,7 +1347,7 @@ elif menu == "⚙️ 基礎資料設定":
                                  (new_r_name, new_r_comm/100.0, int(curr_r['rank_id'])))
                     conn.commit()
                     st.success("更新成功")
-                    time.sleep(2)
+                    time.sleep(10)
                     st.rerun()
 
             if st.button(f"❌ 刪除職級：{target_rank}", type="secondary", use_container_width=True):
@@ -1360,7 +1358,7 @@ elif menu == "⚙️ 基礎資料設定":
                     conn.execute("DELETE FROM ranks WHERE rank_id = ?", (int(curr_r['rank_id']),))
                     conn.commit()
                     st.warning(f"已刪除職級：{target_rank}")
-                    time.sleep(2)
+                    time.sleep(10)
                     st.rerun()
 
     st.divider()
@@ -1396,7 +1394,7 @@ elif menu == "⚙️ 基礎資料設定":
                                  (new_p_name, new_p_rate, new_p_period, int(p_info['plan_id'])))
                     conn.commit()
                     st.success("方案更新成功")
-                    time.sleep(2)
+                    time.sleep(10)
                     st.rerun()
 
             if st.button(f"❌ 刪除方案：{target_p}", type="secondary", use_container_width=True, key=f"del_btn_{target_p}"):
@@ -1407,7 +1405,7 @@ elif menu == "⚙️ 基礎資料設定":
                     conn.execute("DELETE FROM rate_plans WHERE plan_id = ?", (int(p_info['plan_id']),))
                     conn.commit()
                     st.warning(f"已刪除方案：{target_p}")
-                    time.sleep(2)
+                    time.sleep(10)
                     st.rerun()
     st.divider()
     # --- 危險操作區 ---
@@ -1433,7 +1431,7 @@ elif menu == "⚙️ 基礎資料設定":
                     
                     conn.commit()
                     st.success("✅ 所有合約資料已清空，計數器已重置！")
-                    time.sleep(2)
+                    time.sleep(10)
                     st.rerun()
                 except Exception as e:
                     st.error(f"❌ 刪除失敗：{e}")
@@ -1578,7 +1576,7 @@ elif menu == "👤 客戶資料管理":
                             )
                             conn.commit()
                             st.success(f"重新整理中... 已成功修正客戶：{edit_c_name}")
-                            time.sleep(2)
+                            time.sleep(10)
                             st.rerun()
                         except Exception as e:
                             st.error(f"❌ 修正失敗：{e}")
@@ -1602,7 +1600,7 @@ elif menu == "👤 客戶資料管理":
                             conn.execute("DELETE FROM customers WHERE customer_id = ?", (target_id,))
                             conn.commit()
                             st.success(f"✅ 已成功移除客戶：{target_name_only}")
-                            time.sleep(2)
+                            time.sleep(10)
                             st.rerun()
                     except Exception as e:
                         st.error(f"❌ 刪除失敗：{e}")
@@ -1805,7 +1803,7 @@ elif menu == "➕ 新增資料":
                         f"🎉 成功！已為【{cust_name_clean}】建立合約"
                         f"（{start_dt} → {end_dt}，上次利率 {final_prev_rate_num:.2f}%）。"
                     )
-                    time.sleep(2)
+                    time.sleep(10)
                     st.rerun()
                 except Exception as e:
                     st.error(f"❌ 系統錯誤：{e}")
@@ -1956,7 +1954,7 @@ elif menu == "➕ 新增資料":
                     if not current_errors:
                         st.balloons()
                         st.success(f"🎉 批量智慧匯入成功！共完成 {success_count} 筆，資料百分之百正確。")
-                        time.sleep(2)
+                        time.sleep(10)
                         st.rerun()
                     else:
                         st.warning(f"⚠️ 匯入完成，但因利率或格式不符，自動攔截並跳過了 {len(current_errors)} 處錯誤。")
@@ -2033,7 +2031,7 @@ elif menu == "➕ 新增資料":
                 conn.execute("INSERT INTO ranks (rank_name, commission_rate) VALUES (?, ?)", (r_name, r_comm/100))
                 conn.commit()
                 st.success(f"✅ 職級 {r_name} 已成功建立！")
-                time.sleep(2)
+                time.sleep(10)
                 st.rerun()
             else:
                 st.error("請輸入職級名稱")
@@ -2059,7 +2057,7 @@ elif menu == "➕ 新增資料":
                 conn.execute("INSERT INTO agents (name, rank_id, boss_id) VALUES (?, ?, ?)", (a_name, r_id, b_id))
                 conn.commit()
                 st.success(f"✅ 業務員 {a_name} 已成功建立！")
-                time.sleep(2)
+                time.sleep(10)
                 st.rerun()
             else:
                 st.error("請填寫姓名並確保已有職級資料")
@@ -2085,7 +2083,7 @@ elif menu == "➕ 新增資料":
                 )
                 conn.commit()
                 st.success(f"✅ 客戶 {c_name} 已成功建立！")
-                time.sleep(2)
+                time.sleep(10)
                 st.rerun()
             else:
                 st.error("請填寫客戶姓名並確保已有業務員資料")
@@ -2106,7 +2104,7 @@ elif menu == "➕ 新增資料":
                     )
                     conn.commit()
                     st.success(f"✅ 方案 {p_name} 已成功建立！")
-                    time.sleep(2)
+                    time.sleep(10)
                     st.rerun()
                 except Exception as e:
                     st.error(f"建立失敗：{e}")
@@ -2177,7 +2175,7 @@ elif menu == "➕ 新增資料":
                     )
                     conn.commit()
                     st.success(f"✅ 已為【{add_cust}】新增歷史補登 {add_amount:,.2f} 萬（{add_start} ~ {add_end}）")
-                    time.sleep(2)
+                    time.sleep(10)
                     st.rerun()
                 except Exception as e:
                     st.error(f"❌ 新增失敗：{e}")
@@ -2306,7 +2304,7 @@ elif menu == "➕ 新增資料":
                                 )
                                 conn.commit()
                                 st.success("✅ 補登資料已更新")
-                                time.sleep(2)
+                                time.sleep(10)
                                 st.rerun()
                             except Exception as e:
                                 st.error(f"❌ 更新失敗：{e}")
@@ -2322,7 +2320,7 @@ elif menu == "➕ 新增資料":
                         conn.execute("DELETE FROM historical_payouts WHERE payout_id = ?", (int(target_id),))
                         conn.commit()
                         st.success(f"✅ 已刪除補登 ID {int(target_id)}")
-                        time.sleep(2)
+                        time.sleep(10)
                         st.rerun()
                     except Exception as e:
                         st.error(f"❌ 刪除失敗：{e}")
@@ -2566,7 +2564,7 @@ elif menu == "📅 到期續約管理":
                                 conn.commit()
                                 st.session_state.renew_checked_ids.clear()
                                 st.session_state.renew_sync_key += 1
-                                time.sleep(2)
+                                time.sleep(10)
                                 st.rerun()
 
                             except Exception as e:
@@ -3223,7 +3221,7 @@ elif menu == "⚙️ 業務排序設定":
                 cursor.execute("UPDATE agents SET sort_order = ? WHERE agent_id = ?", (row['sort_order'], row['agent_id']))
             conn.commit()
             st.success("✅ 排序設定已成功同步至資料庫！")
-            time.sleep(2)
+            time.sleep(10)
             st.rerun()
         except Exception as e:
             st.error(f"❌ 儲存失敗：{e}")
