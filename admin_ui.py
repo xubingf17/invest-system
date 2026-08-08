@@ -10,10 +10,15 @@ import calendar
 # import graphviz
 
 
-CURRENT_VERSION = "1.6.5"
+CURRENT_VERSION = "1.6.6"
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
+
+# --- 授權檢查（30 天離線寬限；有網路則重驗 Sheet 可使用並刷新）---
+from license import ensure_license_streamlit
+
+ensure_license_streamlit()
 
 st.markdown("""
     <style>
@@ -258,8 +263,55 @@ def force_add_columns(conn):
     
     # st.toast("資料庫結構檢查完成", icon="🔍")
 
-# 執行強制檢查
-force_add_columns(conn)
+
+def auto_close_expired_contracts(conn):
+    """每週三執行一次：結束日已過且未續約的 Active 合約 → Closed。"""
+    today = date.today()
+    if today.weekday() != 2:  # 0=Mon … 2=Wed
+        return
+
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS system_jobs (
+            job_name TEXT PRIMARY KEY,
+            last_run TEXT
+        )
+    """)
+    conn.commit()
+
+    row = cursor.execute(
+        "SELECT last_run FROM system_jobs WHERE job_name = ?",
+        ("auto_close_expired",),
+    ).fetchone()
+    if row and row[0] == today.isoformat():
+        return
+
+    cursor.execute(
+        """
+        UPDATE invest_contracts
+        SET status = 'Closed'
+        WHERE status = 'Active'
+          AND end_date < ?
+          AND IFNULL(is_renewed, 0) = 0
+        """,
+        (today.isoformat(),),
+    )
+    closed_n = cursor.rowcount
+    cursor.execute(
+        "INSERT OR REPLACE INTO system_jobs (job_name, last_run) VALUES (?, ?)",
+        ("auto_close_expired", today.isoformat()),
+    )
+    conn.commit()
+
+    if closed_n > 0:
+        st.toast(f"已自動結案 {closed_n} 筆到期未續約合約", icon="📅")
+
+
+# 執行強制檢查（每個瀏覽器 session 只跑一次，避免切頁卡頓）
+if not st.session_state.get("_db_schema_ready"):
+    force_add_columns(conn)
+    auto_close_expired_contracts(conn)
+    st.session_state["_db_schema_ready"] = True
 
 # --- 側邊欄導航 (由 selectbox 改為 sidebar.radio) ---
 with st.sidebar:
@@ -592,7 +644,10 @@ elif menu == "📖 歷史收益查詢":
                 m += 1
         return len(payout_dates), payout_dates
 
-    def map_status(raw):
+    def map_status(raw, end_date=None, as_of_date=None):
+        """顯示狀態：優先依結束日相對截止日期判斷，避免 DB 仍為 Active 但已過期。"""
+        if end_date is not None and as_of_date is not None and end_date < as_of_date:
+            return "到期"
         s = str(raw).strip().lower() if pd.notna(raw) else ""
         if s == "active":
             return "進行中"
@@ -667,7 +722,7 @@ elif menu == "📖 歷史收益查詢":
                 times_full, _ = count_payouts_received(start_d, end_d, end_d)
                 got_now = round(monthly * times_now, 2)
                 got_full = round(monthly * times_full, 2)
-                status_label = map_status(row["狀態"])
+                status_label = map_status(row["狀態"], end_d, as_of)
                 rows.append({
                     "客戶姓名": row["客戶姓名"],
                     "合約ID": int(row["合約ID"]),
@@ -747,8 +802,10 @@ elif menu == "📖 歷史收益查詢":
                 if not result_df.empty:
                     sys_part = result_df[[
                         "客戶姓名", "生效日", "結束日", "性質",
+                        "本金(萬)", "方案", "利率(%)",
                         "目前已領(萬)", "全部領完可領(萬)", "狀態"
                     ]].copy()
+                    sys_part = sys_part.rename(columns={"方案": "方案名稱", "利率(%)": "利率"})
                     sys_part["資料來源"] = "系統合約"
                     aligned_parts.append(sys_part)
                 if not hist_df.empty:
@@ -757,6 +814,9 @@ elif menu == "📖 歷史收益查詢":
                         "生效日": hist_df["生效日"].fillna("-"),
                         "結束日": hist_df["結束日"].fillna("-"),
                         "性質": "歷史補登",
+                        "本金(萬)": "",
+                        "方案名稱": "",
+                        "利率": "",
                         "目前已領(萬)": hist_df["總金額萬"],
                         "全部領完可領(萬)": hist_df["總金額萬"],
                         "狀態": "到期",
