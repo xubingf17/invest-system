@@ -10,7 +10,7 @@ import calendar
 # import graphviz
 
 
-CURRENT_VERSION = "1.6.7"
+CURRENT_VERSION = "1.6.8"
 
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
 
@@ -772,25 +772,37 @@ elif menu == "📖 歷史收益查詢":
             contract_now = float(result_df["目前已領(萬)"].sum()) if not result_df.empty else 0.0
             total_now = contract_now + hist_total
             active_mask = result_df["狀態"] == "進行中" if not result_df.empty else pd.Series(dtype=bool)
+            active_principal = float(result_df.loc[active_mask, "本金(萬)"].sum()) if active_mask.any() else 0.0
             active_full = float(result_df.loc[active_mask, "全部領完可領(萬)"].sum()) if active_mask.any() else 0.0
             active_full_with_hist = active_full + hist_total
             all_full = (float(result_df["全部領完可領(萬)"].sum()) if not result_df.empty else 0.0) + hist_total
             total_contract_count = len(result_df) + (len(hist_df) if not hist_df.empty else 0)
 
+            earliest_start = None
+            if not result_df.empty:
+                earliest_start = pd.to_datetime(result_df["生效日"], errors="coerce").min()
+                if pd.notna(earliest_start):
+                    earliest_start = earliest_start.date()
+                else:
+                    earliest_start = None
+            if not hist_df.empty:
+                hist_starts = pd.to_datetime(hist_df["生效日"], errors="coerce").dropna()
+                if not hist_starts.empty:
+                    hmin = hist_starts.min().date()
+                    earliest_start = hmin if earliest_start is None else min(earliest_start, hmin)
+            earliest_label = earliest_start.isoformat() if earliest_start else "-"
+
             cust_label = "、".join(sel_custs)
             st.divider()
             st.subheader(f"📊 {sel_agent} ／ {cust_label}　截至 {as_of}")
-            render_adaptive_metrics([
-                ("客戶人數", f"{len(sel_custs)} 人"),
-                ("合約筆數", f"{total_contract_count} 筆"),
-                ("目前已領", f"NT$ {total_now:,.2f} 萬"),
-                ("進行中合約全部領完", f"NT$ {active_full_with_hist:,.2f} 萬"),
-            ])
-            # st.caption(
-            #     f"系統合約目前已領 NT$ {contract_now:,.2f} 萬 ＋ 歷史補登 NT$ {hist_total:,.2f} 萬；"
-            #     f"進行中系統合約全部領完 NT$ {active_full:,.2f} 萬 ＋ 歷史補登 NT$ {hist_total:,.2f} 萬；"
-            #     f"含已到期後的全部領完總額：NT$ {all_full:,.2f} 萬"
-            # )
+            m1, m2, m3 = st.columns(3)
+            m1.metric("客戶人數", f"{len(sel_custs)} 人")
+            m2.metric("合約筆數", f"{total_contract_count} 筆")
+            m3.metric("進行中合約總金額", f"NT$ {active_principal:,.2f} 萬")
+            m4, m5, m6 = st.columns(3)
+            m4.metric("目前已領", f"NT$ {total_now:,.2f} 萬")
+            m5.metric("進行中合約全部領完", f"NT$ {active_full_with_hist:,.2f} 萬")
+            m6.metric("最早生效日", earliest_label)
 
             if result_df.empty and hist_df.empty:
                 st.warning("所選客戶目前尚無合約，也尚無歷史補登資料。")
@@ -915,6 +927,31 @@ elif menu == "📖 歷史收益查詢":
                 combined = export_df
 
             if not combined.empty:
+                summary = {col: "" for col in combined.columns}
+                summary["業務員"] = sel_agent
+                summary["累計截止日期"] = as_of.isoformat()
+                summary["客戶姓名"] = "【彙總】"
+                if "本金(萬)" in summary:
+                    summary["本金(萬)"] = round(active_principal, 2)
+                if "目前已領(萬)" in summary:
+                    summary["目前已領(萬)"] = round(total_now, 2)
+                if "全部領完可領(萬)" in summary:
+                    summary["全部領完可領(萬)"] = round(active_full_with_hist, 2)
+                if "資料來源" in summary:
+                    summary["資料來源"] = "彙總"
+                if "備註" in summary:
+                    summary["備註"] = (
+                        f"目前已領={total_now:,.2f}萬；"
+                        f"進行中全部領完={active_full_with_hist:,.2f}萬；"
+                        f"進行中總金額={active_principal:,.2f}萬"
+                    )
+                elif "性質" in summary:
+                    summary["性質"] = (
+                        f"目前已領={total_now:,.2f}／"
+                        f"進行中全部領完={active_full_with_hist:,.2f}／"
+                        f"進行中總金額={active_principal:,.2f}"
+                    )
+                combined = pd.concat([combined, pd.DataFrame([summary])], ignore_index=True)
                 csv = combined.to_csv(index=False).encode("utf-8-sig")
                 safe_names = "_".join(sel_custs)[:40]
                 st.download_button(
