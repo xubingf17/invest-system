@@ -10,7 +10,7 @@ import calendar
 # import graphviz
 
 
-CURRENT_VERSION = "1.6.8"
+CURRENT_VERSION = "1.6.9"
 
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
 
@@ -773,8 +773,7 @@ elif menu == "📖 歷史收益查詢":
             total_now = contract_now + hist_total
             active_mask = result_df["狀態"] == "進行中" if not result_df.empty else pd.Series(dtype=bool)
             active_principal = float(result_df.loc[active_mask, "本金(萬)"].sum()) if active_mask.any() else 0.0
-            active_full = float(result_df.loc[active_mask, "全部領完可領(萬)"].sum()) if active_mask.any() else 0.0
-            active_full_with_hist = active_full + hist_total
+            # 全部領完＝所有系統合約（含已到期）＋歷史補登
             all_full = (float(result_df["全部領完可領(萬)"].sum()) if not result_df.empty else 0.0) + hist_total
             total_contract_count = len(result_df) + (len(hist_df) if not hist_df.empty else 0)
 
@@ -801,7 +800,7 @@ elif menu == "📖 歷史收益查詢":
             m3.metric("進行中合約總金額", f"NT$ {active_principal:,.2f} 萬")
             m4, m5, m6 = st.columns(3)
             m4.metric("目前已領", f"NT$ {total_now:,.2f} 萬")
-            m5.metric("進行中合約全部領完", f"NT$ {active_full_with_hist:,.2f} 萬")
+            m5.metric("全部領完可領", f"NT$ {all_full:,.2f} 萬")
             m6.metric("最早生效日", earliest_label)
 
             if result_df.empty and hist_df.empty:
@@ -936,19 +935,19 @@ elif menu == "📖 歷史收益查詢":
                 if "目前已領(萬)" in summary:
                     summary["目前已領(萬)"] = round(total_now, 2)
                 if "全部領完可領(萬)" in summary:
-                    summary["全部領完可領(萬)"] = round(active_full_with_hist, 2)
+                    summary["全部領完可領(萬)"] = round(all_full, 2)
                 if "資料來源" in summary:
                     summary["資料來源"] = "彙總"
                 if "備註" in summary:
                     summary["備註"] = (
                         f"目前已領={total_now:,.2f}萬；"
-                        f"進行中全部領完={active_full_with_hist:,.2f}萬；"
+                        f"全部領完可領={all_full:,.2f}萬；"
                         f"進行中總金額={active_principal:,.2f}萬"
                     )
                 elif "性質" in summary:
                     summary["性質"] = (
                         f"目前已領={total_now:,.2f}／"
-                        f"進行中全部領完={active_full_with_hist:,.2f}／"
+                        f"全部領完可領={all_full:,.2f}／"
                         f"進行中總金額={active_principal:,.2f}"
                     )
                 combined = pd.concat([combined, pd.DataFrame([summary])], ignore_index=True)
