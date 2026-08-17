@@ -10,7 +10,7 @@ import calendar
 # import graphviz
 
 
-CURRENT_VERSION = "1.7.4"
+CURRENT_VERSION = "1.7.5"
 
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
 
