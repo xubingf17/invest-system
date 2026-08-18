@@ -5,12 +5,14 @@ from datetime import datetime, date
 from dateutil.relativedelta import relativedelta
 from io import BytesIO
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 import calendar
+import tempfile
+from pathlib import Path
 # import graphviz
 
 
-CURRENT_VERSION = "1.7.7"
+CURRENT_VERSION = "1.7.8"
 
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
 
@@ -176,6 +178,17 @@ def get_connection():
 
 conn = get_connection()
 
+
+def create_database_backup(source_conn):
+    """建立一致的 SQLite 線上備份，回傳檔名與可下載內容。"""
+    taiwan_time = datetime.now(timezone(timedelta(hours=8)))
+    filename = taiwan_time.strftime("%Y%m%d_%H%M%S.db")
+    with tempfile.TemporaryDirectory() as temp_dir:
+        destination = Path(temp_dir) / filename
+        with sqlite3.connect(str(destination)) as backup_conn:
+            source_conn.backup(backup_conn)
+        return filename, destination.read_bytes()
+
 # --- 強制檢查並補上缺失欄位 ---
 def force_add_columns(conn):
     cursor = conn.cursor()
@@ -316,7 +329,7 @@ with st.sidebar:
     st.title("📂 系統總覽")
     menu = st.sidebar.radio(
         "請選擇功能模組：",
-        ["📋 合約總覽","📅 到期續約管理" , "💰 收益發放試算","📖 歷史收益查詢","💰 業務佣", "👤 客戶資料管理", "🌳 團隊組織圖","➕ 新增資料", "⚙️ 基礎資料設定", "⚙️ 業務排序設定"],
+        ["📋 合約總覽","📅 到期續約管理" , "💰 收益發放試算","📖 歷史收益查詢","💰 業務佣", "👤 客戶資料管理", "🌳 團隊組織圖","➕ 新增資料", "⚙️ 基礎資料設定", "⚙️ 業務排序設定", "💾 資料庫備份"],
         index=0,
         label_visibility="collapsed"
     )
@@ -370,8 +383,33 @@ with st.sidebar:
             except Exception as e:
                 st.error(f"❌ 檢查更新時發生錯誤：{e}")
 
+# --- 資料庫備份 ---
+if menu == "💾 資料庫備份":
+    st.title("💾 資料庫備份")
+    st.info("先產生目前資料庫的完整備份，再透過瀏覽器下載並選擇儲存位置。")
+
+    if st.button("產生資料庫備份", type="primary"):
+        try:
+            backup_name, backup_data = create_database_backup(conn)
+            st.session_state["backup_filename"] = backup_name
+            st.session_state["backup_data"] = backup_data
+            st.success("✅ 備份檔已產生，請按下方按鈕儲存。")
+        except Exception as e:
+            st.error(f"❌ 備份失敗：{e}")
+
+    if st.session_state.get("backup_data") is not None:
+        st.download_button(
+            "下載／儲存備份 .db",
+            data=st.session_state["backup_data"],
+            file_name=st.session_state["backup_filename"],
+            mime="application/vnd.sqlite3",
+            use_container_width=False,
+        )
+        st.caption(f"備份檔名：{st.session_state['backup_filename']}")
+        st.caption("若瀏覽器未詢問位置，檔案會存到瀏覽器預設的下載資料夾。")
+
 # --- 1. 客戶資料瀏覽 ---
-if menu == "📊 客戶資料瀏覽":
+elif menu == "📊 客戶資料瀏覽":
     st.title("👥 所有客戶與投資合約")
     query = """
     SELECT c.name as 客戶姓名, ic.amount as 投資金額, rp.annual_rate as 利率, 
