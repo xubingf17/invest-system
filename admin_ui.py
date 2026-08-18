@@ -10,7 +10,7 @@ import calendar
 # import graphviz
 
 
-CURRENT_VERSION = "1.7.6"
+CURRENT_VERSION = "1.7.7"
 
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
 
@@ -1142,25 +1142,45 @@ elif menu == "📋 合約總覽":
                     def_a_idx = a_names.index(curr_agent_name) if curr_agent_name in a_names else 0
                     new_a_name = st.selectbox("變更業務", a_names, index=def_a_idx, key=f"edit_agent_sel_{edit_id}")
                     new_a_id = int(ordered_agents_df[ordered_agents_df['name'] == new_a_name]['agent_id'].values[0])
+                    if new_a_name != curr_agent_name:
+                        st.caption("只改這一筆合約的業務員；客戶選單僅列出該業務名下的客戶。")
 
-                    # 2. 修正姓名 (強制將該單據的原本客戶放入選單第一順位)
-                    cust_query = "SELECT customer_id, name FROM customers WHERE agent_id = ? ORDER BY name"
-                    current_agent_customers = pd.read_sql(cust_query, conn, params=(new_a_id,))
-                    
-                    # 🎯 核心修正：建立原本合約客戶的固定字串
-                    origin_cust_opt = f"{info['customer_name']} (ID: {info['customer_id']})"
-                    
-                    # 撈出新業務名下的客戶選項
-                    cust_opts = [f"{r['name']} (ID: {r['customer_id']})" for _, r in current_agent_customers.iterrows()]
-                    
-                    # 🎯 如果原客戶不在新業務名下，強制插到最前面，確保不會被跳成別人
-                    if origin_cust_opt not in cust_opts:
-                        cust_opts.insert(0, origin_cust_opt)
-                        
-                    def_c_idx = cust_opts.index(origin_cust_opt)
-                    
-                    selected_cust_opt = st.selectbox("修正姓名", cust_opts, index=def_c_idx, key=f"edit_cust_sel_{edit_id}")
-                    final_cust_id = int(selected_cust_opt.split("(ID: ")[1].split(")")[0])
+                    # 2. 修正姓名：只顯示所選業務名下的客戶；有同名則預選
+                    current_agent_customers = pd.read_sql(
+                        "SELECT customer_id, name FROM customers WHERE agent_id = ? ORDER BY name",
+                        conn,
+                        params=(new_a_id,),
+                    )
+                    origin_name = str(info["customer_name"])
+                    same_matches = current_agent_customers[current_agent_customers["name"] == origin_name]
+                    cust_opts = [
+                        f"{r['name']} (ID: {r['customer_id']})"
+                        for _, r in current_agent_customers.iterrows()
+                    ]
+                    final_cust_id = None
+
+                    if current_agent_customers.empty:
+                        st.warning(
+                            f"業務「{new_a_name}」名下尚無客戶。"
+                            f"請先到「基礎資料設定 → 新增客戶」新增「{origin_name}」後再改這筆合約。"
+                        )
+                    else:
+                        if same_matches.empty and new_a_name != curr_agent_name:
+                            st.warning(
+                                f"業務「{new_a_name}」名下找不到同名客戶「{origin_name}」。"
+                                "請先新增該客戶，或從下方選單改選該業務既有客戶。"
+                            )
+                        def_c_idx = 0
+                        if not same_matches.empty:
+                            same_opt = f"{same_matches.iloc[0]['name']} (ID: {int(same_matches.iloc[0]['customer_id'])})"
+                            def_c_idx = cust_opts.index(same_opt)
+                        selected_cust_opt = st.selectbox(
+                            "修正姓名",
+                            cust_opts,
+                            index=def_c_idx,
+                            key=f"edit_cust_sel_{edit_id}_{new_a_id}",
+                        )
+                        final_cust_id = int(selected_cust_opt.split("(ID: ")[1].split(")")[0])
 
                     plans_df = pd.read_sql("SELECT plan_id, plan_name, annual_rate, period_months FROM rate_plans", conn)
                     plans_df['display'] = plans_df['plan_name'] + " (" + plans_df['annual_rate'].astype(str) + "%)"
@@ -1211,9 +1231,9 @@ elif menu == "📋 合約總覽":
 
                     new_n = st.text_input("備註", value=str(info['note']) if info['note'] else "", key=f"edit_note_{edit_id}")
                     
-                    if st.button("💾 儲存修正", use_container_width=True, type="primary", key=f"save_edit_btn_{edit_id}"):
+                    if st.button("💾 儲存修正", use_container_width=True, type="primary", key=f"save_edit_btn_{edit_id}", disabled=final_cust_id is None):
                         if final_cust_id is None:
-                            st.error("❌ 無法儲存：必須選擇有效的客戶。")
+                            st.error("❌ 無法儲存：該業務名下沒有可選客戶，請先新增。")
                         else:
                             try:
                                 conn.execute("""
