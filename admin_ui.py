@@ -12,7 +12,7 @@ from pathlib import Path
 # import graphviz
 
 
-CURRENT_VERSION = "1.8.2"
+CURRENT_VERSION = "1.8.3"
 
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
 
