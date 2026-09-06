@@ -12,7 +12,7 @@ from pathlib import Path
 # import graphviz
 
 
-CURRENT_VERSION = "1.8.1"
+CURRENT_VERSION = "1.8.2"
 
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
 
@@ -1647,6 +1647,7 @@ elif menu == "📋 合約總覽":
             ic.amount / 10000.0 as '金額', 
             rp.plan_name as 方案名稱, 
             rp.annual_rate as '利率',
+            rp.period_months as '週期(月)',
             ic.prev_annual_rate as 上次利率,
             ic.start_date as 開始日, 
             ic.end_date as 結束日, 
@@ -1802,6 +1803,31 @@ elif menu == "📋 合約總覽":
         m1, m2 = st.columns(2)
         m1.metric("符合條件筆數", f"{len(df_display)} 筆")
         m2.metric("篩選總金額 (NT$)", display_total)
+
+        # 匯出格式與「新增資料 → 批量 CSV 上傳」完全一致，可直接重新匯入。
+        contract_export_df = pd.DataFrame({
+            "客戶姓名": df_display["客戶姓名"],
+            "歸屬業務姓名": df_display["業務員"],
+            "利率(%)": df_display["利率"].round(2),
+            "週期(月)": df_display["週期(月)"].astype(int),
+            "金額": df_display["金額"].round(2),
+            "生效年": df_display["開始日"].apply(lambda d: d.year - 1911),
+            "生效月": df_display["開始日"].apply(lambda d: d.month),
+            "生效日": df_display["開始日"].apply(lambda d: d.day),
+            "合約性質": df_display["類型"].fillna("續約"),
+            "上次歷史利率(%)": df_display["上次利率"].fillna(0).round(2),
+            "備註": df_display["備註"].fillna(""),
+        })
+        contract_export_csv = contract_export_df.to_csv(index=False).encode("utf-8-sig")
+        contract_export_filename = taiwan_now().strftime("合約匯出_%Y%m%d_%H%M%S.csv")
+        st.download_button(
+            "📥 下載目前篩選合約（系統 CSV 格式）",
+            data=contract_export_csv,
+            file_name=contract_export_filename,
+            mime="text/csv",
+            use_container_width=True,
+            disabled=contract_export_df.empty,
+        )
 
         # 根據勾選決定是否在 Dataframe 中渲染「上次利率」
         cols_to_render = ['ID', '客戶姓名', '業務員', '類型', '金額', '方案名稱', '利率', '開始日', '結束日', '備註', '狀態']
@@ -3455,7 +3481,12 @@ elif menu == "📅 到期處理管理":
             if done_df.empty:
                 st.info("目前區間內尚無已處理完成的合約。")
             else:
-                done_view = done_df.copy()
+                # dataframes filtered above retain their old index.  Streamlit returns a
+                # zero-based display position, so always normalize before resolving it.
+                # Include the current action ids in the widget key as well: after a
+                # reversal the old selection event must not be reused against a shorter
+                # table (that was the source of the iloc out-of-bounds error).
+                done_view = done_df.copy().reset_index(drop=True)
                 done_view['處理方式'] = done_view['action_type'].map({'renewed': '續約', 'refunded': '回金'})
                 partial_mask = (
                     (done_view['action_type'] == 'renewed') &
@@ -3463,6 +3494,9 @@ elif menu == "📅 到期處理管理":
                 )
                 done_view.loc[partial_mask, '處理方式'] = '部分回金續約'
                 done_view['處理日期'] = pd.to_datetime(done_view['action_date']).dt.date
+                done_table_signature = hash(tuple(
+                    done_view['action_id'].dropna().astype(int).tolist()
+                ))
                 done_event = st.dataframe(
                     done_view[[
                         'contract_id', '客戶姓名', '業務姓名', '金額', '方案(利率)',
@@ -3473,7 +3507,7 @@ elif menu == "📅 到期處理管理":
                     hide_index=True,
                     on_select="rerun",
                     selection_mode="single-row",
-                    key="maturity_done_table",
+                    key=f"maturity_done_table_{done_table_signature}",
                     column_config={
                         'contract_id': st.column_config.NumberColumn("合約ID", format="%d"),
                         '金額': st.column_config.NumberColumn("合約金額(萬)", format="%.2f"),
@@ -3483,8 +3517,14 @@ elif menu == "📅 到期處理管理":
                     },
                 )
                 selected_done_rows = done_event.selection.get("rows", [])
-                if selected_done_rows:
-                    selected_done = done_view.iloc[selected_done_rows[0]]
+                selected_done_position = (
+                    int(selected_done_rows[0]) if selected_done_rows else None
+                )
+                if (
+                    selected_done_position is not None
+                    and 0 <= selected_done_position < len(done_view)
+                ):
+                    selected_done = done_view.iloc[selected_done_position]
                     st.warning(
                         f"準備復原：合約 ID {int(selected_done['contract_id'])}｜"
                         f"{selected_done['客戶姓名']}｜{selected_done['處理方式']}"
