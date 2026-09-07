@@ -12,7 +12,7 @@ from pathlib import Path
 # import graphviz
 
 
-CURRENT_VERSION = "1.8.3"
+CURRENT_VERSION = "1.8.4"
 
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
 
@@ -222,6 +222,7 @@ def process_maturity_batch(
     renewal_ids,
     refund_items,
     partial_refund_items=None,
+    additional_items=None,
     renewal_plan_id=None,
     refund_date=None,
     refund_note="",
@@ -232,14 +233,20 @@ def process_maturity_batch(
     partial_refund_items = {
         int(k): float(v) for k, v in (partial_refund_items or {}).items()
     }
+    additional_items = {
+        int(k): float(v) for k, v in (additional_items or {}).items()
+    }
     overlap = (
         (set(renewal_ids) & set(refund_items)) |
         (set(renewal_ids) & set(partial_refund_items)) |
-        (set(refund_items) & set(partial_refund_items))
+        (set(renewal_ids) & set(additional_items)) |
+        (set(refund_items) & set(partial_refund_items)) |
+        (set(refund_items) & set(additional_items)) |
+        (set(partial_refund_items) & set(additional_items))
     )
     if overlap:
         raise ValueError(f"同一合約不可同時選擇多種到期處理：{sorted(overlap)}")
-    if not renewal_ids and not refund_items and not partial_refund_items:
+    if not renewal_ids and not refund_items and not partial_refund_items and not additional_items:
         raise ValueError("沒有需要處理的合約")
 
     processed_at = taiwan_now().isoformat(timespec="seconds")
@@ -247,9 +254,10 @@ def process_maturity_batch(
     cursor = db_conn.cursor()
     try:
         cursor.execute("BEGIN IMMEDIATE")
-        renewal_work = [(original_id, None) for original_id in renewal_ids]
-        renewal_work += list(partial_refund_items.items())
-        for original_id, partial_refund_amount in renewal_work:
+        renewal_work = [(original_id, None, None) for original_id in renewal_ids]
+        renewal_work += [(original_id, amount, None) for original_id, amount in partial_refund_items.items()]
+        renewal_work += [(original_id, None, amount) for original_id, amount in additional_items.items()]
+        for original_id, partial_refund_amount, additional_amount in renewal_work:
             if cursor.execute(
                 "SELECT 1 FROM contract_maturity_actions WHERE original_contract_id=? AND reversed_at IS NULL",
                 (original_id,),
@@ -277,6 +285,10 @@ def process_maturity_batch(
                 if partial_refund_amount >= float(amount):
                     raise ValueError(f"合約 ID {original_id} 的部分回金金額必須小於原合約金額")
                 new_contract_amount = float(amount) - partial_refund_amount
+            if additional_amount is not None:
+                if additional_amount <= 0:
+                    raise ValueError(f"合約 ID {original_id} 的加碼金額必須大於 0")
+                new_contract_amount = float(amount) + additional_amount
 
             chosen_plan_id = int(renewal_plan_id) if renewal_plan_id is not None else int(old_plan_id)
             plan_row = cursor.execute(
@@ -295,6 +307,8 @@ def process_maturity_batch(
             mode_note = "原條件直接續約轉入" if renewal_plan_id is None else "續約變更方案轉入"
             if partial_refund_amount is not None:
                 mode_note = f"部分回金 {partial_refund_amount / 10000:,.2f} 萬後，{mode_note}"
+            elif additional_amount is not None:
+                mode_note = f"加碼 {additional_amount / 10000:,.2f} 萬後，{mode_note}"
 
             cursor.execute("""
                 INSERT INTO invest_contracts (
@@ -416,7 +430,7 @@ def reverse_maturity_action(db_conn, action_id, reversal_reason):
 
 @st.dialog("🚀 到期處理確認", width="large")
 def show_maturity_confirmation_dialog(
-    db_conn, renewal_rows, refund_rows, partial_refund_rows, today
+    db_conn, renewal_rows, refund_rows, partial_refund_rows, additional_rows, today
 ):
     """完整頂層 dialog：欄位互動只重跑視窗，不依賴外層 fragment。"""
     if st.button("取消並返回勾選", key="maturity_top_dialog_cancel"):
@@ -426,7 +440,8 @@ def show_maturity_confirmation_dialog(
 
     st.write(
         f"續約 **{len(renewal_rows)}** 筆；回金 **{len(refund_rows)}** 筆；"
-        f"部分回金續約 **{len(partial_refund_rows)}** 筆。"
+        f"部分回金續約 **{len(partial_refund_rows)}** 筆；"
+        f"加碼續約 **{len(additional_rows)}** 筆。"
     )
     partial_entries = partial_refund_rows.copy()
     if not partial_entries.empty:
@@ -465,8 +480,50 @@ def show_maturity_confirmation_dialog(
             entered_amounts.append(float(entered))
         partial_entries['回金金額(萬)'] = entered_amounts
 
+    additional_entries = additional_rows.copy()
+    if not additional_entries.empty:
+        st.markdown("##### ➕ 請輸入每張合約的加碼金額")
+        additional_entries = additional_entries[[
+            'contract_id', '客戶姓名', '業務姓名', '金額', '原結束日'
+        ]].copy()
+        entered_additions = []
+        h1, h2, h3 = st.columns([3, 2, 2])
+        h1.markdown("**合約／客戶**")
+        h2.markdown("**加碼金額（萬）**")
+        h3.markdown("**續約總金額（萬）**")
+        for _, row in additional_entries.iterrows():
+            contract_id = int(row['contract_id'])
+            original_amount = float(row['金額'])
+            c1, c2, c3 = st.columns([3, 2, 2])
+            with c1:
+                st.write(f"ID {contract_id}｜{row['客戶姓名']}｜原本金 {original_amount:,.2f} 萬")
+            with c2:
+                entered = st.number_input(
+                    f"合約 {contract_id} 加碼金額",
+                    min_value=0.0,
+                    value=0.0,
+                    step=1.0,
+                    format="%.2f",
+                    key=f"maturity_top_additional_amount_{contract_id}",
+                    label_visibility="collapsed",
+                )
+            with c3:
+                st.write(f"**{original_amount + float(entered):,.2f} 萬**")
+            entered_additions.append(float(entered))
+        additional_entries['加碼金額(萬)'] = entered_additions
+
     chosen_plan_id = None
-    if not renewal_rows.empty or not partial_entries.empty:
+    if not additional_entries.empty:
+        plans_df = pd.read_sql("""
+            SELECT plan_id, plan_name, annual_rate, period_months
+            FROM rate_plans ORDER BY annual_rate
+        """, db_conn)
+        plans_df['display'] = plans_df['plan_name'] + " (" + plans_df['annual_rate'].astype(str) + "%)"
+        chosen_label = st.selectbox(
+            "下一期利率方案", plans_df['display'].tolist(), key="maturity_top_additional_plan"
+        )
+        chosen_plan_id = int(plans_df[plans_df['display'] == chosen_label].iloc[0]['plan_id'])
+    elif not renewal_rows.empty or not partial_entries.empty:
         renewal_mode = st.radio(
             "續約方式",
             ["原條件直接續約", "全部變更為指定方案"],
@@ -513,6 +570,12 @@ def show_maturity_confirmation_dialog(
         ):
             st.error("部分回金金額必須大於 0，並且小於原合約金額。")
             return
+        if not additional_entries.empty and (
+            additional_entries['加碼金額(萬)'].isna().any() or
+            (additional_entries['加碼金額(萬)'] <= 0).any()
+        ):
+            st.error("加碼金額必須大於 0。")
+            return
         try:
             refund_map = {
                 int(row['contract_id']): float(row['回金金額(萬)']) * 10000
@@ -522,11 +585,16 @@ def show_maturity_confirmation_dialog(
                 int(row['contract_id']): float(row['回金金額(萬)']) * 10000
                 for _, row in partial_entries.iterrows()
             }
+            additional_map = {
+                int(row['contract_id']): float(row['加碼金額(萬)']) * 10000
+                for _, row in additional_entries.iterrows()
+            }
             process_maturity_batch(
                 db_conn,
                 renewal_rows['contract_id'].astype(int).tolist(),
                 refund_map,
                 partial_refund_items=partial_map,
+                additional_items=additional_map,
                 renewal_plan_id=chosen_plan_id,
                 refund_date=chosen_refund_date,
                 refund_note=chosen_refund_note,
@@ -545,10 +613,10 @@ def render_maturity_checklist(db_conn, pending_df, maturity_start, maturity_end,
     """只重跑待處理勾選區，避免每次勾選都讓整頁跳回頂端。"""
     batch_action = st.radio(
         "本批處理方式",
-        ["續約", "回金", "部分回金續約"],
+        ["續約", "回金", "部分回金續約", "加碼續約"],
         horizontal=True,
         key="maturity_batch_action_fragment",
-        help="先選擇這一批要辦理續約或回金，再勾選合約。",
+        help="先選擇這一批的到期處理方式，再勾選合約。",
     )
     pending_view = pending_df[[
         'contract_id', '客戶姓名', '業務姓名', '金額', '方案(利率)', '原結束日'
@@ -593,11 +661,20 @@ def render_maturity_checklist(db_conn, pending_df, maturity_start, maturity_end,
         f"maturity_fragment_editor_{batch_action}_{st.session_state['maturity_fragment_sync']}_"
         f"{maturity_start}_{maturity_end}_{','.join(map(str, pending_view['contract_id'].tolist()))}"
     )
+    # 同一輪勾選期間固定傳給 data_editor 的來源資料。若每次勾選後都用
+    # 最新 checkbox 值重建 DataFrame，Streamlit 會重設表格的捲動位置。
+    editor_source_key = (
+        f"maturity_fragment_source_{batch_action}_{st.session_state['maturity_fragment_sync']}_"
+        f"{hash(tuple(pending_view['contract_id'].astype(int).tolist()))}"
+    )
+    if editor_source_key not in st.session_state:
+        st.session_state[editor_source_key] = pending_view.copy()
+
     disabled_columns = ['contract_id', '客戶姓名', '業務姓名', '金額', '方案(利率)', '原結束日']
     if batch_action == "回金":
         disabled_columns.append('回金金額(萬)')
     edited_maturity = st.data_editor(
-        pending_view,
+        st.session_state[editor_source_key],
         use_container_width=True,
         hide_index=True,
         key=editor_key,
@@ -615,6 +692,7 @@ def render_maturity_checklist(db_conn, pending_df, maturity_start, maturity_end,
     selected_renewals = selected_rows if batch_action == "續約" else selected_rows.iloc[0:0].copy()
     selected_refunds = selected_rows if batch_action == "回金" else selected_rows.iloc[0:0].copy()
     selected_partial_refunds = selected_rows if batch_action == "部分回金續約" else selected_rows.iloc[0:0].copy()
+    selected_additions = selected_rows if batch_action == "加碼續約" else selected_rows.iloc[0:0].copy()
 
     if batch_action == "續約":
         sc1, sc2 = st.columns(2)
@@ -625,10 +703,14 @@ def render_maturity_checklist(db_conn, pending_df, maturity_start, maturity_end,
         sc1.metric("目前篩選待處理", f"{len(pending_view)} 筆")
         sc2.metric("已勾選回金", f"{len(selected_refunds)} 筆")
         sc3.metric("回金總額", f"{selected_refunds['回金金額(萬)'].sum():,.2f} 萬")
-    else:
+    elif batch_action == "部分回金續約":
         sc1, sc2 = st.columns(2)
         sc1.metric("目前篩選待處理", f"{len(pending_view)} 筆")
         sc2.metric("已勾選部分回金續約", f"{len(selected_partial_refunds)} 筆")
+    else:
+        sc1, sc2 = st.columns(2)
+        sc1.metric("目前篩選待處理", f"{len(pending_view)} 筆")
+        sc2.metric("已勾選加碼續約", f"{len(selected_additions)} 筆")
 
     def maturity_confirmation_panel(renewal_rows, refund_rows, partial_refund_rows):
         if st.button("取消並返回勾選", key="maturity_confirmation_cancel"):
@@ -749,6 +831,7 @@ def render_maturity_checklist(db_conn, pending_df, maturity_start, maturity_end,
                 "renewals": selected_renewals.copy(),
                 "refunds": selected_refunds.copy(),
                 "partial_refunds": selected_partial_refunds.copy(),
+                "additions": selected_additions.copy(),
                 "today": today,
             }
             st.session_state["maturity_dialog_open"] = True
@@ -812,6 +895,7 @@ def force_add_columns(conn):
     if 'prev_annual_rate' not in contract_cols:
         conn.execute("ALTER TABLE invest_contracts ADD COLUMN prev_annual_rate REAL;")
         conn.commit()
+
 
     # 合約到期處理紀錄：分辨續約／回金，並保留可復原的稽核資料。
     cursor.execute("""
@@ -959,7 +1043,7 @@ with st.sidebar:
     st.title("📂 系統總覽")
     menu = st.sidebar.radio(
         "請選擇功能模組：",
-        ["📋 合約總覽", "💵 回金總覽", "📅 到期處理管理", "💰 收益發放試算","📖 歷史收益查詢","💰 業務佣", "👤 客戶資料管理", "🌳 團隊組織圖","➕ 新增資料", "⚙️ 基礎資料設定", "⚙️ 業務排序設定", "💾 資料庫備份"],
+        ["📋 合約總覽", "💵 回金總覽", "📅 到期續約管理", "💰 收益發放試算","📖 歷史收益查詢","💰 業務佣", "👤 客戶資料管理", "🌳 團隊組織圖","➕ 新增資料", "⚙️ 基礎資料設定", "⚙️ 業務排序設定", "💾 資料庫備份"],
         index=0,
         label_visibility="collapsed"
     )
@@ -1649,6 +1733,7 @@ elif menu == "📋 合約總覽":
             rp.annual_rate as '利率',
             rp.period_months as '週期(月)',
             ic.prev_annual_rate as 上次利率,
+            parent_ic.amount / 10000.0 as 上次金額,
             ic.start_date as 開始日, 
             ic.end_date as 結束日, 
             ic.note as 備註
@@ -1656,6 +1741,7 @@ elif menu == "📋 合約總覽":
         JOIN customers c ON ic.customer_id = c.customer_id
         JOIN agents a ON c.agent_id = a.agent_id
         JOIN rate_plans rp ON ic.plan_id = rp.plan_id
+        LEFT JOIN invest_contracts parent_ic ON parent_ic.contract_id = ic.parent_contract_id
     """
     df_raw = pd.read_sql(query, conn)
 
@@ -1772,13 +1858,27 @@ elif menu == "📋 合約總覽":
             st.write("") 
             show_expired = st.checkbox("顯示已過期合約", value=False, key="show_exp_key")
 
-    # 🎯 核心控制：是否展開顯示上一期利率
-    st.write("---")
-    show_prev_rate_table = st.checkbox(
-        "🔍 顯示歷史上一期利率比對欄位",
-        value=False,
-        key="contract_filter_show_prev_rate",
-    )
+    # 顯示欄位只影響合約總覽，不改變篩選條件或資料庫內容。
+    with st.expander("⚙️ 顯示欄位設定", expanded=False):
+        show_col1, show_col2, show_col3 = st.columns(3)
+        with show_col1:
+            show_prev_rate_table = st.checkbox(
+                "顯示歷史上一期利率比對欄位",
+                value=False,
+                key="contract_filter_show_prev_rate",
+            )
+        with show_col2:
+            show_previous_amount = st.checkbox(
+                "顯示上次金額",
+                value=False,
+                key="contract_filter_show_previous_amount",
+            )
+        with show_col3:
+            show_amount_change = st.checkbox(
+                "顯示增減金額",
+                value=False,
+                key="contract_filter_show_amount_change",
+            )
 
     # --- 3. 執行過濾與顯示 ---
     if not df_raw.empty:
@@ -1796,6 +1896,9 @@ elif menu == "📋 合約總覽":
         if filter_status != "全部": df_display = df_display[df_display['狀態'] == filter_status]
         if search_note:
             df_display = df_display[df_display['備註'].str.contains(search_note, case=False, na=False, regex=False)]
+
+        # 沒有 parent_contract_id 的新約沒有上一張合約，保持空白而不是誤顯示 0。
+        df_display['增減金額'] = df_display['金額'] - df_display['上次金額']
 
         total_wan = df_display['金額'].sum()
         display_total = f"{total_wan/10000:.4f} 億" if total_wan >= 10000 else f"{total_wan:,.0f} 萬"
@@ -1831,8 +1934,14 @@ elif menu == "📋 合約總覽":
 
         # 根據勾選決定是否在 Dataframe 中渲染「上次利率」
         cols_to_render = ['ID', '客戶姓名', '業務員', '類型', '金額', '方案名稱', '利率', '開始日', '結束日', '備註', '狀態']
+        amount_column_position = cols_to_render.index('金額') + 1
+        if show_previous_amount:
+            cols_to_render.insert(amount_column_position, '上次金額')
+            amount_column_position += 1
+        if show_amount_change:
+            cols_to_render.insert(amount_column_position, '增減金額')
         if show_prev_rate_table:
-            cols_to_render.insert(7, '上次利率') # 插在利率後面
+            cols_to_render.insert(cols_to_render.index('利率') + 1, '上次利率')
 
         event = st.dataframe(
             df_display[cols_to_render], 
@@ -1840,6 +1949,9 @@ elif menu == "📋 合約總覽":
             hide_index=True,
             column_config={
                 "ID": st.column_config.NumberColumn("ID", width=60, format="%d"),
+                "金額": st.column_config.NumberColumn("本次金額（萬）", format="%.2f"),
+                "上次金額": st.column_config.NumberColumn("上次金額（萬）", format="%.2f"),
+                "增減金額": st.column_config.NumberColumn("增減金額（萬）", format="%.2f"),
                 "利率": st.column_config.NumberColumn("本次利率", format="%.2f%%"),
                 "上次利率": st.column_config.NumberColumn("上次利率", format="%.2f%%")
             },
@@ -3254,9 +3366,9 @@ elif menu == "💵 回金總覽":
             },
         )
 
-elif menu == "📅 到期處理管理":
-    st.title("📅 到期處理管理")
-    st.caption("每張到期合約都可以選擇續約或回金；處理錯誤可在下方已處理清單復原。")
+elif menu == "📅 到期續約管理":
+    st.title("📅 到期續約管理")
+    st.caption("每張到期合約都可選擇續約、回金、部分回金續約或加碼續約；處理錯誤可在下方已處理清單復原。")
 
     today = taiwan_now().date()
     default_end = (today + relativedelta(months=1)).replace(day=1) - relativedelta(days=1)
@@ -3493,6 +3605,12 @@ elif menu == "📅 到期處理管理":
                     (done_view['已回金金額(萬)'].fillna(0) > 0)
                 )
                 done_view.loc[partial_mask, '處理方式'] = '部分回金續約'
+                additional_mask = (
+                    (done_view['action_type'] == 'renewed') &
+                    (done_view['已回金金額(萬)'].fillna(0) <= 0) &
+                    (done_view['續約後金額(萬)'] > done_view['金額'])
+                )
+                done_view.loc[additional_mask, '處理方式'] = '加碼續約'
                 done_view['處理日期'] = pd.to_datetime(done_view['action_date']).dt.date
                 done_table_signature = hash(tuple(
                     done_view['action_id'].dropna().astype(int).tolist()
@@ -3892,7 +4010,12 @@ elif menu == "💰 業務佣":
         r_col1, r_col2, r_col3, r_col4 = st.columns([1.5, 1.5, 1, 1])
         
         # 🎯 根據最高開關，動態決定第一層要給使用者看什麼選項
-        kind_options = ["常規件 - 全部 (新約+續約)", "常規件 - 限新約", "常規件 - 限續約"]
+        kind_options = [
+            "常規件 - 全部 (新約+續約)",
+            "常規件 - 限新約",
+            "常規件 - 限續約",
+            "常規件 - 續約差額獎勵",
+        ]
         if isolate_rate_change:
             kind_options.append("特規件 - 續約加碼") # 只有勾選獨立查看時，才允許設定利變加碼
 
@@ -3947,13 +4070,15 @@ elif menu == "💰 業務佣":
         query = """
         SELECT ic.contract_id, c.name as 客戶姓名, a.name as 業務姓名, a.agent_id, a.boss_id, 
                r.rank_name as 職級, r.commission_rate as 個人比例, ic.amount / 10000.0 as '金額', 
-               rp.plan_name, rp.annual_rate as '利率', ic.prev_annual_rate, ic.start_date as 生效日, 
+               rp.plan_name, rp.annual_rate as '利率', ic.prev_annual_rate,
+               parent_ic.amount / 10000.0 as '上次金額', ic.start_date as 生效日,
                rp.period_months as 總期數, ic.contract_type, a.sort_order as 業務權重
         FROM invest_contracts ic 
         JOIN customers c ON ic.customer_id = c.customer_id 
         JOIN agents a ON c.agent_id = a.agent_id 
         JOIN ranks r ON a.rank_id = r.rank_id 
         JOIN rate_plans rp ON ic.plan_id = rp.plan_id 
+        LEFT JOIN invest_contracts parent_ic ON parent_ic.contract_id = ic.parent_contract_id
         WHERE ic.start_date <= ?
         ORDER BY a.sort_order ASC
         """
@@ -3991,6 +4116,7 @@ elif menu == "💰 業務佣":
                         kind = rule['kind']
                         target = rule['target']
                         is_match = False
+                        reward_basis = amt
                         
                         # 先判定這筆合約「當下的真實身份」
                         # 條件：必須有勾選隔離、且這單確實是利變單
@@ -4001,14 +4127,26 @@ elif menu == "💰 業務佣":
                             row['prev_annual_rate'] != row['利率']
                         )
                         
-                        # ------------------【分流分支一：這條規則是 特規利變加碼】------------------
-                        if kind == "特規件 - 續約加碼":
+                        # ------------------【分流分支一：續約加碼差額獎勵】------------------
+                        if kind == "常規件 - 續約差額獎勵":
+                            previous_amount = row['上次金額']
+                            if (
+                                suffix == "續"
+                                and pd.notna(previous_amount)
+                                and amt > float(previous_amount)
+                                and (target == "全部方案" or plan == target)
+                            ):
+                                reward_basis = amt - float(previous_amount)
+                                is_match = True
+
+                        # ------------------【分流分支二：這條規則是 特規利變加碼】------------------
+                        elif kind == "特規件 - 續約加碼":
                             if is_current_contract_a_rate_change_type:
                                 curr_chg_str = f"{row['prev_annual_rate']}% ➔ {row['利率']}%"
                                 if curr_chg_str == target:
                                     is_match = True
                         
-                        # ------------------【分流分支二：這條規則是 常規件獎勵】------------------
+                        # ------------------【分流分支三：一般常規件獎勵】------------------
                         else:
                             # 🎯 核心防線：如果這單此時已經是「特規利變件」，常規規則絕對不能碰它！直接跳過！
                             if is_current_contract_a_rate_change_type:
@@ -4021,9 +4159,14 @@ elif menu == "💰 業務佣":
                                 is_match = True
                                 
                         if is_match:
-                            rew_amt = round(amt * rule['bonus_rate'], 2)
+                            rew_amt = round(reward_basis * rule['bonus_rate'], 2)
                             payouts[target_aid]['獎勵'] += rew_amt
-                            this_log["分配明細"].append(f"🎁活動({target}):+{rew_amt}")
+                            if kind == "常規件 - 續約差額獎勵":
+                                this_log["分配明細"].append(
+                                    f"🎁續約差額({reward_basis:,.2f}萬×{rule['bonus_rate']*100:.2f}%):+{rew_amt}"
+                                )
+                            else:
+                                this_log["分配明細"].append(f"🎁活動({target}):+{rew_amt}")
 
                 # ✅ (B) 核心業績歸帳判定：完全受到 Checkbox 控制
                 if is_in_date_range:
@@ -4163,7 +4306,7 @@ elif menu == "💰 業務佣":
                         det_df = det_df.sort_values(by=['_sort', '受款人']).drop(columns=['_sort'])
                         st.dataframe(apply_zebra_style(det_df), use_container_width=True, hide_index=True)
                 
-                st.write("### 📄 原始合約流水軌跡紀錄")
+                st.write("### 📄 處理合約明細")
                 if contract_flow_logs:
                     st.dataframe(apply_zebra_style(pd.DataFrame(contract_flow_logs)), use_container_width=True, hide_index=True)
             else:
@@ -4460,6 +4603,7 @@ if st.session_state.get("maturity_dialog_open", False):
             maturity_dialog_payload["renewals"],
             maturity_dialog_payload["refunds"],
             maturity_dialog_payload["partial_refunds"],
+            maturity_dialog_payload.get("additions", pd.DataFrame()),
             maturity_dialog_payload["today"],
         )
 
