@@ -12,7 +12,7 @@ from pathlib import Path
 # import graphviz
 
 
-CURRENT_VERSION = "1.8.5"
+CURRENT_VERSION = "1.8.6"
 
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
 
@@ -175,6 +175,31 @@ def render_adaptive_metrics(items):
 # --- 資料庫連線 (使用 check_same_thread=False 確保 Streamlit 運行穩定) ---
 def get_connection():
     return sqlite3.connect("data/investment.db", check_same_thread=False)
+
+
+def get_descendant_agents(db_conn, root_agent_id):
+    """回傳指定業務之下所有層級的下屬，並附上相對深度。"""
+    rows = db_conn.execute(
+        "SELECT agent_id, name, boss_id FROM agents ORDER BY sort_order ASC, agent_id ASC"
+    ).fetchall()
+    children = {}
+    names = {}
+    for agent_id, name, boss_id in rows:
+        agent_id = int(agent_id)
+        names[agent_id] = str(name)
+        children.setdefault(boss_id, []).append(agent_id)
+
+    result = []
+    visited = {int(root_agent_id)}
+    pending = [(agent_id, 1) for agent_id in children.get(int(root_agent_id), [])]
+    while pending:
+        agent_id, depth = pending.pop(0)
+        if agent_id in visited:
+            continue
+        visited.add(agent_id)
+        result.append({"agent_id": agent_id, "name": names[agent_id], "depth": depth})
+        pending.extend((child_id, depth + 1) for child_id in children.get(agent_id, []))
+    return result
 
 conn = get_connection()
 
@@ -2226,6 +2251,97 @@ elif menu == "⚙️ 基礎資料設定":
                             st.rerun()
                     except Exception as e:
                         st.error(f"❌ 刪除失敗：{e}")
+
+            st.divider()
+            with st.expander("快速刪除此業務的所有下屬業務", expanded=False):
+                descendants = get_descendant_agents(conn, t_id)
+                if not descendants:
+                    st.info(f"{old_name} 目前沒有任何層級的下屬業務員。")
+                else:
+                    descendant_ids = [item["agent_id"] for item in descendants]
+                    placeholders = ",".join("?" for _ in descendant_ids)
+                    descendant_customer_count = conn.execute(
+                        f"SELECT COUNT(*) FROM customers WHERE agent_id IN ({placeholders})",
+                        descendant_ids,
+                    ).fetchone()[0]
+                    descendant_contract_count = conn.execute(
+                        f"""
+                        SELECT COUNT(*)
+                        FROM invest_contracts ic
+                        JOIN customers c ON c.customer_id = ic.customer_id
+                        WHERE c.agent_id IN ({placeholders})
+                        """,
+                        descendant_ids,
+                    ).fetchone()[0]
+                    descendant_names = "、".join(item["name"] for item in descendants)
+
+                    st.warning(
+                        f"將保留主管 **{old_name}**，並永久刪除其下所有層級共 "
+                        f"**{len(descendants)} 位業務員**及其 **{descendant_customer_count} 位客戶**。"
+                    )
+                    st.write(f"包含：{descendant_names}")
+                    if descendant_contract_count > 0:
+                        st.error(
+                            f"❌ 目前下屬客戶仍有 {descendant_contract_count} 筆合約，"
+                            "必須先將這些合約清除，才能執行批次刪除。"
+                        )
+
+                    confirm_delete_team = st.checkbox(
+                        f"我已確認要永久刪除 {old_name} 的全部下屬業務與其客戶",
+                        key=f"confirm_delete_team_{t_id}",
+                        disabled=descendant_contract_count > 0,
+                    )
+                    if st.button(
+                        "🔥 永久刪除全部下屬業務",
+                        type="primary",
+                        use_container_width=True,
+                        key=f"delete_team_{t_id}",
+                        disabled=not confirm_delete_team or descendant_contract_count > 0,
+                    ):
+                        try:
+                            # 按下按鈕後重新取得關係與合約數，避免畫面停留期間資料已改變。
+                            current_descendants = get_descendant_agents(conn, t_id)
+                            current_ids = [item["agent_id"] for item in current_descendants]
+                            if not current_ids:
+                                st.warning("下屬資料已變更，現在沒有可刪除的業務員。")
+                            else:
+                                current_placeholders = ",".join("?" for _ in current_ids)
+                                current_contract_count = conn.execute(
+                                    f"""
+                                    SELECT COUNT(*)
+                                    FROM invest_contracts ic
+                                    JOIN customers c ON c.customer_id = ic.customer_id
+                                    WHERE c.agent_id IN ({current_placeholders})
+                                    """,
+                                    current_ids,
+                                ).fetchone()[0]
+                                if current_contract_count > 0:
+                                    st.error(
+                                        f"❌ 資料已變更：下屬客戶目前仍有 {current_contract_count} 筆合約，未刪除任何資料。"
+                                    )
+                                else:
+                                    with conn:
+                                        deleted_customers = conn.execute(
+                                            f"DELETE FROM customers WHERE agent_id IN ({current_placeholders})",
+                                            current_ids,
+                                        ).rowcount
+                                        for item in sorted(
+                                            current_descendants,
+                                            key=lambda value: value["depth"],
+                                            reverse=True,
+                                        ):
+                                            conn.execute(
+                                                "DELETE FROM agents WHERE agent_id = ?",
+                                                (item["agent_id"],),
+                                            )
+                                    st.success(
+                                        f"✅ 已刪除 {len(current_descendants)} 位下屬業務員及 {deleted_customers} 位客戶；"
+                                        f"主管 {old_name} 已保留。"
+                                    )
+                                    time.sleep(3)
+                                    st.rerun()
+                        except Exception as e:
+                            st.error(f"❌ 批次刪除失敗，未完成的交易已復原：{e}")
         else:
             st.info("目前尚無業務員資料。")
 
@@ -2518,6 +2634,93 @@ elif menu == "👤 客戶資料管理":
                             st.rerun()
                     except Exception as e:
                         st.error(f"❌ 刪除失敗：{e}")
+
+        st.write("---")
+        with st.expander("批量刪除指定業務名下的所有客戶", expanded=False):
+            if all_agents_ordered.empty:
+                st.info("目前沒有可選擇的業務員。")
+            else:
+                bulk_agent_labels = {
+                    f"{row['name']} (業務 ID: {int(row['agent_id'])})": int(row["agent_id"])
+                    for _, row in all_agents_ordered.iterrows()
+                }
+                selected_bulk_agent_labels = st.multiselect(
+                    "選擇要清空客戶的業務員（可複選）",
+                    list(bulk_agent_labels.keys()),
+                    key="bulk_delete_customer_agents",
+                    placeholder="請勾選一位或多位業務員",
+                )
+                if selected_bulk_agent_labels:
+                    bulk_agent_ids = [bulk_agent_labels[label] for label in selected_bulk_agent_labels]
+                    bulk_agent_names = [label.rsplit(" (業務 ID:", 1)[0] for label in selected_bulk_agent_labels]
+                    bulk_placeholders = ",".join("?" for _ in bulk_agent_ids)
+                    selection_key = "_".join(map(str, sorted(bulk_agent_ids)))
+                    customer_count = conn.execute(
+                        f"SELECT COUNT(*) FROM customers WHERE agent_id IN ({bulk_placeholders})",
+                        bulk_agent_ids,
+                    ).fetchone()[0]
+                    contract_count = conn.execute(
+                        f"""
+                        SELECT COUNT(*)
+                        FROM invest_contracts ic
+                        JOIN customers c ON c.customer_id = ic.customer_id
+                        WHERE c.agent_id IN ({bulk_placeholders})
+                        """,
+                        bulk_agent_ids,
+                    ).fetchone()[0]
+
+                    st.warning(
+                        f"已選擇 **{len(bulk_agent_ids)} 位業務員**，名下共有 **{customer_count} 位客戶**。"
+                        "此操作只會刪除客戶，不會刪除這些業務員。"
+                    )
+                    st.write(f"選取業務：{'、'.join(bulk_agent_names)}")
+                    if contract_count > 0:
+                        st.error(
+                            f"❌ 目前這些客戶仍有 {contract_count} 筆合約；必須先清除全部合約，整批才可刪除。"
+                        )
+                    elif customer_count == 0:
+                        st.info("選取的業務員目前都沒有客戶可刪除。")
+
+                    confirm_bulk_customers = st.checkbox(
+                        f"我已確認要永久刪除以上 {len(bulk_agent_ids)} 位業務名下全部 {customer_count} 位客戶",
+                        key=f"confirm_bulk_customers_{selection_key}",
+                        disabled=contract_count > 0 or customer_count == 0,
+                    )
+                    if st.button(
+                        "🔥 永久刪除所選業務名下的全部客戶",
+                        type="primary",
+                        use_container_width=True,
+                        key=f"bulk_delete_customers_{selection_key}",
+                        disabled=not confirm_bulk_customers or contract_count > 0 or customer_count == 0,
+                    ):
+                        try:
+                            # 執行前重新檢查，確保確認後沒有新增合約。
+                            current_contract_count = conn.execute(
+                                f"""
+                                SELECT COUNT(*)
+                                FROM invest_contracts ic
+                                JOIN customers c ON c.customer_id = ic.customer_id
+                                WHERE c.agent_id IN ({bulk_placeholders})
+                                """,
+                                bulk_agent_ids,
+                            ).fetchone()[0]
+                            if current_contract_count > 0:
+                                st.error(
+                                    f"❌ 資料已變更：目前仍有 {current_contract_count} 筆合約，未刪除任何客戶。"
+                                )
+                            else:
+                                with conn:
+                                    deleted_count = conn.execute(
+                                        f"DELETE FROM customers WHERE agent_id IN ({bulk_placeholders})",
+                                        bulk_agent_ids,
+                                    ).rowcount
+                                st.success(
+                                    f"✅ 已刪除所選 {len(bulk_agent_ids)} 位業務名下全部 {deleted_count} 位客戶。"
+                                )
+                                time.sleep(3)
+                                st.rerun()
+                        except Exception as e:
+                            st.error(f"❌ 批次刪除失敗，未完成的交易已復原：{e}")
 
 # --- 4. 資料總覽 ---
 elif menu == "📋 資料總覽":
