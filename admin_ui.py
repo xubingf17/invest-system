@@ -12,7 +12,7 @@ from pathlib import Path
 # import graphviz
 
 
-CURRENT_VERSION = "1.8.6"
+CURRENT_VERSION = "1.8.7"
 
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
 
@@ -411,19 +411,61 @@ def process_maturity_batch(
 
 
 def reverse_maturity_action(db_conn, action_id, reversal_reason):
-    """復原一筆到期處理；錯誤續約的新合約會在確認安全後直接刪除。"""
+    """復原到期處理；原合約若曾被誤刪，會先由處理快照重建。"""
     reason = str(reversal_reason or "").strip() or "使用者手動復原"
     cursor = db_conn.cursor()
     try:
         cursor.execute("BEGIN IMMEDIATE")
         row = cursor.execute("""
-            SELECT original_contract_id, action_type, child_contract_id
+            SELECT original_contract_id, action_type, child_contract_id,
+                   customer_id, contract_amount, plan_name, annual_rate,
+                   original_start_date, original_end_date
             FROM contract_maturity_actions
             WHERE action_id=? AND reversed_at IS NULL
         """, (int(action_id),)).fetchone()
         if row is None:
             raise ValueError("找不到這筆處理紀錄，或該紀錄已經復原")
-        original_id, action_type, child_id = row
+        (
+            original_id, action_type, child_id, customer_id, contract_amount,
+            plan_name, annual_rate, original_start, original_end,
+        ) = row
+
+        original_exists = cursor.execute(
+            "SELECT 1 FROM invest_contracts WHERE contract_id=?",
+            (original_id,),
+        ).fetchone()
+        if original_exists is None:
+            if customer_id is None or cursor.execute(
+                "SELECT 1 FROM customers WHERE customer_id=?", (customer_id,)
+            ).fetchone() is None:
+                raise ValueError("原合約與客戶資料都已刪除，無法自動重建；請交由管理員由備份修復")
+            plan = cursor.execute("""
+                SELECT plan_id FROM rate_plans
+                WHERE plan_name=? AND ABS(annual_rate - ?) < 0.000001
+                ORDER BY plan_id LIMIT 1
+            """, (plan_name, annual_rate)).fetchone()
+            if plan is None:
+                raise ValueError("找不到原合約使用的利率方案，無法自動重建；請先聯絡管理員")
+            prior_action = cursor.execute("""
+                SELECT original_contract_id, annual_rate
+                FROM contract_maturity_actions
+                WHERE child_contract_id=?
+                ORDER BY action_id DESC LIMIT 1
+            """, (original_id,)).fetchone()
+            contract_type = "續約" if prior_action else "新約"
+            parent_contract_id = int(prior_action[0]) if prior_action else None
+            previous_rate = float(prior_action[1]) if prior_action and prior_action[1] is not None else None
+            cursor.execute("""
+                INSERT INTO invest_contracts (
+                    contract_id, customer_id, plan_id, amount, start_date, end_date,
+                    status, note, is_renewed, contract_type, parent_contract_id,
+                    prev_annual_rate
+                ) VALUES (?, ?, ?, ?, ?, ?, 'Closed', ?, 1, ?, ?, ?)
+            """, (
+                original_id, customer_id, int(plan[0]), float(contract_amount),
+                original_start, original_end, "由到期處理快照自動重建",
+                contract_type, parent_contract_id, previous_rate,
+            ))
 
         if action_type == "renewed" and child_id is not None:
             descendants = cursor.execute(
@@ -451,6 +493,27 @@ def reverse_maturity_action(db_conn, action_id, reversal_reason):
     except Exception:
         db_conn.rollback()
         raise
+
+
+def contract_deletion_block_reason(db_conn, contract_id):
+    """有尚未復原的到期處理關聯時，不允許從合約總覽破壞合約鏈。"""
+    contract_id = int(contract_id)
+    origin_action = db_conn.execute("""
+        SELECT action_type FROM contract_maturity_actions
+        WHERE original_contract_id=? AND reversed_at IS NULL
+        ORDER BY action_id DESC LIMIT 1
+    """, (contract_id,)).fetchone()
+    if origin_action:
+        action_name = "全額回金" if origin_action[0] == "refunded" else "續約／部分回金／加碼"
+        return f"此合約已有有效的{action_name}處理紀錄"
+    parent_action = db_conn.execute("""
+        SELECT original_contract_id FROM contract_maturity_actions
+        WHERE child_contract_id=? AND reversed_at IS NULL
+        ORDER BY action_id DESC LIMIT 1
+    """, (contract_id,)).fetchone()
+    if parent_action:
+        return f"此合約是合約 ID {int(parent_action[0])} 到期處理後產生的續約新單"
+    return ""
 
 
 @st.dialog("🚀 到期處理確認", width="large")
@@ -2139,12 +2202,34 @@ elif menu == "📋 合約總覽":
                 st.error(f"⚠️ 警告：即將刪除合約 ID {del_id}")
                 st.write(f"客戶：{row['客戶姓名']} | 金額：{row['金額']} 萬")
                 st.write("---")
-                is_confirmed = st.checkbox(f"我已確認要永久刪除此筆資料", key=f"confirm_del_{del_id}")
+                deletion_block_reason = contract_deletion_block_reason(conn, del_id)
+                if deletion_block_reason:
+                    st.error(
+                        f"❌ 無法刪除：{deletion_block_reason}。請先到「到期續約管理 → 已處理完成清單」"
+                        "復原該筆處理，再回來刪除合約。"
+                    )
+                is_confirmed = st.checkbox(
+                    f"我已確認要永久刪除此筆資料",
+                    key=f"confirm_del_{del_id}",
+                    disabled=bool(deletion_block_reason),
+                )
                 if is_confirmed:
-                    if st.button(f"🔥 確定刪除 ID:{del_id}", type="primary", use_container_width=True):
-                        conn.execute("DELETE FROM invest_contracts WHERE contract_id=?", (del_id,))
-                        conn.commit()
-                        st.success(f"🗑️ 已移除資料"); time.sleep(5); st.rerun()
+                    if st.button(
+                        f"🔥 確定刪除 ID:{del_id}",
+                        type="primary",
+                        use_container_width=True,
+                        disabled=bool(deletion_block_reason),
+                    ):
+                        # 執行前再次檢查，避免確認後才新增到期處理紀錄。
+                        current_block_reason = contract_deletion_block_reason(conn, del_id)
+                        if current_block_reason:
+                            st.error(
+                                f"❌ 資料已變更，未刪除合約：{current_block_reason}。請先復原到期處理。"
+                            )
+                        else:
+                            conn.execute("DELETE FROM invest_contracts WHERE contract_id=?", (del_id,))
+                            conn.commit()
+                            st.success(f"🗑️ 已移除資料"); time.sleep(5); st.rerun()
     else:
         st.info("⚠️ 目前資料庫中無任何合約。")
         
@@ -3450,17 +3535,22 @@ elif menu == "💵 回金總覽":
                customer_name as 客戶姓名, agent_name as 業務員,
                CASE WHEN action_type='renewed' THEN '部分回金續約' ELSE '全額回金' END as 回金類型,
                refund_amount / 10000.0 as '回金金額(萬)',
-               (SELECT amount / 10000.0 FROM invest_contracts
-                WHERE contract_id=contract_maturity_actions.child_contract_id) as '續約後金額(萬)',
-               plan_name as 原方案, annual_rate as 原利率,
-               original_start_date as 合約開始日, original_end_date as 合約到期日,
-               note as 備註
-        FROM contract_maturity_actions
+               child.amount / 10000.0 as '續約後金額(萬)',
+               ma.plan_name as 原方案, ma.annual_rate as 原利率,
+               ma.original_start_date as 合約開始日, ma.original_end_date as 合約到期日,
+               ma.note as 備註
+        FROM contract_maturity_actions ma
+        -- 原合約已遭刪除的異常紀錄不顯示、不納入回金統計；
+        -- 到期管理仍保留處理快照，供使用者復原並重建原合約。
+        JOIN invest_contracts original_contract
+          ON original_contract.contract_id = ma.original_contract_id
+        LEFT JOIN invest_contracts child
+          ON child.contract_id = ma.child_contract_id
         WHERE (
-            action_type='refunded'
-            OR (action_type='renewed' AND IFNULL(refund_amount, 0) > 0)
-        ) AND reversed_at IS NULL
-        ORDER BY original_end_date DESC, action_id DESC
+            ma.action_type='refunded'
+            OR (ma.action_type='renewed' AND IFNULL(ma.refund_amount, 0) > 0)
+        ) AND ma.reversed_at IS NULL
+        ORDER BY ma.original_end_date DESC, ma.action_id DESC
     """, conn)
 
     if refund_df.empty:
@@ -3871,6 +3961,87 @@ elif menu == "📅 到期續約管理":
                             st.rerun()
                         except Exception as e:
                             st.error(f"❌ 無法復原：{e}")
+
+        orphan_actions_df = pd.read_sql("""
+            SELECT ma.action_id, ma.original_contract_id as 合約ID,
+                   ma.customer_name as 客戶姓名, ma.agent_name as 業務姓名,
+                   CASE
+                     WHEN ma.action_type='refunded' THEN '全額回金'
+                     WHEN IFNULL(ma.refund_amount, 0) > 0 THEN '部分回金續約'
+                     ELSE '續約／加碼續約'
+                   END as 處理方式,
+                   ma.refund_amount / 10000.0 as '回金金額(萬)',
+                   ma.contract_amount / 10000.0 as '原合約金額(萬)',
+                   ma.plan_name as 原方案, ma.annual_rate as 原利率,
+                   ma.original_start_date as 原開始日,
+                   ma.original_end_date as 原結束日,
+                   ma.action_date as 處理日期
+            FROM contract_maturity_actions ma
+            LEFT JOIN invest_contracts original_contract
+              ON original_contract.contract_id = ma.original_contract_id
+            WHERE ma.reversed_at IS NULL
+              AND original_contract.contract_id IS NULL
+              AND ma.original_end_date >= ? AND ma.original_end_date <= ?
+            ORDER BY ma.original_end_date DESC, ma.action_id DESC
+        """, conn, params=(maturity_start.isoformat(), maturity_end.isoformat()))
+
+        if not orphan_actions_df.empty:
+            st.divider()
+            with st.expander(
+                f"🛟 異常紀錄救援：原合約已被刪除 ({len(orphan_actions_df)} 筆)",
+                expanded=True,
+            ):
+                st.warning(
+                    "以下到期處理仍有安全快照，但原合約已不在合約總覽。"
+                    "它們不會顯示在回金總覽；可在此復原並重建原合約。"
+                )
+                rescue_display = orphan_actions_df.drop(columns=['action_id']).copy()
+                st.dataframe(
+                    rescue_display,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        '合約ID': st.column_config.NumberColumn(format="%d"),
+                        '回金金額(萬)': st.column_config.NumberColumn(format="%.2f"),
+                        '原合約金額(萬)': st.column_config.NumberColumn(format="%.2f"),
+                        '原利率': st.column_config.NumberColumn(format="%.2f%%"),
+                    },
+                )
+                rescue_options = orphan_actions_df['action_id'].astype(int).tolist()
+                rescue_action_id = st.selectbox(
+                    "選擇要復原重建的異常紀錄",
+                    rescue_options,
+                    format_func=lambda action_id: (
+                        f"處理 ID {action_id}｜合約 ID "
+                        f"{int(orphan_actions_df.loc[orphan_actions_df['action_id']==action_id, '合約ID'].iloc[0])}｜"
+                        f"{orphan_actions_df.loc[orphan_actions_df['action_id']==action_id, '客戶姓名'].iloc[0]}｜"
+                        f"{orphan_actions_df.loc[orphan_actions_df['action_id']==action_id, '處理方式'].iloc[0]}"
+                    ),
+                    key="orphan_maturity_rescue_action",
+                )
+                rescue_reason = st.text_input(
+                    "復原原因（選填）",
+                    placeholder="例如：合約總覽誤刪原合約",
+                    key=f"orphan_rescue_reason_{rescue_action_id}",
+                )
+                rescue_confirm = st.checkbox(
+                    "我確認要使用處理快照重建原合約，並復原這筆到期處理",
+                    key=f"orphan_rescue_confirm_{rescue_action_id}",
+                )
+                if st.button(
+                    "🛟 重建原合約並復原處理",
+                    type="primary",
+                    use_container_width=True,
+                    disabled=not rescue_confirm,
+                    key=f"orphan_rescue_btn_{rescue_action_id}",
+                ):
+                    try:
+                        reverse_maturity_action(conn, rescue_action_id, rescue_reason)
+                        st.success("✅ 原合約已重建，錯誤的到期處理已復原。")
+                        time.sleep(1)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"❌ 無法自動救援：{e}")
 
 elif menu == "__legacy_到期續約管理":
     st.title("📅 到期續約管理")
