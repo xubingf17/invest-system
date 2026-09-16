@@ -12,7 +12,7 @@ from pathlib import Path
 # import graphviz
 
 
-CURRENT_VERSION = "1.8.7"
+CURRENT_VERSION = "1.8.8"
 
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
 
@@ -925,6 +925,86 @@ def render_maturity_checklist(db_conn, pending_df, maturity_start, maturity_end,
             st.session_state["maturity_dialog_open"] = True
             # 此按鈕位於 fragment；必須明確整頁重跑，頁尾才會呼叫頂層 dialog。
             st.rerun()
+
+
+@st.fragment
+def render_maturity_done_list(db_conn, done_df):
+    """獨立刷新已處理清單，避免選取或填寫復原資料時跳回頁首。"""
+    st.divider()
+    st.subheader(f"✅ 已處理完成清單 ({len(done_df)} 筆)")
+    if done_df.empty:
+        st.info("目前區間內尚無已處理完成的合約。")
+        return
+
+    done_view = done_df.copy().reset_index(drop=True)
+    done_view['處理方式'] = done_view['action_type'].map({'renewed': '續約', 'refunded': '回金'})
+    partial_mask = (
+        (done_view['action_type'] == 'renewed') &
+        (done_view['已回金金額(萬)'].fillna(0) > 0)
+    )
+    done_view.loc[partial_mask, '處理方式'] = '部分回金續約'
+    additional_mask = (
+        (done_view['action_type'] == 'renewed') &
+        (done_view['已回金金額(萬)'].fillna(0) <= 0) &
+        (done_view['續約後金額(萬)'] > done_view['金額'])
+    )
+    done_view.loc[additional_mask, '處理方式'] = '加碼續約'
+    done_view['處理日期'] = pd.to_datetime(done_view['action_date']).dt.date
+    done_table_signature = hash(tuple(
+        done_view['action_id'].dropna().astype(int).tolist()
+    ))
+    done_event = st.dataframe(
+        done_view[[
+            'contract_id', '客戶姓名', '業務姓名', '金額', '方案(利率)',
+            '原結束日', '處理方式', '處理日期', '已回金金額(萬)',
+            '續約後金額(萬)', 'child_contract_id'
+        ]],
+        use_container_width=True,
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        key=f"maturity_done_table_{done_table_signature}",
+        column_config={
+            'contract_id': st.column_config.NumberColumn("合約ID", format="%d"),
+            '金額': st.column_config.NumberColumn("合約金額(萬)", format="%.2f"),
+            '已回金金額(萬)': st.column_config.NumberColumn(format="%.2f"),
+            '續約後金額(萬)': st.column_config.NumberColumn(format="%.2f"),
+            'child_contract_id': st.column_config.NumberColumn("續約新合約ID", format="%d"),
+        },
+    )
+    selected_rows = done_event.selection.get("rows", [])
+    selected_position = int(selected_rows[0]) if selected_rows else None
+    if selected_position is None or not 0 <= selected_position < len(done_view):
+        return
+
+    selected_done = done_view.iloc[selected_position]
+    action_id = int(selected_done['action_id'])
+    st.warning(
+        f"準備復原：合約 ID {int(selected_done['contract_id'])}｜"
+        f"{selected_done['客戶姓名']}｜{selected_done['處理方式']}"
+    )
+    reverse_reason = st.text_input(
+        "復原原因（選填）",
+        placeholder="例如：誤按續約，實際應為回金",
+        key=f"reverse_reason_{action_id}",
+    )
+    reverse_confirm = st.checkbox(
+        "我確認要復原這筆處理；若為續約，系統會刪除其產生的新合約",
+        key=f"reverse_confirm_{action_id}",
+    )
+    if st.button(
+        "↩️ 復原此筆處理",
+        disabled=not reverse_confirm,
+        key=f"reverse_btn_{action_id}",
+    ):
+        try:
+            reverse_maturity_action(db_conn, action_id, reverse_reason)
+            st.success("✅ 已復原，原合約已回到待處理清單。")
+            time.sleep(1)
+            # 真正改動資料後才刷新整個 App，讓上下兩份清單同步。
+            st.rerun(scope="app")
+        except Exception as e:
+            st.error(f"❌ 無法復原：{e}")
 
 # --- 強制檢查並補上缺失欄位 ---
 def force_add_columns(conn):
@@ -2142,7 +2222,14 @@ elif menu == "📋 合約總覽":
 
                     amt_c, type_c = st.columns(2)
                     with amt_c:
-                        new_amt = st.number_input("金額(萬)", value=float(info['amount']/10000), key=f"edit_amt_{edit_id}")
+                        new_amt = st.number_input(
+                            "金額(萬)",
+                            value=float(info['amount'] / 10000),
+                            step=10.0,
+                            format="%.2f",
+                            key=f"edit_amt_{edit_id}",
+                            help="按 ＋／－ 每次增減 10 萬，也可以直接輸入任意金額。",
+                        )
                     with type_c:
                         new_type = st.radio("性質", ["新約", "續約"], index=0 if info['contract_type'] == "新約" else 1, horizontal=True, key=f"edit_type_{edit_id}")
                     
@@ -3881,87 +3968,7 @@ elif menu == "📅 到期續約管理":
                     conn, pending_df, maturity_start, maturity_end, today
                 )
 
-            st.divider()
-            st.subheader(f"✅ 已處理完成清單 ({len(done_df)} 筆)")
-            if done_df.empty:
-                st.info("目前區間內尚無已處理完成的合約。")
-            else:
-                # dataframes filtered above retain their old index.  Streamlit returns a
-                # zero-based display position, so always normalize before resolving it.
-                # Include the current action ids in the widget key as well: after a
-                # reversal the old selection event must not be reused against a shorter
-                # table (that was the source of the iloc out-of-bounds error).
-                done_view = done_df.copy().reset_index(drop=True)
-                done_view['處理方式'] = done_view['action_type'].map({'renewed': '續約', 'refunded': '回金'})
-                partial_mask = (
-                    (done_view['action_type'] == 'renewed') &
-                    (done_view['已回金金額(萬)'].fillna(0) > 0)
-                )
-                done_view.loc[partial_mask, '處理方式'] = '部分回金續約'
-                additional_mask = (
-                    (done_view['action_type'] == 'renewed') &
-                    (done_view['已回金金額(萬)'].fillna(0) <= 0) &
-                    (done_view['續約後金額(萬)'] > done_view['金額'])
-                )
-                done_view.loc[additional_mask, '處理方式'] = '加碼續約'
-                done_view['處理日期'] = pd.to_datetime(done_view['action_date']).dt.date
-                done_table_signature = hash(tuple(
-                    done_view['action_id'].dropna().astype(int).tolist()
-                ))
-                done_event = st.dataframe(
-                    done_view[[
-                        'contract_id', '客戶姓名', '業務姓名', '金額', '方案(利率)',
-                        '原結束日', '處理方式', '處理日期', '已回金金額(萬)',
-                        '續約後金額(萬)', 'child_contract_id'
-                    ]],
-                    use_container_width=True,
-                    hide_index=True,
-                    on_select="rerun",
-                    selection_mode="single-row",
-                    key=f"maturity_done_table_{done_table_signature}",
-                    column_config={
-                        'contract_id': st.column_config.NumberColumn("合約ID", format="%d"),
-                        '金額': st.column_config.NumberColumn("合約金額(萬)", format="%.2f"),
-                        '已回金金額(萬)': st.column_config.NumberColumn(format="%.2f"),
-                        '續約後金額(萬)': st.column_config.NumberColumn(format="%.2f"),
-                        'child_contract_id': st.column_config.NumberColumn("續約新合約ID", format="%d"),
-                    },
-                )
-                selected_done_rows = done_event.selection.get("rows", [])
-                selected_done_position = (
-                    int(selected_done_rows[0]) if selected_done_rows else None
-                )
-                if (
-                    selected_done_position is not None
-                    and 0 <= selected_done_position < len(done_view)
-                ):
-                    selected_done = done_view.iloc[selected_done_position]
-                    st.warning(
-                        f"準備復原：合約 ID {int(selected_done['contract_id'])}｜"
-                        f"{selected_done['客戶姓名']}｜{selected_done['處理方式']}"
-                    )
-                    reverse_reason = st.text_input(
-                        "復原原因（選填）",
-                        placeholder="例如：誤按續約，實際應為回金",
-                        key=f"reverse_reason_{int(selected_done['action_id'])}",
-                    )
-                    reverse_confirm = st.checkbox(
-                        "我確認要復原這筆處理；若為續約，系統會刪除其產生的新合約",
-                        key=f"reverse_confirm_{int(selected_done['action_id'])}",
-                    )
-                    if st.button(
-                        "↩️ 復原此筆處理",
-                        disabled=not reverse_confirm,
-                        key=f"reverse_btn_{int(selected_done['action_id'])}",
-                    ):
-                        try:
-                            reverse_maturity_action(conn, int(selected_done['action_id']), reverse_reason)
-                            st.success("✅ 已復原，原合約已回到待處理清單。")
-                            time.sleep(1)
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"❌ 無法復原：{e}")
-
+            render_maturity_done_list(conn, done_df)
         orphan_actions_df = pd.read_sql("""
             SELECT ma.action_id, ma.original_contract_id as 合約ID,
                    ma.customer_name as 客戶姓名, ma.agent_name as 業務姓名,
