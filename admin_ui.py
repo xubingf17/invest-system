@@ -12,7 +12,7 @@ from pathlib import Path
 # import graphviz
 
 
-CURRENT_VERSION = "1.8.8"
+CURRENT_VERSION = "1.8.9"
 
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
 
@@ -516,6 +516,17 @@ def contract_deletion_block_reason(db_conn, contract_id):
     return ""
 
 
+def get_contract_parent_maturity_action(db_conn, contract_id):
+    """若合約是到期處理產生的新單，回傳其處理 ID 與上一期合約 ID。"""
+    row = db_conn.execute("""
+        SELECT action_id, original_contract_id
+        FROM contract_maturity_actions
+        WHERE child_contract_id=? AND reversed_at IS NULL
+        ORDER BY action_id DESC LIMIT 1
+    """, (int(contract_id),)).fetchone()
+    return (int(row[0]), int(row[1])) if row else None
+
+
 @st.dialog("🚀 到期處理確認", width="large")
 def show_maturity_confirmation_dialog(
     db_conn, renewal_rows, refund_rows, partial_refund_rows, additional_rows, today
@@ -1010,11 +1021,17 @@ def render_maturity_done_list(db_conn, done_df):
 def force_add_columns(conn):
     cursor = conn.cursor()
     
-    # 1. 檢查並補齊 customers 的 note
+    # 1. 檢查並補齊 customers 的聯絡與備註欄位
     cursor.execute("PRAGMA table_info(customers)")
     cust_cols = [row[1] for row in cursor.fetchall()]
     if 'note' not in cust_cols:
         conn.execute("ALTER TABLE customers ADD COLUMN note TEXT;")
+        conn.commit()
+    if 'emergency_contact_name' not in cust_cols:
+        conn.execute("ALTER TABLE customers ADD COLUMN emergency_contact_name TEXT;")
+        conn.commit()
+    if 'emergency_contact_phone' not in cust_cols:
+        conn.execute("ALTER TABLE customers ADD COLUMN emergency_contact_phone TEXT;")
         conn.commit()
 
     # 2. 檢查並補齊 invest_contracts 的欄位
@@ -1200,11 +1217,13 @@ def auto_close_expired_contracts(conn):
         st.toast(f"已自動結案 {closed_n} 筆到期未續約合約", icon="📅")
 
 
-# 執行強制檢查（每個瀏覽器 session 只跑一次，避免切頁卡頓）
-if not st.session_state.get("_db_schema_ready"):
+# 執行資料庫結構升級。不可只用布林旗標：OTA 更新後舊 session 仍可能保留 True，
+# 造成新版新增欄位被跳過。每次新增 schema migration 時同步更換此版本字串。
+DB_SCHEMA_VERSION = "2026-10-13-emergency-contacts-v1"
+if st.session_state.get("_db_schema_version") != DB_SCHEMA_VERSION:
     force_add_columns(conn)
     auto_close_expired_contracts(conn)
-    st.session_state["_db_schema_ready"] = True
+    st.session_state["_db_schema_version"] = DB_SCHEMA_VERSION
 
 # --- 側邊欄導航 (由 selectbox 改為 sidebar.radio) ---
 with st.sidebar:
@@ -2290,33 +2309,85 @@ elif menu == "📋 合約總覽":
                 st.write(f"客戶：{row['客戶姓名']} | 金額：{row['金額']} 萬")
                 st.write("---")
                 deletion_block_reason = contract_deletion_block_reason(conn, del_id)
-                if deletion_block_reason:
+                parent_maturity_action = get_contract_parent_maturity_action(conn, del_id)
+                # 若這張合約本身已有後續處理，仍然必須從最新一單往回；
+                # 只有「單純的續約新單」可在此同步復原上一期。
+                has_own_active_action = conn.execute("""
+                    SELECT 1 FROM contract_maturity_actions
+                    WHERE original_contract_id=? AND reversed_at IS NULL
+                    LIMIT 1
+                """, (int(del_id),)).fetchone() is not None
+                can_reverse_parent = parent_maturity_action is not None and not has_own_active_action
+
+                if can_reverse_parent:
+                    parent_action_id, parent_contract_id = parent_maturity_action
+                    st.warning(
+                        f"合約 ID {int(del_id)} 是由合約 ID {parent_contract_id} 續約產生。\n\n"
+                        f"確認後將刪除 ID {int(del_id)}、同步取消上一期續約處理，"
+                        f"並讓 ID {parent_contract_id} 恢復為待處理狀態。"
+                    )
+                elif deletion_block_reason:
                     st.error(
                         f"❌ 無法刪除：{deletion_block_reason}。請先到「到期續約管理 → 已處理完成清單」"
                         "復原該筆處理，再回來刪除合約。"
                     )
                 is_confirmed = st.checkbox(
-                    f"我已確認要永久刪除此筆資料",
+                    (
+                        f"我確認刪除 ID {int(del_id)}，並同步將 ID {parent_contract_id} 恢復為待處理"
+                        if can_reverse_parent else
+                        "我已確認要永久刪除此筆資料"
+                    ),
                     key=f"confirm_del_{del_id}",
-                    disabled=bool(deletion_block_reason),
+                    disabled=bool(deletion_block_reason) and not can_reverse_parent,
                 )
                 if is_confirmed:
                     if st.button(
-                        f"🔥 確定刪除 ID:{del_id}",
+                        (
+                            f"↩️ 刪除 ID:{del_id} 並復原上一期"
+                            if can_reverse_parent else
+                            f"🔥 確定刪除 ID:{del_id}"
+                        ),
                         type="primary",
                         use_container_width=True,
-                        disabled=bool(deletion_block_reason),
+                        disabled=bool(deletion_block_reason) and not can_reverse_parent,
                     ):
-                        # 執行前再次檢查，避免確認後才新增到期處理紀錄。
-                        current_block_reason = contract_deletion_block_reason(conn, del_id)
-                        if current_block_reason:
-                            st.error(
-                                f"❌ 資料已變更，未刪除合約：{current_block_reason}。請先復原到期處理。"
-                            )
+                        if can_reverse_parent:
+                            # reverse_maturity_action 會在同一交易內刪除續約新單、
+                            # 恢復上一期合約並標記處理紀錄已復原。
+                            current_parent = get_contract_parent_maturity_action(conn, del_id)
+                            current_own_action = conn.execute("""
+                                SELECT 1 FROM contract_maturity_actions
+                                WHERE original_contract_id=? AND reversed_at IS NULL
+                                LIMIT 1
+                            """, (int(del_id),)).fetchone()
+                            if current_parent != parent_maturity_action or current_own_action:
+                                st.error("❌ 合約關係已變更，未刪除任何資料；請重新整理後再操作。")
+                            else:
+                                try:
+                                    reverse_maturity_action(
+                                        conn,
+                                        parent_action_id,
+                                        f"從合約總覽刪除續約新單 ID {int(del_id)}，同步復原上一期",
+                                    )
+                                    st.success(
+                                        f"✅ 已刪除續約新單 ID {int(del_id)}；"
+                                        f"上一期 ID {parent_contract_id} 已恢復為待處理。"
+                                    )
+                                    time.sleep(2)
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"❌ 無法同步復原，未刪除任何資料：{e}")
                         else:
-                            conn.execute("DELETE FROM invest_contracts WHERE contract_id=?", (del_id,))
-                            conn.commit()
-                            st.success(f"🗑️ 已移除資料"); time.sleep(5); st.rerun()
+                            # 執行前再次檢查，避免確認後才新增到期處理紀錄。
+                            current_block_reason = contract_deletion_block_reason(conn, del_id)
+                            if current_block_reason:
+                                st.error(
+                                    f"❌ 資料已變更，未刪除合約：{current_block_reason}。請先復原到期處理。"
+                                )
+                            else:
+                                conn.execute("DELETE FROM invest_contracts WHERE contract_id=?", (del_id,))
+                                conn.commit()
+                                st.success(f"🗑️ 已移除資料"); time.sleep(5); st.rerun()
     else:
         st.info("⚠️ 目前資料庫中無任何合約。")
         
@@ -2648,7 +2719,9 @@ elif menu == "👤 客戶資料管理":
     SELECT 
         c.customer_id as ID, 
         c.name as 客戶姓名, 
-        IFNULL(a.name, '⚠️ 未分配') as 業務姓名
+        IFNULL(a.name, '⚠️ 未分配') as 業務姓名,
+        IFNULL(c.emergency_contact_name, '') as 緊急聯絡人,
+        IFNULL(c.emergency_contact_phone, '') as 緊急聯絡人電話
     FROM customers c
     LEFT JOIN agents a ON c.agent_id = a.agent_id
     ORDER BY c.customer_id DESC
@@ -2688,19 +2761,192 @@ elif menu == "👤 客戶資料管理":
         else:
             st.write(f"📅 目前顯示：**全部** 的客戶 (共 {len(df_display)} 筆)")
 
-        # --- 3. 顯示客戶清單 (優化欄位寬度) ---
-        # st.write(f"📅 目前顯示：**{sel_agent}** 的客戶 (共 {len(df_display)} 筆)")
+        # --- 3. 顯示客戶清單：固定緊湊欄寬，避免需要水平捲動 ---
+        customer_table = df_display[[
+            'ID', '客戶姓名', '緊急聯絡人', '緊急聯絡人電話', '業務姓名'
+        ]].copy()
         st.dataframe(
-            apply_zebra_style(df_display), 
-            use_container_width=False,
+            apply_zebra_style(customer_table),
+            use_container_width=True,
             hide_index=True,
             height=600,
             column_config={
-                "ID": st.column_config.NumberColumn("ID", width=60, format="%d"),
-                "客戶姓名": st.column_config.TextColumn("客戶姓名", width="large"),
-                "業務姓名": st.column_config.TextColumn("所屬業務", width="large")
+                "ID": st.column_config.NumberColumn("ID", width=70, format="%d"),
+                "客戶姓名": st.column_config.TextColumn("客戶姓名", width=190),
+                "緊急聯絡人": st.column_config.TextColumn("緊急聯絡人", width=170),
+                "緊急聯絡人電話": st.column_config.TextColumn("緊急聯絡人電話", width=210),
+                "業務姓名": st.column_config.TextColumn("所屬業務", width=150),
             }
         )
+
+        st.divider()
+        with st.expander("📇 批量更新緊急聯絡資料（CSV）", expanded=False):
+            st.caption(
+                "先下載現有客戶範本，在 Excel 填寫最後兩欄後再上傳。"
+                "系統依客戶ID更新；空白欄位不會覆蓋既有資料。"
+            )
+            emergency_template = df_all_cust[[
+                'ID', '客戶姓名', '緊急聯絡人', '緊急聯絡人電話', '業務姓名'
+            ]].copy().rename(columns={'ID': '客戶ID'})
+            emergency_csv = emergency_template.to_csv(index=False).encode('utf-8-sig')
+            st.download_button(
+                "📥 下載現有客戶緊急聯絡資料範本",
+                emergency_csv,
+                "客戶緊急聯絡資料範本.csv",
+                "text/csv",
+                use_container_width=True,
+                key="download_emergency_contacts_template",
+            )
+            st.info(
+                "電話請在 Excel 將儲存格設為『文字』後再輸入，避免 0912 開頭的 0 被 Excel 移除。"
+            )
+            emergency_upload = st.file_uploader(
+                "上傳填寫完成的 CSV",
+                type=['csv'],
+                key="upload_emergency_contacts_csv",
+            )
+
+            if emergency_upload is not None:
+                uploaded_bytes = emergency_upload.getvalue()
+                emergency_import_df = None
+                import_error = None
+                for encoding in ('utf-8-sig', 'utf-8', 'cp950'):
+                    try:
+                        emergency_import_df = pd.read_csv(
+                            BytesIO(uploaded_bytes),
+                            encoding=encoding,
+                            dtype=str,
+                            keep_default_na=False,
+                        )
+                        break
+                    except Exception as exc:
+                        import_error = exc
+
+                if emergency_import_df is None:
+                    st.error(f"❌ 無法讀取 CSV：{import_error}")
+                else:
+                    emergency_import_df.columns = [str(col).strip() for col in emergency_import_df.columns]
+                    required_columns = {
+                        '客戶ID', '業務姓名', '客戶姓名', '緊急聯絡人', '緊急聯絡人電話'
+                    }
+                    missing_columns = sorted(required_columns - set(emergency_import_df.columns))
+                    validation_errors = []
+                    prepared_updates = []
+
+                    if missing_columns:
+                        validation_errors.append(f"缺少欄位：{'、'.join(missing_columns)}")
+                    else:
+                        parsed_ids = []
+                        for row_number, value in enumerate(emergency_import_df['客戶ID'], start=2):
+                            text_id = str(value).strip()
+                            try:
+                                numeric_id = float(text_id)
+                                if not numeric_id.is_integer() or numeric_id <= 0:
+                                    raise ValueError()
+                                parsed_ids.append(int(numeric_id))
+                            except (TypeError, ValueError):
+                                validation_errors.append(f"第 {row_number} 列客戶ID格式錯誤：{text_id or '空白'}")
+
+                        if len(parsed_ids) == len(emergency_import_df):
+                            emergency_import_df['客戶ID'] = parsed_ids
+                            duplicated_ids = sorted(
+                                emergency_import_df.loc[
+                                    emergency_import_df['客戶ID'].duplicated(keep=False), '客戶ID'
+                                ].unique().tolist()
+                            )
+                            if duplicated_ids:
+                                validation_errors.append(
+                                    "客戶ID重複：" + '、'.join(map(str, duplicated_ids))
+                                )
+
+                            known_ids = set(df_all_cust['ID'].astype(int).tolist())
+                            uploaded_ids = set(parsed_ids)
+                            unknown_ids = sorted(uploaded_ids - known_ids)
+                            if unknown_ids:
+                                validation_errors.append(
+                                    "系統找不到客戶ID：" + '、'.join(map(str, unknown_ids))
+                                )
+
+                            for _, import_row in emergency_import_df.iterrows():
+                                contact_name = str(import_row['緊急聯絡人']).strip()
+                                contact_phone = str(import_row['緊急聯絡人電話']).strip()
+                                if len(contact_name) > 100:
+                                    validation_errors.append(
+                                        f"客戶ID {int(import_row['客戶ID'])} 的緊急聯絡人超過 100 字"
+                                    )
+                                if len(contact_phone) > 100:
+                                    validation_errors.append(
+                                        f"客戶ID {int(import_row['客戶ID'])} 的電話超過 100 字"
+                                    )
+                                if contact_name or contact_phone:
+                                    prepared_updates.append({
+                                        '客戶ID': int(import_row['客戶ID']),
+                                        '業務姓名': str(import_row['業務姓名']).strip(),
+                                        '客戶姓名': str(import_row['客戶姓名']).strip(),
+                                        '緊急聯絡人': contact_name,
+                                        '緊急聯絡人電話': contact_phone,
+                                    })
+
+                    if validation_errors:
+                        st.error("❌ CSV 驗證失敗，尚未更新任何資料。")
+                        for message in validation_errors[:20]:
+                            st.write(f"- {message}")
+                        if len(validation_errors) > 20:
+                            st.write(f"另有 {len(validation_errors) - 20} 個錯誤未顯示。")
+                    elif not prepared_updates:
+                        st.warning("CSV 中沒有填寫任何緊急聯絡資料，因此沒有可更新的內容。")
+                    else:
+                        preview_df = pd.DataFrame(prepared_updates)
+                        st.success(
+                            f"✅ 格式檢查通過：將更新 {len(prepared_updates)} 位客戶；"
+                            f"其餘空白資料不會覆蓋。"
+                        )
+                        st.dataframe(preview_df, use_container_width=True, hide_index=True, height=360)
+                        confirm_emergency_import = st.checkbox(
+                            f"我確認依客戶ID更新以上 {len(prepared_updates)} 位客戶",
+                            key="confirm_emergency_contacts_import",
+                        )
+                        if st.button(
+                            "💾 確認批量更新緊急聯絡資料",
+                            type="primary",
+                            use_container_width=True,
+                            disabled=not confirm_emergency_import,
+                            key="execute_emergency_contacts_import",
+                        ):
+                            try:
+                                update_ids = [item['客戶ID'] for item in prepared_updates]
+                                placeholders = ','.join('?' for _ in update_ids)
+                                existing_ids = {
+                                    int(row[0]) for row in conn.execute(
+                                        f"SELECT customer_id FROM customers WHERE customer_id IN ({placeholders})",
+                                        update_ids,
+                                    ).fetchall()
+                                }
+                                disappeared_ids = sorted(set(update_ids) - existing_ids)
+                                if disappeared_ids:
+                                    raise ValueError(
+                                        "操作期間客戶資料已變更，找不到 ID：" +
+                                        '、'.join(map(str, disappeared_ids))
+                                    )
+                                with conn:
+                                    for item in prepared_updates:
+                                        conn.execute("""
+                                            UPDATE customers
+                                            SET emergency_contact_name = CASE
+                                                    WHEN ? = '' THEN emergency_contact_name ELSE ? END,
+                                                emergency_contact_phone = CASE
+                                                    WHEN ? = '' THEN emergency_contact_phone ELSE ? END
+                                            WHERE customer_id = ?
+                                        """, (
+                                            item['緊急聯絡人'], item['緊急聯絡人'],
+                                            item['緊急聯絡人電話'], item['緊急聯絡人電話'],
+                                            item['客戶ID'],
+                                        ))
+                                st.success(f"✅ 已完成更新 {len(prepared_updates)} 位客戶的緊急聯絡資料。")
+                                time.sleep(2)
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"❌ 批量更新失敗，資料未完整寫入：{e}")
 
         # --- 4. 刪除客戶功能 (業務員連動版) ---
         # --- 4. 🛠️ 維護與刪除客戶功能 (功能升級版) ---
@@ -2750,7 +2996,11 @@ elif menu == "👤 客戶資料管理":
             # 【A. 編輯客戶面板】
             with op_tab1:
                 # 撈取該客戶當前的詳細舊資料
-                cust_detail = pd.read_sql("SELECT name, agent_id, bank_info, note FROM customers WHERE customer_id = ?", conn, params=(target_id,)).iloc[0]
+                cust_detail = pd.read_sql("""
+                    SELECT name, agent_id, bank_info, note,
+                           emergency_contact_name, emergency_contact_phone
+                    FROM customers WHERE customer_id = ?
+                """, conn, params=(target_id,)).iloc[0]
                 
                 # 找出目前業務的名字
                 curr_agent_name = df_all_cust[df_all_cust['ID'] == target_id]['業務姓名'].values[0]
@@ -2765,6 +3015,20 @@ elif menu == "👤 客戶資料管理":
                     edit_a_id = int(all_agents_ordered[all_agents_ordered['name'] == edit_a_name]['agent_id'].values[0])
                 
                 edit_bank = st.text_input("修正銀行資訊", value=str(cust_detail['bank_info']) if cust_detail['bank_info'] else "", key=f"c_bank_edit_{target_id}")
+                ec1, ec2 = st.columns(2)
+                with ec1:
+                    edit_emergency_name = st.text_input(
+                        "緊急聯絡人",
+                        value=str(cust_detail['emergency_contact_name']) if cust_detail['emergency_contact_name'] else "",
+                        key=f"c_emergency_name_{target_id}",
+                    )
+                with ec2:
+                    edit_emergency_phone = st.text_input(
+                        "緊急聯絡人電話",
+                        value=str(cust_detail['emergency_contact_phone']) if cust_detail['emergency_contact_phone'] else "",
+                        key=f"c_emergency_phone_{target_id}",
+                        help="電話以文字儲存，可輸入手機、市話、分機或 +886。",
+                    )
                 edit_note = st.text_area("修正備註", value=str(cust_detail['note']) if cust_detail['note'] else "", key=f"c_note_edit_{target_id}")
                 
                 if st.button("💾 儲存修改內容", use_container_width=True, type="primary", key=f"save_cust_btn_{target_id}"):
@@ -2773,8 +3037,16 @@ elif menu == "👤 客戶資料管理":
                     else:
                         try:
                             conn.execute(
-                                "UPDATE customers SET name = ?, agent_id = ?, bank_info = ?, note = ? WHERE customer_id = ?",
-                                (edit_c_name.strip(), edit_a_id, edit_bank.strip(), edit_note.strip(), target_id)
+                                """
+                                UPDATE customers
+                                SET name = ?, agent_id = ?, bank_info = ?, note = ?,
+                                    emergency_contact_name = ?, emergency_contact_phone = ?
+                                WHERE customer_id = ?
+                                """,
+                                (
+                                    edit_c_name.strip(), edit_a_id, edit_bank.strip(), edit_note.strip(),
+                                    edit_emergency_name.strip(), edit_emergency_phone.strip(), target_id,
+                                )
                             )
                             conn.commit()
                             st.success(f"重新整理中... 已成功修正客戶：{edit_c_name}")
