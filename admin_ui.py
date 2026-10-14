@@ -12,7 +12,7 @@ from pathlib import Path
 # import graphviz
 
 
-CURRENT_VERSION = "1.8.9"
+CURRENT_VERSION = "1.9.0"
 
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
 
@@ -1033,6 +1033,9 @@ def force_add_columns(conn):
     if 'emergency_contact_phone' not in cust_cols:
         conn.execute("ALTER TABLE customers ADD COLUMN emergency_contact_phone TEXT;")
         conn.commit()
+    if 'contact_phone' not in cust_cols:
+        conn.execute("ALTER TABLE customers ADD COLUMN contact_phone TEXT;")
+        conn.commit()
 
     # 2. 檢查並補齊 invest_contracts 的欄位
     cursor.execute("PRAGMA table_info(invest_contracts)")
@@ -1219,7 +1222,7 @@ def auto_close_expired_contracts(conn):
 
 # 執行資料庫結構升級。不可只用布林旗標：OTA 更新後舊 session 仍可能保留 True，
 # 造成新版新增欄位被跳過。每次新增 schema migration 時同步更換此版本字串。
-DB_SCHEMA_VERSION = "2026-10-13-emergency-contacts-v1"
+DB_SCHEMA_VERSION = "2026-10-14-customer-contact-v2"
 if st.session_state.get("_db_schema_version") != DB_SCHEMA_VERSION:
     force_add_columns(conn)
     auto_close_expired_contracts(conn)
@@ -2719,9 +2722,11 @@ elif menu == "👤 客戶資料管理":
     SELECT 
         c.customer_id as ID, 
         c.name as 客戶姓名, 
-        IFNULL(a.name, '⚠️ 未分配') as 業務姓名,
+        IFNULL(c.contact_phone, '') as 客戶聯絡電話,
         IFNULL(c.emergency_contact_name, '') as 緊急聯絡人,
-        IFNULL(c.emergency_contact_phone, '') as 緊急聯絡人電話
+        IFNULL(c.emergency_contact_phone, '') as 緊急聯絡人電話,
+        IFNULL(c.note, '') as 備註,
+        IFNULL(a.name, '⚠️ 未分配') as 業務姓名
     FROM customers c
     LEFT JOIN agents a ON c.agent_id = a.agent_id
     ORDER BY c.customer_id DESC
@@ -2763,7 +2768,8 @@ elif menu == "👤 客戶資料管理":
 
         # --- 3. 顯示客戶清單：固定緊湊欄寬，避免需要水平捲動 ---
         customer_table = df_display[[
-            'ID', '客戶姓名', '緊急聯絡人', '緊急聯絡人電話', '業務姓名'
+            'ID', '業務姓名', '客戶姓名', '客戶聯絡電話',
+            '緊急聯絡人', '緊急聯絡人電話', '備註'
         ]].copy()
         st.dataframe(
             apply_zebra_style(customer_table),
@@ -2771,28 +2777,31 @@ elif menu == "👤 客戶資料管理":
             hide_index=True,
             height=600,
             column_config={
-                "ID": st.column_config.NumberColumn("ID", width=70, format="%d"),
-                "客戶姓名": st.column_config.TextColumn("客戶姓名", width=190),
-                "緊急聯絡人": st.column_config.TextColumn("緊急聯絡人", width=170),
-                "緊急聯絡人電話": st.column_config.TextColumn("緊急聯絡人電話", width=210),
-                "業務姓名": st.column_config.TextColumn("所屬業務", width=150),
+                "ID": st.column_config.NumberColumn("ID", width=60, format="%d"),
+                "客戶姓名": st.column_config.TextColumn("客戶姓名", width=140),
+                "客戶聯絡電話": st.column_config.TextColumn("客戶電話", width=155),
+                "緊急聯絡人": st.column_config.TextColumn("緊急聯絡人", width=130),
+                "緊急聯絡人電話": st.column_config.TextColumn("緊急電話", width=155),
+                "備註": st.column_config.TextColumn("備註", width=190),
+                "業務姓名": st.column_config.TextColumn("所屬業務", width=120),
             }
         )
 
         st.divider()
-        with st.expander("📇 批量更新緊急聯絡資料（CSV）", expanded=False):
+        with st.expander("📇 批量更新客戶聯絡資料與備註（CSV）", expanded=False):
             st.caption(
-                "先下載現有客戶範本，在 Excel 填寫最後兩欄後再上傳。"
+                "先下載現有客戶範本，在 Excel 填寫客戶電話、緊急聯絡資料或備註後再上傳。"
                 "系統依客戶ID更新；空白欄位不會覆蓋既有資料。"
             )
             emergency_template = df_all_cust[[
-                'ID', '客戶姓名', '緊急聯絡人', '緊急聯絡人電話', '業務姓名'
+                'ID', '業務姓名', '客戶姓名', '客戶聯絡電話',
+                '緊急聯絡人', '緊急聯絡人電話', '備註'
             ]].copy().rename(columns={'ID': '客戶ID'})
             emergency_csv = emergency_template.to_csv(index=False).encode('utf-8-sig')
             st.download_button(
-                "📥 下載現有客戶緊急聯絡資料範本",
+                "📥 下載現有客戶聯絡資料範本",
                 emergency_csv,
-                "客戶緊急聯絡資料範本.csv",
+                "客戶聯絡資料與備註範本.csv",
                 "text/csv",
                 use_container_width=True,
                 key="download_emergency_contacts_template",
@@ -2868,8 +2877,14 @@ elif menu == "👤 客戶資料管理":
                                 )
 
                             for _, import_row in emergency_import_df.iterrows():
+                                customer_phone = str(import_row.get('客戶聯絡電話', '')).strip()
                                 contact_name = str(import_row['緊急聯絡人']).strip()
                                 contact_phone = str(import_row['緊急聯絡人電話']).strip()
+                                customer_note = str(import_row.get('備註', '')).strip()
+                                if len(customer_phone) > 100:
+                                    validation_errors.append(
+                                        f"客戶ID {int(import_row['客戶ID'])} 的客戶電話超過 100 字"
+                                    )
                                 if len(contact_name) > 100:
                                     validation_errors.append(
                                         f"客戶ID {int(import_row['客戶ID'])} 的緊急聯絡人超過 100 字"
@@ -2878,13 +2893,19 @@ elif menu == "👤 客戶資料管理":
                                     validation_errors.append(
                                         f"客戶ID {int(import_row['客戶ID'])} 的電話超過 100 字"
                                     )
-                                if contact_name or contact_phone:
+                                if len(customer_note) > 1000:
+                                    validation_errors.append(
+                                        f"客戶ID {int(import_row['客戶ID'])} 的備註超過 1000 字"
+                                    )
+                                if customer_phone or contact_name or contact_phone or customer_note:
                                     prepared_updates.append({
                                         '客戶ID': int(import_row['客戶ID']),
                                         '業務姓名': str(import_row['業務姓名']).strip(),
                                         '客戶姓名': str(import_row['客戶姓名']).strip(),
+                                        '客戶聯絡電話': customer_phone,
                                         '緊急聯絡人': contact_name,
                                         '緊急聯絡人電話': contact_phone,
+                                        '備註': customer_note,
                                     })
 
                     if validation_errors:
@@ -2894,7 +2915,7 @@ elif menu == "👤 客戶資料管理":
                         if len(validation_errors) > 20:
                             st.write(f"另有 {len(validation_errors) - 20} 個錯誤未顯示。")
                     elif not prepared_updates:
-                        st.warning("CSV 中沒有填寫任何緊急聯絡資料，因此沒有可更新的內容。")
+                        st.warning("CSV 中沒有填寫任何聯絡資料或備註，因此沒有可更新的內容。")
                     else:
                         preview_df = pd.DataFrame(prepared_updates)
                         st.success(
@@ -2907,7 +2928,7 @@ elif menu == "👤 客戶資料管理":
                             key="confirm_emergency_contacts_import",
                         )
                         if st.button(
-                            "💾 確認批量更新緊急聯絡資料",
+                            "💾 確認批量更新客戶聯絡資料與備註",
                             type="primary",
                             use_container_width=True,
                             disabled=not confirm_emergency_import,
@@ -2932,17 +2953,23 @@ elif menu == "👤 客戶資料管理":
                                     for item in prepared_updates:
                                         conn.execute("""
                                             UPDATE customers
-                                            SET emergency_contact_name = CASE
+                                            SET contact_phone = CASE
+                                                    WHEN ? = '' THEN contact_phone ELSE ? END,
+                                                emergency_contact_name = CASE
                                                     WHEN ? = '' THEN emergency_contact_name ELSE ? END,
                                                 emergency_contact_phone = CASE
-                                                    WHEN ? = '' THEN emergency_contact_phone ELSE ? END
+                                                    WHEN ? = '' THEN emergency_contact_phone ELSE ? END,
+                                                note = CASE
+                                                    WHEN ? = '' THEN note ELSE ? END
                                             WHERE customer_id = ?
                                         """, (
+                                            item['客戶聯絡電話'], item['客戶聯絡電話'],
                                             item['緊急聯絡人'], item['緊急聯絡人'],
                                             item['緊急聯絡人電話'], item['緊急聯絡人電話'],
+                                            item['備註'], item['備註'],
                                             item['客戶ID'],
                                         ))
-                                st.success(f"✅ 已完成更新 {len(prepared_updates)} 位客戶的緊急聯絡資料。")
+                                st.success(f"✅ 已完成更新 {len(prepared_updates)} 位客戶的聯絡資料與備註。")
                                 time.sleep(2)
                                 st.rerun()
                             except Exception as e:
@@ -2998,7 +3025,7 @@ elif menu == "👤 客戶資料管理":
                 # 撈取該客戶當前的詳細舊資料
                 cust_detail = pd.read_sql("""
                     SELECT name, agent_id, bank_info, note,
-                           emergency_contact_name, emergency_contact_phone
+                           contact_phone, emergency_contact_name, emergency_contact_phone
                     FROM customers WHERE customer_id = ?
                 """, conn, params=(target_id,)).iloc[0]
                 
@@ -3014,7 +3041,16 @@ elif menu == "👤 客戶資料管理":
                     edit_a_name = st.selectbox("變更所屬業務", ordered_agent_names, index=def_agent_idx, key=f"c_agent_edit_{target_id}")
                     edit_a_id = int(all_agents_ordered[all_agents_ordered['name'] == edit_a_name]['agent_id'].values[0])
                 
-                edit_bank = st.text_input("修正銀行資訊", value=str(cust_detail['bank_info']) if cust_detail['bank_info'] else "", key=f"c_bank_edit_{target_id}")
+                customer_phone_col, customer_bank_col = st.columns(2)
+                with customer_phone_col:
+                    edit_contact_phone = st.text_input(
+                        "客戶聯絡電話",
+                        value=str(cust_detail['contact_phone']) if cust_detail['contact_phone'] else "",
+                        key=f"c_contact_phone_{target_id}",
+                        help="電話以文字儲存，可輸入手機、市話、分機或 +886。",
+                    )
+                with customer_bank_col:
+                    edit_bank = st.text_input("修正銀行資訊", value=str(cust_detail['bank_info']) if cust_detail['bank_info'] else "", key=f"c_bank_edit_{target_id}")
                 ec1, ec2 = st.columns(2)
                 with ec1:
                     edit_emergency_name = st.text_input(
@@ -3040,12 +3076,13 @@ elif menu == "👤 客戶資料管理":
                                 """
                                 UPDATE customers
                                 SET name = ?, agent_id = ?, bank_info = ?, note = ?,
-                                    emergency_contact_name = ?, emergency_contact_phone = ?
+                                    contact_phone = ?, emergency_contact_name = ?, emergency_contact_phone = ?
                                 WHERE customer_id = ?
                                 """,
                                 (
                                     edit_c_name.strip(), edit_a_id, edit_bank.strip(), edit_note.strip(),
-                                    edit_emergency_name.strip(), edit_emergency_phone.strip(), target_id,
+                                    edit_contact_phone.strip(), edit_emergency_name.strip(),
+                                    edit_emergency_phone.strip(), target_id,
                                 )
                             )
                             conn.commit()
@@ -3632,15 +3669,29 @@ elif menu == "➕ 新增資料":
         agent_query = pd.read_sql("SELECT agent_id, name FROM agents ORDER BY sort_order ASC, name ASC", conn)
         
         sel_agent = st.selectbox("歸屬業務", agent_query['name'] if not agent_query.empty else ["請先新增業務員"], key="new_cust_agent")
-        bank = st.text_input("銀行資訊", key="new_cust_bank")
+        contact_col1, contact_col2 = st.columns(2)
+        with contact_col1:
+            c_phone = st.text_input("客戶電話", key="new_cust_phone")
+            emergency_name = st.text_input("緊急聯絡人", key="new_cust_emergency_name")
+        with contact_col2:
+            emergency_phone = st.text_input("緊急電話", key="new_cust_emergency_phone")
+            bank = st.text_input("銀行資訊", key="new_cust_bank")
         c_note = st.text_area("備註", key="new_cust_note") 
         
         if st.button("確認建立客戶", key="btn_create_customer"):
             if not agent_query.empty and c_name:
                 ag_id = int(agent_query[agent_query['name'] == sel_agent]['agent_id'].values[0])
                 conn.execute(
-                    "INSERT INTO customers (name, agent_id, bank_info, note) VALUES (?, ?, ?, ?)", 
-                    (c_name, ag_id, bank, c_note)
+                    """
+                    INSERT INTO customers (
+                        name, agent_id, contact_phone, emergency_contact_name,
+                        emergency_contact_phone, bank_info, note
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        c_name.strip(), ag_id, c_phone.strip(), emergency_name.strip(),
+                        emergency_phone.strip(), bank.strip(), c_note.strip()
+                    )
                 )
                 conn.commit()
                 st.success(f"✅ 客戶 {c_name} 已成功建立！")
