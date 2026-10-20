@@ -12,7 +12,7 @@ from pathlib import Path
 # import graphviz
 
 
-CURRENT_VERSION = "1.9.1"
+CURRENT_VERSION = "1.9.2"
 
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
 
@@ -601,7 +601,7 @@ def show_maturity_confirmation_dialog(
                     f"合約 {contract_id} 加碼金額",
                     min_value=0.0,
                     value=0.0,
-                    step=1.0,
+                    step=10.0,
                     format="%.2f",
                     key=f"maturity_top_additional_amount_{contract_id}",
                     label_visibility="collapsed",
