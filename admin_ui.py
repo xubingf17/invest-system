@@ -12,7 +12,7 @@ from pathlib import Path
 # import graphviz
 
 
-CURRENT_VERSION = "1.9.2"
+CURRENT_VERSION = "1.9.3"
 
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
 
@@ -213,6 +213,103 @@ def create_database_backup(source_conn):
         with sqlite3.connect(str(destination)) as backup_conn:
             source_conn.backup(backup_conn)
         return filename, destination.read_bytes()
+
+
+def create_team_database_backup(source_conn, root_agent_id):
+    """建立只包含指定業務及其全部下屬資料的可直接使用 SQLite 備份。"""
+    root_row = source_conn.execute(
+        "SELECT agent_id, name FROM agents WHERE agent_id = ?",
+        (int(root_agent_id),),
+    ).fetchone()
+    if not root_row:
+        raise ValueError("找不到指定的業務員")
+
+    descendants = get_descendant_agents(source_conn, int(root_agent_id))
+    agent_ids = [int(root_agent_id)] + [int(item["agent_id"]) for item in descendants]
+    root_name = str(root_row[1])
+    safe_name = "".join(char for char in root_name if char.isalnum() or char in "-_ ").strip()
+    safe_name = safe_name.replace(" ", "_") or f"agent_{int(root_agent_id)}"
+    taiwan_time = taiwan_now()
+    timestamp = taiwan_time.strftime("%Y%m%d_%H%M%S")
+    filename = f"investment_{safe_name}_團隊_{timestamp}.db"
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        destination = Path(temp_dir) / filename
+        with sqlite3.connect(str(destination)) as backup_conn:
+            source_conn.backup(backup_conn)
+            backup_conn.execute("PRAGMA foreign_keys = OFF")
+            backup_conn.execute(
+                "CREATE TEMP TABLE selected_agent_ids (agent_id INTEGER PRIMARY KEY)"
+            )
+            backup_conn.executemany(
+                "INSERT INTO selected_agent_ids (agent_id) VALUES (?)",
+                [(agent_id,) for agent_id in agent_ids],
+            )
+            backup_conn.execute("""
+                CREATE TEMP TABLE selected_customer_ids AS
+                SELECT customer_id FROM customers
+                WHERE agent_id IN (SELECT agent_id FROM selected_agent_ids)
+            """)
+            backup_conn.execute("""
+                CREATE TEMP TABLE selected_contract_ids AS
+                SELECT contract_id FROM invest_contracts
+                WHERE customer_id IN (SELECT customer_id FROM selected_customer_ids)
+            """)
+
+            customer_count = int(backup_conn.execute(
+                "SELECT COUNT(*) FROM selected_customer_ids"
+            ).fetchone()[0])
+            contract_count = int(backup_conn.execute(
+                "SELECT COUNT(*) FROM selected_contract_ids"
+            ).fetchone()[0])
+
+            backup_conn.execute("""
+                DELETE FROM contract_maturity_actions
+                WHERE original_contract_id NOT IN (SELECT contract_id FROM selected_contract_ids)
+            """)
+            backup_conn.execute("""
+                UPDATE contract_maturity_actions SET child_contract_id = NULL
+                WHERE child_contract_id IS NOT NULL
+                  AND child_contract_id NOT IN (SELECT contract_id FROM selected_contract_ids)
+            """)
+            backup_conn.execute("""
+                DELETE FROM historical_payouts
+                WHERE customer_id NOT IN (SELECT customer_id FROM selected_customer_ids)
+            """)
+            backup_conn.execute("""
+                DELETE FROM invest_contracts
+                WHERE contract_id NOT IN (SELECT contract_id FROM selected_contract_ids)
+            """)
+            backup_conn.execute("""
+                UPDATE invest_contracts SET parent_contract_id = NULL
+                WHERE parent_contract_id IS NOT NULL
+                  AND parent_contract_id NOT IN (SELECT contract_id FROM selected_contract_ids)
+            """)
+            backup_conn.execute("""
+                DELETE FROM customers
+                WHERE customer_id NOT IN (SELECT customer_id FROM selected_customer_ids)
+            """)
+            backup_conn.execute("""
+                DELETE FROM agents
+                WHERE agent_id NOT IN (SELECT agent_id FROM selected_agent_ids)
+            """)
+            backup_conn.execute(
+                "UPDATE agents SET boss_id = NULL WHERE agent_id = ?",
+                (int(root_agent_id),),
+            )
+            backup_conn.commit()
+
+            foreign_key_errors = backup_conn.execute("PRAGMA foreign_key_check").fetchall()
+            if foreign_key_errors:
+                raise ValueError("團隊資料匯出後關聯檢查失敗，未產生檔案")
+
+        summary = {
+            "root_name": root_name,
+            "agent_count": len(agent_ids),
+            "customer_count": customer_count,
+            "contract_count": contract_count,
+        }
+        return filename, destination.read_bytes(), summary
 
 
 def taiwan_now():
@@ -1290,7 +1387,9 @@ with st.sidebar:
 # --- 資料庫備份 ---
 if menu == "💾 資料庫備份":
     st.title("💾 資料庫備份")
-    st.info("先產生目前資料庫的完整備份，再透過瀏覽器下載並選擇儲存位置。")
+    st.info("可下載完整資料庫，或只匯出某位業務及其全部下屬的團隊資料庫。")
+
+    st.subheader("完整資料庫備份")
 
     if st.button("產生資料庫備份", type="primary"):
         try:
@@ -1311,6 +1410,80 @@ if menu == "💾 資料庫備份":
         )
         st.caption(f"備份檔名：{st.session_state['backup_filename']}")
         st.caption("若瀏覽器未詢問位置，檔案會存到瀏覽器預設的下載資料夾。")
+
+    st.divider()
+    st.subheader("匯出指定業務的團隊資料庫")
+    st.caption(
+        "會包含所選業務本人、所有層級的下屬業務、其客戶與相關合約紀錄；"
+        "所選業務會成為匯出資料庫的最高主管。"
+    )
+    backup_agents = pd.read_sql("""
+        SELECT agent_id, name
+        FROM agents
+        ORDER BY sort_order ASC, agent_id ASC
+    """, conn)
+    if backup_agents.empty:
+        st.warning("目前沒有可匯出的業務員。")
+    else:
+        selected_team_agent_id = st.selectbox(
+            "選擇要匯出的業務",
+            options=backup_agents["agent_id"].astype(int).tolist(),
+            format_func=lambda agent_id: backup_agents.loc[
+                backup_agents["agent_id"] == agent_id, "name"
+            ].iloc[0],
+            key="team_backup_agent_id",
+        )
+        team_descendants = get_descendant_agents(conn, int(selected_team_agent_id))
+        team_agent_ids = [int(selected_team_agent_id)] + [
+            int(item["agent_id"]) for item in team_descendants
+        ]
+        team_placeholders = ",".join("?" for _ in team_agent_ids)
+        team_customer_count = int(conn.execute(
+            f"SELECT COUNT(*) FROM customers WHERE agent_id IN ({team_placeholders})",
+            team_agent_ids,
+        ).fetchone()[0])
+        team_contract_count = int(conn.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM invest_contracts ic
+            JOIN customers c ON c.customer_id = ic.customer_id
+            WHERE c.agent_id IN ({team_placeholders})
+            """,
+            team_agent_ids,
+        ).fetchone()[0])
+        st.write(
+            f"預計匯出：**{len(team_agent_ids)} 位業務**、"
+            f"**{team_customer_count} 位客戶**、**{team_contract_count} 筆合約**"
+        )
+
+        if st.button("產生團隊資料庫", type="primary", key="create_team_backup"):
+            try:
+                team_name, team_data, team_summary = create_team_database_backup(
+                    conn, int(selected_team_agent_id)
+                )
+                st.session_state["team_backup_filename"] = team_name
+                st.session_state["team_backup_data"] = team_data
+                st.session_state["team_backup_summary"] = team_summary
+                st.success("✅ 團隊資料庫已產生，請按下方按鈕儲存。")
+            except Exception as e:
+                st.error(f"❌ 團隊資料庫匯出失敗：{e}")
+
+        if st.session_state.get("team_backup_data") is not None:
+            team_summary = st.session_state.get("team_backup_summary", {})
+            st.download_button(
+                "下載／儲存團隊資料庫 .db",
+                data=st.session_state["team_backup_data"],
+                file_name=st.session_state["team_backup_filename"],
+                mime="application/vnd.sqlite3",
+                use_container_width=False,
+                key="download_team_backup",
+            )
+            st.caption(
+                f"備份檔名：{st.session_state['team_backup_filename']}｜"
+                f"業務 {team_summary.get('agent_count', 0)} 位｜"
+                f"客戶 {team_summary.get('customer_count', 0)} 位｜"
+                f"合約 {team_summary.get('contract_count', 0)} 筆"
+            )
 
 # --- 1. 客戶資料瀏覽 ---
 elif menu == "📊 客戶資料瀏覽":
