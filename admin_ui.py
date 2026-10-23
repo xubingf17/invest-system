@@ -13,7 +13,7 @@ from pathlib import Path
 # import graphviz
 
 
-CURRENT_VERSION = "1.9.4"
+CURRENT_VERSION = "1.9.5"
 
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
 
@@ -657,12 +657,13 @@ def process_maturity_batch(
         raise
 
 
-def reverse_maturity_action(db_conn, action_id, reversal_reason):
+def reverse_maturity_action(db_conn, action_id, reversal_reason, manage_transaction=True):
     """復原到期處理；原合約若曾被誤刪，會先由處理快照重建。"""
     reason = str(reversal_reason or "").strip() or "使用者手動復原"
     cursor = db_conn.cursor()
     try:
-        cursor.execute("BEGIN IMMEDIATE")
+        if manage_transaction:
+            cursor.execute("BEGIN IMMEDIATE")
         row = cursor.execute("""
             SELECT original_contract_id, action_type, child_contract_id,
                    customer_id, contract_amount, plan_name, annual_rate,
@@ -736,6 +737,29 @@ def reverse_maturity_action(db_conn, action_id, reversal_reason):
             SET reversed_at=?, reversal_reason=?
             WHERE action_id=?
         """, (taiwan_now().isoformat(timespec="seconds"), reason, int(action_id)))
+        if manage_transaction:
+            db_conn.commit()
+    except Exception:
+        if manage_transaction:
+            db_conn.rollback()
+        raise
+
+
+def reverse_maturity_actions(db_conn, action_ids, reversal_reason):
+    """以單一交易批次復原；任何一筆失敗時整批回滾。"""
+    normalized_ids = sorted({int(action_id) for action_id in action_ids}, reverse=True)
+    if not normalized_ids:
+        raise ValueError("請先選擇至少一筆要復原的處理紀錄")
+    try:
+        db_conn.execute("BEGIN IMMEDIATE")
+        # 後建立的處理通常是合約鏈的下游，必須先從最新一筆往回復原。
+        for action_id in normalized_ids:
+            reverse_maturity_action(
+                db_conn,
+                action_id,
+                reversal_reason,
+                manage_transaction=False,
+            )
         db_conn.commit()
     except Exception:
         db_conn.rollback()
@@ -1211,18 +1235,60 @@ def render_maturity_done_list(db_conn, done_df):
     done_table_signature = hash(tuple(
         done_view['action_id'].dropna().astype(int).tolist()
     ))
-    done_event = st.dataframe(
-        done_view[[
-            'contract_id', '客戶姓名', '業務姓名', '金額', '方案(利率)',
-            '原結束日', '處理方式', '處理日期', '已回金金額(萬)',
-            '續約後金額(萬)', 'child_contract_id'
-        ]],
+
+    if "maturity_done_selected_ids" not in st.session_state:
+        st.session_state["maturity_done_selected_ids"] = set()
+    if "maturity_done_sync_key" not in st.session_state:
+        st.session_state["maturity_done_sync_key"] = 0
+    available_action_ids = set(done_view['action_id'].dropna().astype(int).tolist())
+    st.session_state["maturity_done_selected_ids"] = {
+        int(action_id) for action_id in st.session_state["maturity_done_selected_ids"]
+        if int(action_id) in available_action_ids
+    }
+
+    select_col, clear_col = st.columns(2)
+    with select_col:
+        if st.button(
+            "✅ 一鍵全選已處理項目",
+            use_container_width=True,
+            key="maturity_done_select_all",
+        ):
+            st.session_state["maturity_done_selected_ids"] = set(available_action_ids)
+            st.session_state["maturity_done_sync_key"] += 1
+    with clear_col:
+        if st.button(
+            "🗑️ 清空選取",
+            use_container_width=True,
+            key="maturity_done_clear_all",
+        ):
+            st.session_state["maturity_done_selected_ids"] = set()
+            st.session_state["maturity_done_sync_key"] += 1
+
+    done_editor = done_view.copy()
+    done_editor.insert(
+        0,
+        "選取",
+        done_editor['action_id'].astype(int).isin(
+            st.session_state["maturity_done_selected_ids"]
+        ),
+    )
+    visible_columns = [
+        '選取', 'contract_id', '客戶姓名', '業務姓名', '金額', '方案(利率)',
+        '原結束日', '處理方式', '處理日期', '已回金金額(萬)',
+        '續約後金額(萬)', 'child_contract_id'
+    ]
+    edited_done = st.data_editor(
+        done_editor[['action_id'] + visible_columns],
         use_container_width=True,
         hide_index=True,
-        on_select="rerun",
-        selection_mode="single-row",
-        key=f"maturity_done_table_{done_table_signature}",
+        disabled=['action_id'] + [column for column in visible_columns if column != '選取'],
+        key=(
+            f"maturity_done_table_{done_table_signature}_"
+            f"{st.session_state['maturity_done_sync_key']}"
+        ),
         column_config={
+            'action_id': None,
+            '選取': st.column_config.CheckboxColumn("選取", width="small"),
             'contract_id': st.column_config.NumberColumn("合約ID", format="%d"),
             '金額': st.column_config.NumberColumn("合約金額(萬)", format="%.2f"),
             '已回金金額(萬)': st.column_config.NumberColumn(format="%.2f"),
@@ -1230,34 +1296,38 @@ def render_maturity_done_list(db_conn, done_df):
             'child_contract_id': st.column_config.NumberColumn("續約新合約ID", format="%d"),
         },
     )
-    selected_rows = done_event.selection.get("rows", [])
-    selected_position = int(selected_rows[0]) if selected_rows else None
-    if selected_position is None or not 0 <= selected_position < len(done_view):
+    selected_action_ids = set(
+        edited_done.loc[edited_done['選取'] == True, 'action_id'].astype(int).tolist()
+    )
+    st.session_state["maturity_done_selected_ids"] = selected_action_ids
+    st.caption(f"目前已選取 {len(selected_action_ids)} 筆")
+    if not selected_action_ids:
         return
 
-    selected_done = done_view.iloc[selected_position]
-    action_id = int(selected_done['action_id'])
     st.warning(
-        f"準備復原：合約 ID {int(selected_done['contract_id'])}｜"
-        f"{selected_done['客戶姓名']}｜{selected_done['處理方式']}"
+        f"準備批次復原 **{len(selected_action_ids)} 筆**處理紀錄。"
+        "若包含前後相連的續約，系統會自動從最新一筆往回復原。"
     )
     reverse_reason = st.text_input(
         "復原原因（選填）",
         placeholder="例如：誤按續約，實際應為回金",
-        key=f"reverse_reason_{action_id}",
+        key="reverse_reason_batch",
     )
+    selection_signature = hash(tuple(sorted(selected_action_ids)))
     reverse_confirm = st.checkbox(
-        "我確認要復原這筆處理；若為續約，系統會刪除其產生的新合約",
-        key=f"reverse_confirm_{action_id}",
+        f"我確認要復原所選 {len(selected_action_ids)} 筆；若為續約，系統會刪除其產生的新合約",
+        key=f"reverse_confirm_batch_{selection_signature}",
     )
     if st.button(
-        "↩️ 復原此筆處理",
+        f"↩️ 復原所選 {len(selected_action_ids)} 筆處理",
         disabled=not reverse_confirm,
-        key=f"reverse_btn_{action_id}",
+        key=f"reverse_btn_batch_{selection_signature}",
     ):
         try:
-            reverse_maturity_action(db_conn, action_id, reverse_reason)
-            st.success("✅ 已復原，原合約已回到待處理清單。")
+            reverse_maturity_actions(db_conn, selected_action_ids, reverse_reason)
+            st.session_state["maturity_done_selected_ids"] = set()
+            st.success(f"✅ 已復原 {len(selected_action_ids)} 筆，原合約已回到待處理清單。")
+            st.balloons()
             time.sleep(1)
             # 真正改動資料後才刷新整個 App，讓上下兩份清單同步。
             st.rerun(scope="app")
