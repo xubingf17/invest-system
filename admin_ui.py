@@ -7,12 +7,13 @@ from io import BytesIO
 import time
 from datetime import date, datetime, timedelta, timezone
 import calendar
+import os
 import tempfile
 from pathlib import Path
 # import graphviz
 
 
-CURRENT_VERSION = "1.9.3"
+CURRENT_VERSION = "1.9.4"
 
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
 
@@ -310,6 +311,155 @@ def create_team_database_backup(source_conn, root_agent_id):
             "contract_count": contract_count,
         }
         return filename, destination.read_bytes(), summary
+
+
+DATABASE_BACKUP_LIMIT = 50
+REQUIRED_DATABASE_TABLES = {
+    "agents", "customers", "invest_contracts", "ranks", "rate_plans"
+}
+
+
+def get_active_database_path(db_conn):
+    """從目前連線取得實際資料庫位置，兼容開發版、macOS 與 Windows。"""
+    for _, database_name, database_path in db_conn.execute("PRAGMA database_list").fetchall():
+        if database_name == "main" and database_path:
+            return Path(database_path).resolve()
+    raise ValueError("無法取得目前資料庫位置")
+
+
+def inspect_database_file(database_path):
+    """唯讀檢查待匯入資料庫，並回傳畫面預覽需要的統計。"""
+    database_path = Path(database_path).resolve()
+    if not database_path.is_file() or database_path.stat().st_size == 0:
+        raise ValueError("檔案不存在或內容為空")
+
+    inspection_conn = sqlite3.connect(f"file:{database_path}?mode=ro", uri=True)
+    try:
+        quick_check = inspection_conn.execute("PRAGMA quick_check").fetchone()
+        if not quick_check or str(quick_check[0]).lower() != "ok":
+            raise ValueError(f"SQLite 完整性檢查失敗：{quick_check[0] if quick_check else '未知錯誤'}")
+
+        existing_tables = {
+            str(row[0]) for row in inspection_conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        missing_tables = sorted(REQUIRED_DATABASE_TABLES - existing_tables)
+        if missing_tables:
+            raise ValueError(f"缺少必要資料表：{', '.join(missing_tables)}")
+
+        foreign_key_errors = inspection_conn.execute("PRAGMA foreign_key_check").fetchall()
+
+        return {
+            "agents": int(inspection_conn.execute("SELECT COUNT(*) FROM agents").fetchone()[0]),
+            "customers": int(inspection_conn.execute("SELECT COUNT(*) FROM customers").fetchone()[0]),
+            "contracts": int(inspection_conn.execute("SELECT COUNT(*) FROM invest_contracts").fetchone()[0]),
+            "size_bytes": int(database_path.stat().st_size),
+            "relation_warnings": len(foreign_key_errors),
+        }
+    except sqlite3.DatabaseError as exc:
+        raise ValueError(f"不是有效的 SQLite 投資系統資料庫：{exc}") from exc
+    finally:
+        inspection_conn.close()
+
+
+def get_database_backup_dir(db_conn):
+    backup_dir = get_active_database_path(db_conn).parent / "database_backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    return backup_dir
+
+
+def is_managed_database_history(path):
+    """只辨識本系統建立的歷史備份，避免輪替時刪到其他資料庫。"""
+    path = Path(path)
+    if path.name.startswith("investment_before_change_") and path.suffix == ".db":
+        return True
+    try:
+        datetime.strptime(path.name, "%Y%m%d_%H%M%S.db")
+        return True
+    except ValueError:
+        return False
+
+
+def list_database_history(db_conn):
+    backup_dir = get_database_backup_dir(db_conn)
+    return sorted(
+        [path for path in backup_dir.iterdir() if is_managed_database_history(path)],
+        key=lambda path: (path.stat().st_mtime, path.name),
+        reverse=True,
+    )
+
+
+def create_pre_change_backup(db_conn):
+    """以 SQLite 線上備份建立可還原版本，不直接複製正在使用中的檔案。"""
+    backup_dir = get_database_backup_dir(db_conn)
+    backup_time = taiwan_now()
+    backup_path = backup_dir / backup_time.strftime("%Y%m%d_%H%M%S.db")
+    while backup_path.exists():
+        backup_time += timedelta(seconds=1)
+        backup_path = backup_dir / backup_time.strftime("%Y%m%d_%H%M%S.db")
+    with sqlite3.connect(str(backup_path)) as backup_conn:
+        db_conn.backup(backup_conn)
+    inspect_database_file(backup_path)
+    return backup_path
+
+
+def prune_database_history(backup_dir, limit=DATABASE_BACKUP_LIMIT):
+    histories = sorted(
+        [
+            path for path in Path(backup_dir).iterdir()
+            if is_managed_database_history(path)
+        ],
+        key=lambda path: (path.stat().st_mtime, path.name),
+        reverse=True,
+    )
+    for old_backup in histories[int(limit):]:
+        old_backup.unlink(missing_ok=True)
+
+
+def stage_database_bytes(target_path, database_bytes):
+    """把新資料庫寫入目標資料夾，讓最後替換可使用同磁碟原子操作。"""
+    target_path = Path(target_path).resolve()
+    staged_path = target_path.parent / f".{target_path.name}.pending_import"
+    with staged_path.open("wb") as staged_file:
+        staged_file.write(database_bytes)
+        staged_file.flush()
+        os.fsync(staged_file.fileno())
+    inspect_database_file(staged_path)
+    return staged_path
+
+
+def replace_active_database(db_conn, database_bytes):
+    """備份現況後安全替換資料庫；成功時回傳自動備份位置。"""
+    target_path = get_active_database_path(db_conn)
+    staged_path = stage_database_bytes(target_path, database_bytes)
+    backup_path = None
+    try:
+        backup_path = create_pre_change_backup(db_conn)
+        db_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        db_conn.commit()
+        db_conn.close()
+        os.replace(staged_path, target_path)
+        for sidecar_suffix in ("-wal", "-shm"):
+            try:
+                Path(str(target_path) + sidecar_suffix).unlink(missing_ok=True)
+            except OSError:
+                pass
+        try:
+            prune_database_history(backup_path.parent, DATABASE_BACKUP_LIMIT)
+        except OSError:
+            pass
+        return backup_path
+    finally:
+        staged_path.unlink(missing_ok=True)
+
+
+def restart_after_database_change():
+    """商業版重啟整個 App；開發環境則讓 Streamlit 重新載入。"""
+    commercial_loader = globals().get("_load_commercial_module")
+    if callable(commercial_loader):
+        commercial_loader("restart_helper").restart_commercial_app()
+    st.rerun()
 
 
 def taiwan_now():
@@ -1330,7 +1480,7 @@ with st.sidebar:
     st.title("📂 系統總覽")
     menu = st.sidebar.radio(
         "請選擇功能模組：",
-        ["📋 合約總覽", "💵 回金總覽", "📅 到期續約管理", "💰 收益發放試算","📖 歷史收益查詢","💰 業務佣", "👤 客戶資料管理", "🌳 團隊組織圖","➕ 新增資料", "⚙️ 基礎資料設定", "⚙️ 業務排序設定", "💾 資料庫備份"],
+        ["📋 合約總覽", "💵 回金總覽", "📅 到期續約管理", "💰 收益發放試算","📖 歷史收益查詢","💰 業務佣", "👤 客戶資料管理", "🌳 團隊組織圖","➕ 新增資料", "⚙️ 基礎資料設定", "⚙️ 業務排序設定", "💾 資料庫備份/還原"],
         index=0,
         label_visibility="collapsed"
     )
@@ -1385,8 +1535,8 @@ with st.sidebar:
                 st.error(f"❌ 檢查更新時發生錯誤：{e}")
 
 # --- 資料庫備份 ---
-if menu == "💾 資料庫備份":
-    st.title("💾 資料庫備份")
+if menu == "💾 資料庫備份/還原":
+    st.title("💾 資料庫備份/還原")
     st.info("可下載完整資料庫，或只匯出某位業務及其全部下屬的團隊資料庫。")
 
     st.subheader("完整資料庫備份")
@@ -1484,6 +1634,129 @@ if menu == "💾 資料庫備份":
                 f"客戶 {team_summary.get('customer_count', 0)} 位｜"
                 f"合約 {team_summary.get('contract_count', 0)} 筆"
             )
+
+    st.divider()
+    st.subheader("匯入／還原資料庫")
+    st.warning(
+        "匯入會取代目前全部資料。系統會先自動保存目前版本，並保留最近 50 份，"
+    )
+    uploaded_database = st.file_uploader(
+        "選擇要匯入的投資系統資料庫（.db）",
+        type=["db"],
+        key="database_restore_upload",
+    )
+    if uploaded_database is not None:
+        uploaded_database_bytes = uploaded_database.getvalue()
+        try:
+            with tempfile.TemporaryDirectory() as inspect_dir:
+                inspect_path = Path(inspect_dir) / "uploaded_database.db"
+                inspect_path.write_bytes(uploaded_database_bytes)
+                upload_summary = inspect_database_file(inspect_path)
+
+            st.success("✅ 資料庫格式與完整性檢查通過")
+            if upload_summary.get("relation_warnings", 0):
+                st.warning(
+                    f"此資料庫有 {upload_summary['relation_warnings']} 筆舊紀錄指向已刪除資料；"
+                    "系統仍可使用，匯入後會維持原狀。"
+                )
+            import_col1, import_col2, import_col3, import_col4 = st.columns(4)
+            import_col1.metric("業務", f"{upload_summary['agents']:,} 位")
+            import_col2.metric("客戶", f"{upload_summary['customers']:,} 位")
+            import_col3.metric("合約", f"{upload_summary['contracts']:,} 筆")
+            import_col4.metric("檔案大小", f"{upload_summary['size_bytes'] / 1024 / 1024:.2f} MB")
+            confirm_database_import = st.checkbox(
+                "我確認要以此資料庫取代目前資料；系統會先自動備份現況",
+                key="confirm_database_import",
+            )
+            if st.button(
+                "匯入並重新啟動系統",
+                type="primary",
+                disabled=not confirm_database_import,
+                key="execute_database_import",
+            ):
+                try:
+                    with st.spinner("正在備份目前資料並匯入新資料庫…"):
+                        replace_active_database(conn, uploaded_database_bytes)
+                    st.success("✅ 資料庫匯入成功！系統即將重新啟動。")
+                    st.balloons()
+                    time.sleep(3)
+                    restart_after_database_change()
+                except Exception as exc:
+                    st.error(f"❌ 匯入失敗，尚未完成切換：{exc}")
+                    st.info("請重新開啟系統；匯入前的自動備份仍會保留。")
+                    st.stop()
+        except Exception as exc:
+            st.error(f"❌ 無法匯入此檔案：{exc}")
+
+    st.markdown("#### 歷史自動備份")
+    database_histories = list_database_history(conn)
+    st.caption(f"目前保留 {len(database_histories)}／{DATABASE_BACKUP_LIMIT} 份；超過後自動刪除最舊版本。")
+    if not database_histories:
+        st.info("目前尚無匯入前的自動備份。第一次匯入資料庫時會自動建立。")
+    else:
+        selected_history_name = st.selectbox(
+            "選擇要還原的版本",
+            options=[history.name for history in database_histories],
+            key="selected_database_history",
+        )
+        selected_history = next(
+            history for history in database_histories if history.name == selected_history_name
+        )
+        try:
+            history_summary = inspect_database_file(selected_history)
+            history_time = datetime.fromtimestamp(
+                selected_history.stat().st_mtime,
+                timezone(timedelta(hours=8)),
+            ).strftime("%Y-%m-%d %H:%M:%S")
+            st.write(
+                f"備份時間：**{history_time}**｜業務 **{history_summary['agents']:,}** 位｜"
+                f"客戶 **{history_summary['customers']:,}** 位｜"
+                f"合約 **{history_summary['contracts']:,}** 筆"
+            )
+            confirm_history_restore = st.checkbox(
+                "我確認要還原此版本；目前資料也會先另存成一份備份",
+                key=f"confirm_history_restore_{selected_history_name}",
+            )
+            if st.button(
+                "還原此版本並重新啟動",
+                disabled=not confirm_history_restore,
+                key="execute_history_restore",
+            ):
+                try:
+                    history_bytes = selected_history.read_bytes()
+                    with st.spinner("正在備份目前資料並還原指定版本…"):
+                        replace_active_database(conn, history_bytes)
+                    st.success("✅ 資料庫還原成功！系統即將重新啟動。")
+                    st.balloons()
+                    time.sleep(3)
+                    restart_after_database_change()
+                except Exception as exc:
+                    st.error(f"❌ 還原失敗，尚未完成切換：{exc}")
+                    st.info("請重新開啟系統；還原前的自動備份仍會保留。")
+                    st.stop()
+
+            st.markdown("##### 刪除歷史備份")
+            confirm_history_delete = st.checkbox(
+                f"我確認要永久刪除 {selected_history.name}",
+                key=f"confirm_history_delete_{selected_history_name}",
+            )
+            if st.button(
+                "🗑️ 刪除此備份",
+                disabled=not confirm_history_delete,
+                key="delete_selected_history",
+            ):
+                try:
+                    if not is_managed_database_history(selected_history):
+                        raise ValueError("此檔案不是系統管理的歷史備份")
+                    selected_history.unlink()
+                    st.success(f"✅ 已刪除歷史備份：{selected_history.name}")
+                    st.balloons()
+                    time.sleep(3)
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"❌ 刪除失敗：{exc}")
+        except Exception as exc:
+            st.error(f"❌ 此歷史備份無法使用：{exc}")
 
 # --- 1. 客戶資料瀏覽 ---
 elif menu == "📊 客戶資料瀏覽":
