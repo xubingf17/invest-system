@@ -13,7 +13,7 @@ from pathlib import Path
 # import graphviz
 
 
-CURRENT_VERSION = "1.9.5"
+CURRENT_VERSION = "1.9.6"
 
 st.set_page_config(page_title="投資團隊管理系統", layout="wide")
 
@@ -452,6 +452,38 @@ def replace_active_database(db_conn, database_bytes):
         return backup_path
     finally:
         staged_path.unlink(missing_ok=True)
+
+
+def clear_all_database_data(db_conn):
+    """備份後清空所有業務資料與基礎設定，但保留完整資料庫結構。"""
+    backup_path = create_pre_change_backup(db_conn)
+    try:
+        db_conn.execute("BEGIN IMMEDIATE")
+        for table_name in (
+            "contract_maturity_actions",
+            "historical_payouts",
+            "invest_contracts",
+            "customers",
+            "agents",
+            "rate_plans",
+            "ranks",
+            "system_jobs",
+        ):
+            db_conn.execute(f'DELETE FROM "{table_name}"')
+        sequence_exists = db_conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sqlite_sequence'"
+        ).fetchone()
+        if sequence_exists:
+            db_conn.execute("DELETE FROM sqlite_sequence")
+        db_conn.commit()
+        try:
+            prune_database_history(backup_path.parent, DATABASE_BACKUP_LIMIT)
+        except OSError:
+            pass
+        return backup_path
+    except Exception:
+        db_conn.rollback()
+        raise
 
 
 def restart_after_database_change():
@@ -1827,6 +1859,52 @@ if menu == "💾 資料庫備份/還原":
                     st.error(f"❌ 刪除失敗：{exc}")
         except Exception as exc:
             st.error(f"❌ 此歷史備份無法使用：{exc}")
+
+    st.divider()
+    with st.expander("⚠️ 完全清空資料庫", expanded=False):
+        st.error(
+            "此功能會刪除所有業務員、客戶、合約、利率方案、職級、"
+            "回金／續約處理及歷史收益資料。資料庫結構與歷史備份會保留。"
+        )
+        clear_counts = {
+            "業務": int(conn.execute("SELECT COUNT(*) FROM agents").fetchone()[0]),
+            "客戶": int(conn.execute("SELECT COUNT(*) FROM customers").fetchone()[0]),
+            "合約": int(conn.execute("SELECT COUNT(*) FROM invest_contracts").fetchone()[0]),
+        }
+        st.write(
+            f"目前將清除：業務 **{clear_counts['業務']:,}** 位｜"
+            f"客戶 **{clear_counts['客戶']:,}** 位｜"
+            f"合約 **{clear_counts['合約']:,}** 筆，以及全部相關設定與紀錄。"
+        )
+        clear_confirmation_text = st.text_input(
+            "請輸入 CLEAR ALL 確認完全清空",
+            key="clear_database_confirmation_text",
+        )
+        clear_database_confirm = st.checkbox(
+            "我了解所有目前資料將被清除，並確認系統已先自動備份",
+            key="clear_database_confirm",
+        )
+        if st.button(
+            "🔥 一鍵清空整個資料庫",
+            type="primary",
+            use_container_width=True,
+            disabled=(
+                clear_confirmation_text.strip() != "CLEAR ALL"
+                or not clear_database_confirm
+            ),
+            key="execute_clear_entire_database",
+        ):
+            try:
+                with st.spinner("正在備份目前資料並清空資料庫…"):
+                    backup_path = clear_all_database_data(conn)
+                st.success(
+                    f"✅ 資料庫已完全清空！清空前備份：{backup_path.name}"
+                )
+                st.balloons()
+                time.sleep(3)
+                st.rerun()
+            except Exception as exc:
+                st.error(f"❌ 清空失敗，資料已回滾：{exc}")
 
 # --- 1. 客戶資料瀏覽 ---
 elif menu == "📊 客戶資料瀏覽":
